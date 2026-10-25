@@ -1,9 +1,11 @@
 # Memesnipe Implementation Plan
 
-> Status (25 Oct 2026): Phases 1–7 implemented in `main`; code ships
-> disabled-first and is verified by `tests/regression/run_all.py` (38/38).
-> Remaining before live use: an armed test run at user-approved size, then the
-> Phase 6 ledger to measure net expectancy.
+> Status (26 Oct 2026): Phases 1–7 implemented in `main`; PLUS the T1
+> hardening batch from the 12-repo research (commit `c5888aa`) landed and was
+> live-validated in shadow mode. Code ships disabled-first and is verified by
+> `tests/regression/run_all.py` (40/40). Remaining before live use: an armed
+> test run at user-approved size, then the Phase 6 ledger to measure net
+> expectancy.
 
 Derived from the audit of `Celmaro/Memesnipe` (25 Oct 2026 snapshot, `d1b19ef`)
 and live verification runs (PASTALANA, DICE, Doin). Priorities: P0 = live-money
