@@ -813,6 +813,15 @@ class UniversalTrader:
             buy_result.price,
             buy_result.amount,
             buy_result.tx_signature,
+            # SOL settlement (SOL-paired coins spend SOL; non-SOL quotes are
+            # logged as None until a quote->SOL conversion exists).
+            quote_spent_sol=(
+                buy_result.price * buy_result.amount
+                if buy_result.price and buy_result.amount and (
+                    normalize_quote_mint(token_info.quote_mint) == WSOL_MINT
+                )
+                else None
+            ),
         )
         self.traded_mints.add(token_info.mint)
         # Track token program for cleanup
@@ -905,6 +914,13 @@ class UniversalTrader:
                     sell_result.price,
                     sell_result.amount,
                     sell_result.tx_signature,
+                    quote_received_sol=(
+                        sell_result.price * sell_result.amount
+                        if sell_result.price and sell_result.amount and (
+                            normalize_quote_mint(token_info.quote_mint) == WSOL_MINT
+                        )
+                        else None
+                    ),
                 )
                 # Close ATA if enabled
                 await self._cleanup_after_exit(token_info)
@@ -1349,6 +1365,13 @@ class UniversalTrader:
                 sell_result.price,
                 sell_result.amount,
                 sell_result.tx_signature,
+                quote_received_sol=(
+                    sell_result.price * sell_result.amount
+                    if sell_result.price and sell_result.amount and (
+                        normalize_quote_mint(token_info.quote_mint) == WSOL_MINT
+                    )
+                    else None
+                ),
             )
 
             final_pnl = position.get_pnl()

@@ -71,7 +71,7 @@ filters:
   max_transfer_fee_bps: 0 # reject Token-2022 transfer-tax coins outright
   # Quality gates
   blocked_creators: []
-  max_market_cap_sol: 25.0 # Phase 5 trial: skip already-pumped coins
+  max_market_cap_sol: 40.0 # above pump.fun launch MC (~28 SOL): rejects already-pumped, passes normal launches
   min_curve_progress_sol: 0.25 # Phase 5 trial: skip dead launches
   marry_mode: false # MUST be false so the bot auto-sells
   yolo_mode: true # Phase 3: continuous sniping (freshness fix landed)

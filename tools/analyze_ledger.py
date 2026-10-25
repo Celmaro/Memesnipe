@@ -50,9 +50,17 @@ def main() -> int:
         s["buys"] += len(buys)
         s["sells"] += len(sells)
         for e in buys:
-            s["spent"] += e.get("quote_spent_sol") or 0.0
+            spent = e.get("quote_spent_sol")
+            if spent is None:
+                # Legacy / non-wired rows: price * amount approximates the
+                # settlement when the coin is SOL-paired.
+                spent = (e.get("price") or 0.0) * (e.get("amount") or 0.0)
+            s["spent"] += spent
         for e in sells:
-            s["received"] += e.get("quote_received_sol") or 0.0
+            received = e.get("quote_received_sol")
+            if received is None:
+                received = (e.get("price") or 0.0) * (e.get("amount") or 0.0)
+            s["received"] += received
 
     print(f"Ledger: {path}")
     print(f"{'Session':<12} {'Buys':>5} {'Sells':>5} {'Spent SOL':>12} {'Received SOL':>14} {'Net SOL':>10}")
