@@ -93,7 +93,7 @@ The YAML files are commented inline. The sections that matter most:
 
 - **`trade`** — `buy_amount` (in SOL), slippage, `exit_strategy` (`time_based`, `tp_sl`, `manual`), and [`extreme_fast_mode`](#extreme-fast-mode).
 - **`priority_fees`** — fixed or dynamic. Dynamic costs an extra RPC call, which slows the buy.
-- **`filters`** — `listener_type`, `max_token_age`, name/creator matching, `marry_mode` (buy only, never sell), `yolo_mode` (trade continuously).
+- **`filters`** — `listener_type`, `max_token_age`, name/creator matching, the [quality gates](#quality-gates), `marry_mode` (buy only, never sell), `yolo_mode` (trade continuously).
 - **`retries`** — attempts and the wait windows around creation, buy, and the next token.
 - **`cleanup`** — when to close leftover token accounts: `disabled`, `on_fail`, `after_sell`, `post_session`.
 - **`node.max_rps`** — cap requests per second to match your provider's plan.
@@ -117,6 +117,35 @@ Two knobs:
   on a slow endpoint, lower it to skip faster.
 - **`trust_create_event`** (default `true`) — set `false` to make every listener
   do the read, giving up the zero-RPC path.
+
+### Quality gates
+
+The listener fires on every launch, and most launches are dead on arrival or
+insta-rugs. Three optional filters keep the bot off them; every check runs
+**before** the buy transaction, so a rejected coin never costs a fee.
+
+```yaml
+filters:
+  # Creator addresses never to trade (known spam/rug wallets).
+  blocked_creators: []
+  # Skip coins already above this market cap (SOL) at buy time — a snipe
+  # that arrives late is buying the top.
+  max_market_cap_sol: 50
+  # Skip coins with less than this much SOL actually paid into the curve by
+  # buyers (real_quote_reserves). A launch nobody touched sits at ~0 SOL.
+  min_curve_progress_sol: 0.5
+```
+
+- **`blocked_creators`** — list of creator wallet addresses. Checked at
+  detection (and again before the buy) with zero RPC cost.
+- **`max_market_cap_sol`** — skip coins already above a market cap. Market cap
+  is price × total supply in SOL, read from the curve right before the buy.
+- **`min_curve_progress_sol`** — skip launches with less than N SOL of real
+  buyer money in the curve. With the post-creation wait, a coin with real
+  demand has moved off zero here; raising this filters harder but slows fills.
+
+All three are denominated in SOL and only apply to SOL-paired coins; non-SOL
+quote assets are left alone. Leave them unset (or `null`) to disable.
 
 ### Non-SOL quote assets
 
