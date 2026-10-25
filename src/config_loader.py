@@ -81,7 +81,24 @@ CONFIG_VALIDATION_RULES = [
         float("inf"),
         "filters.max_token_age must be a non-negative number",
     ),
+    (
+        "filters.max_market_cap_sol",
+        (int, float),
+        0,
+        float("inf"),
+        "filters.max_market_cap_sol must be a non-negative number",
+    ),
+    (
+        "filters.min_curve_progress_sol",
+        (int, float),
+        0,
+        float("inf"),
+        "filters.min_curve_progress_sol must be a non-negative number",
+    ),
 ]
+
+# Config fields that must be a list of strings when present
+LIST_OF_STR_FIELDS = ["filters.blocked_creators"]
 
 # Valid values for enum-like fields
 VALID_VALUES = {
@@ -188,6 +205,21 @@ def validate_config(config: dict) -> None:
         except ValueError as e:
             if "Missing required config key" not in str(e):
                 raise
+
+    # Validate list-of-string fields (e.g. blocked_creators)
+    for path in LIST_OF_STR_FIELDS:
+        try:
+            value = get_nested_value(config, path)
+        except ValueError as e:
+            if "Missing required config key" in str(e):
+                continue
+            raise
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ValueError(f"{path} must be a list of strings")
 
     # Cannot enable both dynamic and fixed priority fees
     try:

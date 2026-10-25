@@ -189,6 +189,9 @@ class UniversalTrader:
         # Trading filters
         match_string: str | None = None,
         bro_address: str | None = None,
+        blocked_creators: list[str] | None = None,
+        max_market_cap_sol: float | None = None,
+        min_curve_progress_sol: float | None = None,
         marry_mode: bool = False,
         yolo_mode: bool = False,
         # Compute unit configuration
@@ -311,6 +314,11 @@ class UniversalTrader:
         # Trading filters/modes
         self.match_string = match_string
         self.bro_address = bro_address
+        self.blocked_creators = {
+            str(a) for a in (blocked_creators or [])
+        }
+        self.max_market_cap_sol = max_market_cap_sol
+        self.min_curve_progress_sol = min_curve_progress_sol
         self.marry_mode = marry_mode
         self.yolo_mode = yolo_mode
 
@@ -624,6 +632,14 @@ class UniversalTrader:
         otherwise spend its one token on a coin it was never going to buy.
         """
         quote_mint = normalize_quote_mint(token_info.quote_mint)
+        if (
+            self.blocked_creators
+            and (
+                str(token_info.creator) in self.blocked_creators
+                or str(token_info.user) in self.blocked_creators
+            )
+        ):
+            return f"creator {token_info.creator or token_info.user} is blocked"
         if self.allowed_quote_mints is not None and quote_mint not in self.allowed_quote_mints:
             return f"quote mint {quote_mint} not in allowed_quote_mints"
         if quote_mint not in self.quote_amounts:
@@ -636,6 +652,62 @@ class UniversalTrader:
                 f"transfer fee {token_info.transfer_fee_bps} bps exceeds "
                 f"max_transfer_fee_bps {self.max_transfer_fee_bps}"
             )
+        return None
+
+    async def _curve_gate_reason(self, token_info: TokenInfo) -> str | None:
+        """Why the curve refuses this coin, or None to trade it.
+
+        Applies the optional `max_market_cap_sol` and `min_curve_progress_sol`
+        filters. Market cap is price * total supply in SOL; curve progress is
+        the SOL actually paid into the curve by buyers (real_quote_reserves) —
+        a launch nobody touched sits at ~0. Non-SOL-paired coins are left alone
+        because both filters are denominated in SOL.
+        """
+        if self.max_market_cap_sol is None and self.min_curve_progress_sol is None:
+            return None
+        try:
+            implementations = get_platform_implementations(
+                token_info.platform, self.solana_client
+            )
+            curve_manager = implementations.curve_manager
+            pool_address = (
+                token_info.bonding_curve
+                or token_info.pool_state
+                or token_info.associated_bonding_curve
+            )
+            if pool_address is None:
+                return None
+            state = await curve_manager.get_pool_state(pool_address)
+            if not state.get("is_sol_paired", False):
+                return None
+            if state.get("graduated"):
+                return "curve already graduated (on PumpSwap)"
+            price = state.get("price_per_token")
+            total_supply = state.get("token_total_supply", 0)
+            if price is None or total_supply <= 0:
+                return None
+            mc_sol = price * (total_supply / 1e6)
+            if (
+                self.max_market_cap_sol is not None
+                and mc_sol > self.max_market_cap_sol
+            ):
+                return (
+                    f"market cap {mc_sol:.2f} SOL exceeds "
+                    f"max_market_cap_sol {self.max_market_cap_sol}"
+                )
+            real_quote = state.get("real_quote_reserves", 0)
+            progress_sol = real_quote / 1e9
+            if (
+                self.min_curve_progress_sol is not None
+                and progress_sol < self.min_curve_progress_sol
+            ):
+                return (
+                    f"curve progress {progress_sol:.6f} SOL below "
+                    f"min_curve_progress_sol {self.min_curve_progress_sol}"
+                )
+        except Exception:
+            logger.exception("Curve gate check failed")
+            return None
         return None
 
     async def _handle_token(self, token_info: TokenInfo) -> None:
@@ -661,6 +733,13 @@ class UniversalTrader:
                     f"Waiting for {self.wait_time_after_creation} seconds for the pool/curve to stabilize..."
                 )
                 await asyncio.sleep(self.wait_time_after_creation)
+
+            # Curve quality gates (min progress / max MC) — check right before
+            # the buy so a dead or already-pumped coin never costs a tx fee.
+            curve_gate_reason = await self._curve_gate_reason(token_info)
+            if curve_gate_reason:
+                logger.info(f"Skipping {token_info.symbol} - {curve_gate_reason}")
+                return
 
             # Buy token
             logger.info(

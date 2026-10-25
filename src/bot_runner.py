@@ -156,6 +156,9 @@ async def start_bot(config_path: str):
             # Trading filters
             match_string=cfg["filters"].get("match_string"),
             bro_address=cfg["filters"].get("bro_address"),
+            blocked_creators=cfg["filters"].get("blocked_creators"),
+            max_market_cap_sol=cfg["filters"].get("max_market_cap_sol"),
+            min_curve_progress_sol=cfg["filters"].get("min_curve_progress_sol"),
             marry_mode=cfg["filters"].get("marry_mode", False),
             yolo_mode=cfg["filters"].get("yolo_mode", False),
             # Compute unit configuration
