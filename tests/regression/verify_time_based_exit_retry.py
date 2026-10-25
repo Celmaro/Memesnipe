@@ -145,8 +145,15 @@ def _make_trader(
     trader._unsold_watcher_task = None  # noqa: SLF001
     trader.persistent_exit_ttl = 600
     trader.persistent_exit_interval = 15
+    trader.shadow_mode = False
+    trader.stuck_sweep_interval = 0
+    trader.buy_priority_fee = None
+    trader.sell_priority_fee = None
+    trader.min_market_cap_sol = None
+    trader.max_tracked_tokens = 500
     # Keep a verification run from writing to ./trades.
     trader._log_trade = lambda *_args, **_kwargs: None  # noqa: SLF001
+    trader._log_attempt = lambda *_args, **_kwargs: None  # noqa: SLF001
     return trader
 
 

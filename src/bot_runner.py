@@ -163,6 +163,12 @@ async def start_bot(config_path: str):
             blocked_creators=cfg["filters"].get("blocked_creators"),
             max_market_cap_sol=cfg["filters"].get("max_market_cap_sol"),
             min_curve_progress_sol=cfg["filters"].get("min_curve_progress_sol"),
+            min_market_cap_sol=cfg["filters"].get("min_market_cap_sol"),
+            max_tracked_tokens=cfg["filters"].get("max_tracked_tokens", 500),
+            buy_priority_fee=cfg.get("priority_fees", {}).get("buy_fixed_amount"),
+            sell_priority_fee=cfg.get("priority_fees", {}).get("sell_fixed_amount"),
+            stuck_sweep_interval=cfg.get("trade", {}).get("stuck_sweep_interval", 0),
+            shadow_mode=cfg.get("trade", {}).get("shadow_mode", False),
             marry_mode=cfg["filters"].get("marry_mode", False),
             yolo_mode=cfg["filters"].get("yolo_mode", False),
             # Compute unit configuration

@@ -210,10 +210,17 @@ def _make_trader(seller: StubSeller, client: StubClient) -> UniversalTrader:
     trader.cleanup_with_priority_fee = False
     trader.cleanup_force_close_with_burn = False
     trader._log_trade = lambda *_a, **_kw: None  # noqa: SLF001
+    trader._log_attempt = lambda *_a, **_kw: None  # noqa: SLF001
     trader._unsold_positions = {}  # noqa: SLF001
     trader._unsold_watcher_task = None  # noqa: SLF001
     trader.persistent_exit_ttl = 600
     trader.persistent_exit_interval = 15
+    trader.shadow_mode = False
+    trader.stuck_sweep_interval = 0
+    trader.buy_priority_fee = None
+    trader.sell_priority_fee = None
+    trader.min_market_cap_sol = None
+    trader.max_tracked_tokens = 500
     return trader
 
 

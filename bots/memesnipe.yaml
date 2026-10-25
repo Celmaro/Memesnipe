@@ -52,12 +52,23 @@ trade:
   # or this TTL expires (never silently abandoned).
   persistent_exit_ttl: 600 # seconds the watcher keeps trying
   persistent_exit_interval: 15 # seconds between watcher retries
+  # Improvement #3: orphaned-token sweeper (0 = off). Scans the wallet for
+  # tokens the bot owns but isn't tracking (restart leftovers, late-confirmed
+  # buys, abandoned positions) and sells them through the persistent watcher.
+  stuck_sweep_interval: 60 # seconds between wallet scans; 0 disables
+  # Improvement #8: shadow/paper mode — record simulated decisions and
+  # outcomes without sending transactions (backtest the gates risk-free).
+  shadow_mode: false
 
 # Priority fees: transaction speed vs cost (fixed = 0 extra RPC calls)
 priority_fees:
   enable_dynamic: false # MUST be false: dynamic adds 60-250ms on the hot path
   enable_fixed: true
   fixed_amount: 100_000 # Phase 1: ~0.00001 SOL/tx at documented CU defaults
+  # Improvement #6: split buy/sell priority fees — urgent buys may pay more,
+  # sells (already in position) can pay less. Omit to use fixed_amount.
+  # buy_fixed_amount: 150_000
+  # sell_fixed_amount: 50_000
   extra_percentage: 0.0
   hard_cap: 200_000 # ceiling on the CU price
 
@@ -73,6 +84,12 @@ filters:
   blocked_creators: []
   max_market_cap_sol: 40.0 # above pump.fun launch MC (~28 SOL): rejects already-pumped, passes normal launches
   min_curve_progress_sol: 0.25 # Phase 5 trial: skip dead launches
+  # Improvement #4: buy-on-breakout — buy only after MC rises through this.
+  # Leave null to keep pure launch sniping (max cap only).
+  min_market_cap_sol: null
+  # Improvement #5: bound the tracked queue so a launch flood can't grow it
+  # without limit (drop oldest beyond this).
+  max_tracked_tokens: 500
   marry_mode: false # MUST be false so the bot auto-sells
   yolo_mode: true # Phase 3: continuous sniping (freshness fix landed)
 

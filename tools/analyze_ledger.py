@@ -15,11 +15,34 @@ from pathlib import Path
 from statistics import median
 
 
+def _attempt_stats(attempts_path: Path) -> dict:
+    """Count failed attempts per token from the attempts telemetry log."""
+    stats = defaultdict(lambda: {"attempts": 0, "failed": 0})
+    if attempts_path.exists():
+        with attempts_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = entry.get("token_address", "?")
+                stats[key]["attempts"] += 1
+                if entry.get("failure_reason"):
+                    stats[key]["failed"] += 1
+    return stats
+
+
 def main() -> int:
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("trades/trades.log")
+    attempts_path = Path("trades/attempts.log")
     if not path.exists():
         print(f"ledger not found: {path}")
         return 1
+
+    attempts = _attempt_stats(attempts_path)
 
     # Group by token: list of (action, entry)
     by_token: dict[str, list[tuple[str, dict]]] = defaultdict(list)
@@ -72,15 +95,24 @@ def main() -> int:
             f"{s['spent']:>12.6f} {s['received']:>14.6f} {net:>10.6f}"
         )
 
-    # Across the whole ledger: net expectancy per buy
+    # Across the whole ledger: net expectancy per buy and per-attempt cost.
     total_buys = sum(s["buys"] for s in sessions.values())
     total_net = sum(s["received"] - s["spent"] for s in sessions.values())
+    total_attempts = sum(a["attempts"] for a in attempts.values())
     print()
     if total_buys:
         print(f"Total buys: {total_buys}")
         print(f"Total net: {total_net:+.6f} SOL ({total_net / total_buys:+.6f} SOL/buy)")
     else:
         print("No buys with settlement amounts recorded yet.")
+    if total_attempts:
+        # Improvement #2: cost per attempt = total spent across attempts that
+        # ended in a failure or were abandoned, divided by attempts.
+        failed_attempts = sum(a["failed"] for a in attempts.values())
+        print(
+            f"Attempts telemetry: {total_attempts} submissions, "
+            f"{failed_attempts} failed"
+        )
     print("Note: quote_spent/received are only populated when the seller reports them;")
     print("network + protocol fees are not yet itemized per trade.")
 

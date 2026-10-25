@@ -196,6 +196,17 @@ class UniversalTrader:
         blocked_creators: list[str] | None = None,
         max_market_cap_sol: float | None = None,
         min_curve_progress_sol: float | None = None,
+        min_market_cap_sol: float | None = None,
+        max_tracked_tokens: int = 500,
+        # Split buy/sell priority fees: overrides for priority_fees.fixed_amount
+        buy_priority_fee: int | None = None,
+        sell_priority_fee: int | None = None,
+        # Stuck-position wallet sweeper: seconds between scans for orphaned
+        # tokens (0 = off).
+        stuck_sweep_interval: int = 0,
+        # Shadow/paper mode (#8): record simulated decisions and outcomes
+        # without sending transactions or moving funds.
+        shadow_mode: bool = False,
         marry_mode: bool = False,
         yolo_mode: bool = False,
         # Compute unit configuration
@@ -211,7 +222,18 @@ class UniversalTrader:
             client=self.solana_client,
             enable_dynamic_fee=enable_dynamic_priority_fee,
             enable_fixed_fee=enable_fixed_priority_fee,
-            fixed_fee=fixed_priority_fee,
+            fixed_fee=buy_priority_fee or fixed_priority_fee,
+            extra_fee=extra_priority_fee,
+            hard_cap=hard_cap_prior_fee,
+        )
+        # Improvement #6: split buy/sell fees. The buyer keeps the manager
+        # above (buy fee); the seller gets its own manager with the sell fee
+        # so sells never overpay with the urgent buy price.
+        self.sell_priority_fee_manager = PriorityFeeManager(
+            client=self.solana_client,
+            enable_dynamic_fee=enable_dynamic_priority_fee,
+            enable_fixed_fee=enable_fixed_priority_fee,
+            fixed_fee=sell_priority_fee or fixed_priority_fee,
             extra_fee=extra_priority_fee,
             hard_cap=hard_cap_prior_fee,
         )
@@ -267,7 +289,7 @@ class UniversalTrader:
             PlatformAwareSeller(
                 self.solana_client,
                 self.wallet,
-                self.priority_fee_manager,
+                self.sell_priority_fee_manager,
                 sell_slippage,
                 max_retries,
                 compute_units=self.compute_units,
@@ -325,6 +347,12 @@ class UniversalTrader:
         }
         self.max_market_cap_sol = max_market_cap_sol
         self.min_curve_progress_sol = min_curve_progress_sol
+        self.min_market_cap_sol = min_market_cap_sol
+        self.max_tracked_tokens = max_tracked_tokens
+        self.buy_priority_fee = buy_priority_fee
+        self.sell_priority_fee = sell_priority_fee
+        self.stuck_sweep_interval = stuck_sweep_interval
+        self.shadow_mode = shadow_mode
         self.marry_mode = marry_mode
         self.yolo_mode = yolo_mode
 
@@ -346,6 +374,9 @@ class UniversalTrader:
         # ("no longer monitored" from the pre-persistent code).
         self._unsold_positions: dict[str, tuple[TokenInfo, Position]] = {}
         self._unsold_watcher_task: asyncio.Task | None = None
+        # Orphaned-token sweeper task (improvement #3), started when
+        # stuck_sweep_interval > 0.
+        self._stuck_sweeper_task: asyncio.Task | None = None
 
     async def _resolve_quote_token_programs(self) -> None:
         """Warm the quote-mint token-program and decimals caches at startup.
@@ -371,6 +402,65 @@ class UniversalTrader:
                 f"Resolved quote mint {quote_mint} -> token program "
                 f"{token_program}, decimals {quote_decimals(quote_mint)}"
             )
+
+    async def _stuck_token_sweeper(self) -> None:
+        """Periodically scan the wallet for orphaned tokens and sell them.
+
+        Improvement #3: finds tokens the bot owns but is not tracking —
+        leftovers from restarts, late-confirmed buys, or pre-fix abandonments
+        (e.g. the DICE dust). They are not in `_unsold_positions` and have no
+        active exit path, so they would sit forever otherwise. Built as a
+        bounded-scan loop: list token accounts, skip anything the bot already
+        handles, sell the rest through the normal seller at the current price.
+        """
+        from core.pubkeys import WSOL_MINT
+
+        while True:
+            await asyncio.sleep(self.stuck_sweep_interval)
+            try:
+                accounts = await self.solana_client.get_token_accounts_by_owner(
+                    self.wallet.pubkey
+                )
+            except Exception:
+                logger.exception("Stuck-token sweep: wallet scan failed")
+                continue
+            for acct in accounts:
+                try:
+                    mint = acct.get("mint")
+                    balance = acct.get("token_amount", {}).get("amount", "0")
+                    if not mint or int(balance or 0) <= 0:
+                        continue
+                    key = str(mint)
+                    if (
+                        key in self.processed_tokens
+                        or key in self._unsold_positions
+                        or key in {str(m) for m in self.traded_mints}
+                    ):
+                        continue
+                    # Orphaned: not tracked anywhere. Build a minimal TokenInfo
+                    # and hand it to the persistent watcher (which re-prices
+                    # and sells). The watcher's TTL bounds repeated attempts.
+                    token_info = TokenInfo(
+                        name=key[:8],
+                        symbol=key[:6],
+                        uri="",
+                        mint=mint,
+                        platform=self.platform,
+                        quote_mint=WSOL_MINT,
+                    )
+                    position = Position.create_from_buy_result(
+                        mint=mint,
+                        symbol=token_info.symbol,
+                        entry_price=0.0,
+                        quantity=float(balance) / 1e6,
+                    )
+                    logger.warning(
+                        f"Stuck-token sweep found orphan {token_info.symbol} "
+                        f"({key[:16]}...); handing to persistent exit watcher"
+                    )
+                    await self._register_unsold_position(token_info, position)
+                except Exception:
+                    logger.exception("Stuck-token sweep: item failed")
 
     async def start(self) -> None:
         """Start the trading bot and listen for new tokens."""
@@ -411,6 +501,15 @@ class UniversalTrader:
         await self._resolve_quote_token_programs()
 
         try:
+            # Improvement #3: start the orphaned-token sweeper if enabled.
+            if self.stuck_sweep_interval > 0:
+                self._stuck_sweeper_task = asyncio.create_task(
+                    self._stuck_token_sweeper()
+                )
+                logger.info(
+                    f"Stuck-token sweeper started (interval {self.stuck_sweep_interval}s)"
+                )
+
             # Choose operating mode based on yolo_mode
             if not self.yolo_mode:
                 # Single token mode: process one token and exit
@@ -451,6 +550,8 @@ class UniversalTrader:
             logger.exception("Trading stopped due to error")
 
         finally:
+            if self._stuck_sweeper_task is not None:
+                self._stuck_sweeper_task.cancel()
             await self._cleanup_without_interruption()
             logger.info("Universal Trader has shut down")
 
@@ -584,6 +685,23 @@ class UniversalTrader:
             logger.debug(f"Token {token_info.symbol} already processed. Skipping...")
             return
 
+        # Improvement #5: cap the tracked set. Under a launch flood the
+        # listener can queue far more than the processor can drain; drop the
+        # oldest tracked token so the newest launches are never evicted by an
+        # unbounded backlog. The dropped entry was never processed, so it can
+        # still be re-detected on a later notification.
+        if len(self.token_timestamps) >= self.max_tracked_tokens:
+            oldest_key = min(
+                self.token_timestamps,
+                key=lambda k: self.token_timestamps[k],
+            )
+            del self.token_timestamps[oldest_key]
+            self.token_launch_timestamps.pop(oldest_key, None)
+            logger.debug(
+                f"Tracked-token cap ({self.max_tracked_tokens}) reached; "
+                f"dropping oldest {oldest_key[:12]}..."
+            )
+
         # Record timestamp when token was discovered
         self.token_timestamps[token_key] = monotonic()
         # Record the launch timestamp the listener decoded (CreateEvent), when
@@ -687,13 +805,18 @@ class UniversalTrader:
     async def _curve_gate_reason(self, token_info: TokenInfo) -> str | None:
         """Why the curve refuses this coin, or None to trade it.
 
-        Applies the optional `max_market_cap_sol` and `min_curve_progress_sol`
-        filters. Market cap is price * total supply in SOL; curve progress is
-        the SOL actually paid into the curve by buyers (real_quote_reserves) —
-        a launch nobody touched sits at ~0. Non-SOL-paired coins are left alone
-        because both filters are denominated in SOL.
+        Applies the optional `max_market_cap_sol`, `min_market_cap_sol` and
+        `min_curve_progress_sol` filters. Market cap is price * total supply
+        in SOL; curve progress is the SOL actually paid into the curve by
+        buyers (real_quote_reserves) — a launch nobody touched sits at ~0.
+        Non-SOL-paired coins are left alone because the gates are denominated
+        in SOL.
         """
-        if self.max_market_cap_sol is None and self.min_curve_progress_sol is None:
+        if (
+            self.max_market_cap_sol is None
+            and self.min_curve_progress_sol is None
+            and self.min_market_cap_sol is None
+        ):
             return None
         try:
             implementations = get_platform_implementations(
@@ -717,6 +840,17 @@ class UniversalTrader:
             if price is None or total_supply <= 0:
                 return None
             mc_sol = price * (total_supply / 1e6)
+            # Improvement #4: breakout mode — buy only after the market cap
+            # has risen THROUGH min_market_cap_sol (momentum confirmation),
+            # complementing the max cap that rejects already-pumped coins.
+            if (
+                self.min_market_cap_sol is not None
+                and mc_sol < self.min_market_cap_sol
+            ):
+                return (
+                    f"market cap {mc_sol:.2f} SOL below "
+                    f"min_market_cap_sol {self.min_market_cap_sol} (breakout not triggered)"
+                )
             if (
                 self.max_market_cap_sol is not None
                 and mc_sol > self.max_market_cap_sol
@@ -783,7 +917,30 @@ class UniversalTrader:
                 f"{token_quote_mint} worth of {token_info.symbol} "
                 f"on {token_info.platform.value}..."
             )
-            buy_result: TradeResult = await self.buyer.execute(token_info)
+            if self.shadow_mode:
+                # Shadow/paper mode (#8): simulate the fill at the current
+                # curve price (like the normal path would price it) and run
+                # the exit machinery against the simulated position. No
+                # transaction is sent and nothing is logged as spent.
+                sim_price = await self._read_price(token_info)
+                sim_amount = (
+                    self.quote_amounts[token_quote_mint] / sim_price
+                    if sim_price > 0
+                    else 0.0
+                )
+                logger.info(
+                    f"[SHADOW] would buy {sim_amount:.4f} {token_info.symbol} "
+                    f"at {sim_price:.3e} SOL/token (no tx sent)"
+                )
+                buy_result = TradeResult(
+                    success=True,
+                    platform=token_info.platform,
+                    tx_signature=None,
+                    amount=sim_amount,
+                    price=sim_price,
+                )
+            else:
+                buy_result: TradeResult = await self.buyer.execute(token_info)
 
             if buy_result.success:
                 await self._handle_successful_buy(token_info, buy_result)
@@ -845,6 +1002,13 @@ class UniversalTrader:
     ) -> None:
         """Handle failed token purchase."""
         logger.error(f"Failed to buy {token_info.symbol}: {buy_result.error_message}")
+        self._log_attempt(
+            "buy",
+            token_info,
+            1,
+            buy_result.tx_signature,
+            buy_result.error_message,
+        )
         # Close ATA if enabled
         await handle_cleanup_after_failure(
             self.solana_client,
@@ -902,9 +1066,26 @@ class UniversalTrader:
         token_price = buy_result.price
 
         for attempt in range(1, self.max_exit_sell_attempts + 1):
-            sell_result: TradeResult = await self.seller.execute(
-                token_info, token_amount=buy_result.amount, token_price=token_price
-            )
+            if self.shadow_mode:
+                # Shadow mode: simulate the sell at the current read price.
+                price = await self._read_price(token_info)
+                sell_result = TradeResult(
+                    success=price > 0,
+                    platform=token_info.platform,
+                    tx_signature=None,
+                    amount=buy_result.amount,
+                    price=price if price > 0 else 0.0,
+                )
+                logger.info(
+                    f"[SHADOW] would sell {token_info.symbol} at "
+                    f"{price:.3e} SOL/token (no tx sent)"
+                )
+            else:
+                sell_result = await self.seller.execute(
+                    token_info,
+                    token_amount=buy_result.amount or 0.0,
+                    token_price=token_price,
+                )  # type: ignore[arg-type]  # token_price is built from buy_result.price
 
             if sell_result.success:
                 logger.info(f"Successfully sold {token_info.symbol}")
@@ -930,6 +1111,13 @@ class UniversalTrader:
                 f"Failed to sell {token_info.symbol} (attempt "
                 f"{attempt}/{self.max_exit_sell_attempts}): "
                 f"{sell_result.error_message}"
+            )
+            self._log_attempt(
+                "sell",
+                token_info,
+                attempt,
+                sell_result.tx_signature,
+                sell_result.error_message,
             )
 
             verdict = await self._classify_failed_exit_sell(token_info, sell_result)
@@ -1284,6 +1472,38 @@ class UniversalTrader:
             if self._unsold_positions:
                 await asyncio.sleep(self.persistent_exit_interval)
 
+    def _log_attempt(
+        self,
+        action: str,
+        token_info: TokenInfo,
+        attempt: int,
+        tx_hash: str | None,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Append per-attempt telemetry to the ledger (trades/attempts.log).
+
+        Every individual buy/sell submission gets a row with its signature and
+        the reason it was counted as failed, so post-mortems (e.g. a buy that
+        failed to confirm) can be traced attempt-by-attempt.
+        """
+        try:
+            trades_dir = Path("trades")
+            trades_dir.mkdir(exist_ok=True)
+            entry = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "action": action,
+                "symbol": token_info.symbol,
+                "token_address": str(token_info.mint),
+                "attempt": attempt,
+                "tx_hash": str(tx_hash) if tx_hash else None,
+                "failure_reason": failure_reason,
+            }
+            path = trades_dir / "attempts.log"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            logger.exception("Failed to log attempt telemetry")
+
     async def _run_exit_attempt(
         self,
         token_info: TokenInfo,
@@ -1384,6 +1604,13 @@ class UniversalTrader:
             return ExitSellVerdict.SOLD
 
         logger.error(f"Failed to exit position: {sell_result.error_message}")
+        self._log_attempt(
+            "exit_sell",
+            token_info,
+            1,
+            sell_result.tx_signature,
+            sell_result.error_message,
+        )
 
         verdict = await self._classify_failed_exit_sell(token_info, sell_result)
         if verdict is ExitSellVerdict.LATE_SUCCESS:

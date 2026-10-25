@@ -95,6 +95,41 @@ CONFIG_VALIDATION_RULES = [
         float("inf"),
         "filters.min_curve_progress_sol must be a non-negative number",
     ),
+    (
+        "filters.min_market_cap_sol",
+        (int, float, type(None)),
+        0,
+        float("inf"),
+        "filters.min_market_cap_sol must be a non-negative number or null",
+    ),
+    (
+        "filters.max_tracked_tokens",
+        int,
+        1,
+        100_000,
+        "filters.max_tracked_tokens must be between 1 and 100000",
+    ),
+    (
+        "priority_fees.buy_fixed_amount",
+        (int, float),
+        0,
+        float("inf"),
+        "priority_fees.buy_fixed_amount must be a non-negative number",
+    ),
+    (
+        "priority_fees.sell_fixed_amount",
+        (int, float),
+        0,
+        float("inf"),
+        "priority_fees.sell_fixed_amount must be a non-negative number",
+    ),
+    (
+        "trade.stuck_sweep_interval",
+        (int, float),
+        0,
+        86_400,
+        "trade.stuck_sweep_interval must be between 0 and 86400 seconds",
+    ),
 ]
 
 # Config fields that must be a list of strings when present

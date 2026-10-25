@@ -26,6 +26,9 @@ from interfaces.core import ConfirmationStatus, Platform
 from utils.idl_manager import get_idl_parser
 from utils.logger import get_logger
 
+# Token program id for the token-accounts-by-owner scan (stuck sweeper).
+SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
 logger = get_logger(__name__)
 
 HTTP_TOO_MANY_REQUESTS = 429
@@ -333,6 +336,47 @@ class SolanaClient:
         if response.value:
             return int(response.value.amount)
         return 0
+
+    async def get_token_accounts_by_owner(
+        self, owner: Pubkey, commitment: str = "confirmed"
+    ) -> list[dict]:
+        """List the owner's token accounts with mint and balance.
+
+        Used by the stuck-token sweeper to find orphaned holdings. Returns a
+        list of plain dicts ({mint, token_amount: {amount}}) so callers never
+        touch solana-py's nested result objects directly.
+
+        Args:
+            owner: Wallet pubkey to scan
+            commitment: Commitment level for the read
+
+        Returns:
+            List of account summaries; empty on failure or no accounts
+        """
+        from solana.rpc.core import TokenAccountOpts
+
+        await self._rate_limiter.acquire()
+        client = await self.get_client()
+        try:
+            response = await client.get_token_accounts_by_owner(
+                owner,
+                TokenAccountOpts(program_id=SPL_TOKEN_PROGRAM_ID),
+                commitment=commitment,
+            )
+        except Exception:
+            logger.exception("get_token_accounts_by_owner failed")
+            return []
+        out: list[dict] = []
+        if not response.value:
+            return out
+        for item in response.value:
+            parsed = getattr(item.account, "data", None)
+            if parsed is None:
+                continue
+            mint = parsed.get("mint")
+            amount = parsed.get("tokenAmount", {}).get("amount", "0")
+            out.append({"mint": mint, "token_amount": {"amount": amount}})
+        return out
 
     async def get_latest_blockhash(self) -> Hash:
         """Get the latest blockhash."""
