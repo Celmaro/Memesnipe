@@ -58,7 +58,7 @@ trade:
   stuck_sweep_interval: 60 # seconds between wallet scans; 0 disables
   # Improvement #8: shadow/paper mode — record simulated decisions and
   # outcomes without sending transactions (backtest the gates risk-free).
-  shadow_mode: false
+  shadow_mode: true
 
 # Priority fees: transaction speed vs cost (fixed = 0 extra RPC calls)
 priority_fees:

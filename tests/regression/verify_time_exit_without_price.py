@@ -170,6 +170,7 @@ def _make_trader(
     trader = object.__new__(UniversalTrader)
     trader.price_check_interval = price_check_interval
     trader.max_exit_sell_attempts = MAX_EXIT_SELL_ATTEMPTS
+    trader.shadow_mode = False
     trader.platform_implementations = SimpleNamespace(
         curve_manager=curve_manager, address_provider=None
     )

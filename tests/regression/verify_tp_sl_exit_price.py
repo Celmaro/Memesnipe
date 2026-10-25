@@ -121,6 +121,7 @@ def _make_trader(
     trader = object.__new__(UniversalTrader)
     trader.price_check_interval = 0  # no real waiting between iterations
     trader.max_exit_sell_attempts = max_exit_sell_attempts
+    trader.shadow_mode = False
     trader.platform_implementations = SimpleNamespace(
         curve_manager=curve_manager, address_provider=None
     )

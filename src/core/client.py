@@ -20,14 +20,17 @@ from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
+from core.pubkeys import TOKEN_PROGRAM, TOKEN_2022_PROGRAM
 from core.pubkeys import is_sol_paired
 from core.rpc_rate_limiter import TokenBucketRateLimiter
 from interfaces.core import ConfirmationStatus, Platform
 from utils.idl_manager import get_idl_parser
 from utils.logger import get_logger
 
-# Token program id for the token-accounts-by-owner scan (stuck sweeper).
-SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+# Token program ids for the token-accounts-by-owner scan (stuck sweeper).
+# Reuse the canonical Pubkeys from core.pubkeys; do not re-derive strings.
+SPL_TOKEN_PROGRAM_ID = TOKEN_PROGRAM
+TOKEN_2022_PROGRAM_ID = TOKEN_2022_PROGRAM
 
 logger = get_logger(__name__)
 
@@ -377,6 +380,58 @@ class SolanaClient:
             amount = parsed.get("tokenAmount", {}).get("amount", "0")
             out.append({"mint": mint, "token_amount": {"amount": amount}})
         return out
+
+    async def get_token_accounts_by_owner_all_programs(
+        self, owner: Pubkey, commitment: str = "confirmed", retries: int = 3
+    ) -> list[dict]:
+        """List token accounts across SPL and Token-2022 programs.
+
+        The stuck sweeper needs Token-2022 coverage too: reward coins (and
+        older dust like the DICE position) live under TokenzQdBNbLqP...
+
+        PublicNode intermittently answers token-account scans with HTTP 403
+        under load; retry each program's scan with backoff rather than
+        dropping the whole sweep on a transient.
+        """
+        from solana.rpc.core import TokenAccountOpts
+
+        import asyncio as _asyncio
+
+        combined: list[dict] = []
+        for prog in (SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+            last_error: Exception | None = None
+            for attempt in range(retries):
+                try:
+                    await self._rate_limiter.acquire()
+                    client = await self.get_client()
+                    response = await client.get_token_accounts_by_owner(
+                        owner,
+                        TokenAccountOpts(program_id=prog),
+                        commitment=commitment,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    last_error = error
+                    if attempt < retries - 1:
+                        await _asyncio.sleep(3 * (attempt + 1))
+                    continue
+                if not response.value:
+                    break
+                for item in response.value:
+                    parsed = getattr(item.account, "data", None)
+                    if parsed is None:
+                        continue
+                    mint = parsed.get("mint")
+                    amount = parsed.get("tokenAmount", {}).get("amount", "0")
+                    combined.append(
+                        {"mint": mint, "token_amount": {"amount": amount}}
+                    )
+                break
+            else:
+                logger.error(
+                    f"get_token_accounts_by_owner failed for program {prog} "
+                    f"after {retries} attempts: {last_error}"
+                )
+        return combined
 
     async def get_latest_blockhash(self) -> Hash:
         """Get the latest blockhash."""

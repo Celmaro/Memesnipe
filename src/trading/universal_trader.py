@@ -418,7 +418,7 @@ class UniversalTrader:
         while True:
             await asyncio.sleep(self.stuck_sweep_interval)
             try:
-                accounts = await self.solana_client.get_token_accounts_by_owner(
+                accounts = await self.solana_client.get_token_accounts_by_owner_all_programs(
                     self.wallet.pubkey
                 )
             except Exception:
@@ -1568,11 +1568,26 @@ class UniversalTrader:
             f"{quote_symbol(normalize_quote_mint(token_info.quote_mint))})"
         )
 
-        sell_result = await self.seller.execute(
-            token_info,
-            token_amount=position.quantity,
-            token_price=price,
-        )
+        if self.shadow_mode:
+            # Shadow/paper mode (#8): simulate the exit at the current price.
+            sim_price = await self._read_price(token_info)
+            sell_result = TradeResult(
+                success=sim_price > 0,
+                platform=token_info.platform,
+                tx_signature=None,
+                amount=position.quantity,
+                price=sim_price if sim_price > 0 else 0.0,
+            )
+            logger.info(
+                f"[SHADOW] would exit {token_info.symbol} at "
+                f"{sim_price:.3e} SOL/token ({exit_reason.value}, no tx sent)"
+            )
+        else:
+            sell_result = await self.seller.execute(
+                token_info,
+                token_amount=position.quantity,
+                token_price=price,
+            )
 
         if sell_result.success:
             # Close position with actual exit price
