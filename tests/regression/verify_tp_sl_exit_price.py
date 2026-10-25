@@ -133,6 +133,10 @@ def _make_trader(
     trader.cleanup_force_close_with_burn = False
     # Keep a verification run from writing to ./trades.
     trader._log_trade = lambda *_args, **_kwargs: None  # noqa: SLF001
+    trader._unsold_positions = {}  # noqa: SLF001
+    trader._unsold_watcher_task = None  # noqa: SLF001
+    trader.persistent_exit_ttl = 600
+    trader.persistent_exit_interval = 15
     return trader
 
 

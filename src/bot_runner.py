@@ -116,6 +116,10 @@ async def start_bot(config_path: str):
             max_exit_sell_attempts=cfg["trade"].get(
                 "max_exit_sell_attempts", DEFAULT_MAX_EXIT_SELL_ATTEMPTS
             ),
+            persistent_exit_ttl=cfg["trade"].get("persistent_exit_ttl", 600),
+            persistent_exit_interval=cfg["trade"].get(
+                "persistent_exit_interval", 15
+            ),
             # Listener configuration
             listener_type=cfg["filters"]["listener_type"],
             # Geyser configuration (if applicable)

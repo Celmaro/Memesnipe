@@ -221,6 +221,28 @@ def validate_config(config: dict) -> None:
         ):
             raise ValueError(f"{path} must be a list of strings")
 
+    # Interval/hold coherence: an exit that checks the price slower than the
+    # hold window can never fire on schedule. Require at least 4 checks within
+    # max_hold_time (when both are set and exit_strategy is tp_sl).
+    try:
+        exit_strategy = get_nested_value(config, "trade.exit_strategy")
+        hold = get_nested_value(config, "trade.max_hold_time")
+        interval = get_nested_value(config, "trade.price_check_interval")
+        if (
+            exit_strategy == "tp_sl"
+            and hold is not None
+            and interval is not None
+            and interval * 4 > hold
+        ):
+            raise ValueError(
+                f"trade.price_check_interval ({interval}s) is too large for "
+                f"trade.max_hold_time ({hold}s): a tp_sl exit needs at least "
+                f"4 checks inside the hold window (interval <= hold/4)"
+            )
+    except ValueError as e:
+        if "Missing required config key" not in str(e):
+            raise
+
     # Cannot enable both dynamic and fixed priority fees
     try:
         dynamic = get_nested_value(config, "priority_fees.enable_dynamic")

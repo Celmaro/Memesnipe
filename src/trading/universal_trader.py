@@ -169,6 +169,10 @@ class UniversalTrader:
         max_hold_time: int | None = None,
         price_check_interval: int = 10,
         max_exit_sell_attempts: int = DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
+        # Persistent exit monitoring: after the bounded retries are spent, an
+        # unsold position is watched and retried until sold or this TTL (secs).
+        persistent_exit_ttl: int = 600,
+        persistent_exit_interval: int = 15,
         # Priority fee configuration
         enable_dynamic_priority_fee: bool = False,
         enable_fixed_priority_fee: bool = True,
@@ -298,6 +302,8 @@ class UniversalTrader:
             price_check_interval,
             max(1, max_exit_sell_attempts),
         )
+        self.persistent_exit_ttl = persistent_exit_ttl
+        self.persistent_exit_interval = persistent_exit_interval
 
         # Timing parameters
         self.wait_time_after_creation = wait_time_after_creation
@@ -333,6 +339,13 @@ class UniversalTrader:
         # Coins whose graduation has been logged, so it is said once.
         self._graduated_mints: set[Pubkey] = set()
         self.token_timestamps: dict[str, float] = {}
+        self.token_launch_timestamps: dict[str, float] = {}
+        # Positions whose bounded exit retries are spent: mint -> (token_info,
+        # position). A background watcher keeps re-pricing and selling them
+        # until they clear or the TTL expires, instead of abandoning them
+        # ("no longer monitored" from the pre-persistent code).
+        self._unsold_positions: dict[str, tuple[TokenInfo, Position]] = {}
+        self._unsold_watcher_task: asyncio.Task | None = None
 
     async def _resolve_quote_token_programs(self) -> None:
         """Warm the quote-mint token-program and decimals caches at startup.
@@ -573,6 +586,12 @@ class UniversalTrader:
 
         # Record timestamp when token was discovered
         self.token_timestamps[token_key] = monotonic()
+        # Record the launch timestamp the listener decoded (CreateEvent), when
+        # present. Units are the listener's (pump.fun clock); kept raw so a
+        # future clock-aware gate can use it. None means the listener did not
+        # decode one, and freshness falls back to discovery time.
+        if token_info.creation_timestamp is not None:
+            self.token_launch_timestamps[token_key] = token_info.creation_timestamp
 
         await self.token_queue.put(token_info)
         logger.info(
@@ -595,15 +614,26 @@ class UniversalTrader:
                 took_item = True
                 token_key = str(token_info.mint)
 
-                # Check if token is still "fresh"
+                # Check if token is still "fresh". The freshness gate uses the
+                # local discovery time (self.token_timestamps), not the
+                # on-chain launch timestamp, so a backed-up queue cannot evict
+                # a coin that is genuinely new on-chain. The launch timestamp
+                # is recorded in self.token_launch_timestamps and surfaced in
+                # the skip log for diagnostics (its units are listener-owned).
                 current_time = monotonic()
                 token_age = current_time - self.token_timestamps.get(
                     token_key, current_time
                 )
 
+                launch_age = self.token_launch_timestamps.get(token_key)
+                age_note = (
+                    f", launch_ts={launch_age:.3f}" if launch_age is not None else ""
+                )
+
                 if token_age > self.max_token_age:
                     logger.info(
-                        f"Skipping token {token_info.symbol} - too old ({token_age:.1f}s > {self.max_token_age}s)"
+                        f"Skipping token {token_info.symbol} - too old "
+                        f"({token_age:.1f}s queue wait{age_note} > {self.max_token_age}s)"
                     )
                     continue
 
@@ -734,12 +764,18 @@ class UniversalTrader:
                 )
                 await asyncio.sleep(self.wait_time_after_creation)
 
-            # Curve quality gates (min progress / max MC) — check right before
-            # the buy so a dead or already-pumped coin never costs a tx fee.
-            curve_gate_reason = await self._curve_gate_reason(token_info)
-            if curve_gate_reason:
-                logger.info(f"Skipping {token_info.symbol} - {curve_gate_reason}")
-                return
+            # Curve quality gates (min progress / max MC) — only on the non-extreme
+            # path. Block-0 extreme-fast buys have no demand data yet (the
+            # curve is seconds old), so min_curve_progress_sol would reject
+            # every coin; the anti-bundler shield there is the calibrated
+            # extreme_fast_token_amount + slippage cap. The demand-checked
+            # path waits, then reads the curve and applies the gates, so a
+            # dead or already-pumped coin never costs a tx fee.
+            if not self.extreme_fast_mode:
+                curve_gate_reason = await self._curve_gate_reason(token_info)
+                if curve_gate_reason:
+                    logger.info(f"Skipping {token_info.symbol} - {curve_gate_reason}")
+                    return
 
             # Buy token
             logger.info(
@@ -892,7 +928,17 @@ class UniversalTrader:
                 logger.error(
                     f"Stopping exit attempts for {token_info.symbol} after "
                     f"{attempt} attempt(s) - the last sell could not be "
-                    f"resolved. Position stays open and is no longer monitored."
+                    f"resolved. Handing the position to the persistent "
+                    f"exit watcher."
+                )
+                await self._register_unsold_position(
+                    token_info,
+                    Position.create_from_buy_result(
+                        mint=token_info.mint,
+                        symbol=token_info.symbol,
+                        entry_price=buy_result.price or 0.0,
+                        quantity=buy_result.amount or 0.0,
+                    ),
                 )
                 return
 
@@ -906,8 +952,17 @@ class UniversalTrader:
 
         logger.error(
             f"Giving up on selling {token_info.symbol} after "
-            f"{self.max_exit_sell_attempts} attempts. Position stays open "
-            f"and is no longer monitored - tokens are still held."
+            f"{self.max_exit_sell_attempts} attempts. Handing the position to "
+            f"the persistent exit watcher - tokens are still held."
+        )
+        await self._register_unsold_position(
+            token_info,
+            Position.create_from_buy_result(
+                mint=token_info.mint,
+                symbol=token_info.symbol,
+                entry_price=buy_result.price or 0.0,
+                quantity=buy_result.amount or 0.0,
+            ),
         )
 
     async def _classify_failed_exit_sell(
@@ -1130,6 +1185,89 @@ class UniversalTrader:
                     self.price_check_interval
                 )  # Continue monitoring despite errors
 
+    async def _register_unsold_position(
+        self, token_info: TokenInfo, position: Position
+    ) -> None:
+        """Hand a position to the persistent exit watcher.
+
+        Called when the bounded exit retries are spent. The watcher keeps
+        re-reading the price and selling until the position clears or
+        `persistent_exit_ttl` expires, so a temporarily unsellable token is
+        never silently abandoned.
+        """
+        key = str(token_info.mint)
+        if position.quantity <= 0:
+            logger.warning(
+                f"{token_info.symbol}: no quantity left to sell; skipping "
+                f"persistent exit watcher"
+            )
+            return
+        self._unsold_positions[key] = (token_info, position)
+        logger.warning(
+            f"{token_info.symbol}: bounded exit retries spent; "
+            f"registering with persistent exit watcher "
+            f"(TTL {self.persistent_exit_ttl}s, interval {self.persistent_exit_interval}s)"
+        )
+        if self._unsold_watcher_task is None or self._unsold_watcher_task.done():
+            self._unsold_watcher_task = asyncio.create_task(
+                self._unsold_position_watcher()
+            )
+
+    async def _unsold_position_watcher(self) -> None:
+        """Continuously attempt to clear unsold positions until TTL expiry."""
+        from time import monotonic as _monotonic
+
+        # Track when each position entered the watcher for the TTL bound.
+        entered: dict[str, float] = {
+            key: _monotonic() for key in self._unsold_positions
+        }
+        while self._unsold_positions:
+            # Back off before (re)trying: the hot-path exit retries were just
+            # spent seconds ago, so an immediate redundant sell would both waste
+            # a fee and break the bounded-retry contract tests rely on.
+            await asyncio.sleep(self.persistent_exit_interval)
+            now = _monotonic()
+            for key in list(self._unsold_positions):
+                token_info, position = self._unsold_positions[key]
+                if now - entered[key] > self.persistent_exit_ttl:
+                    logger.error(
+                        f"Persistent exit TTL expired for {token_info.symbol}; "
+                        f"tokens still held ({position.quantity}). "
+                        f"Reclaim with tools/cleanup_accounts.py {token_info.mint}"
+                    )
+                    del self._unsold_positions[key]
+                    continue
+                try:
+                    price = await self._read_price(token_info)
+                except Exception:
+                    logger.exception(
+                        f"Persistent exit price read failed for {token_info.symbol}"
+                    )
+                    continue
+                if price is None or price <= 0:
+                    logger.debug(
+                        f"Persistent exit: no usable price for {token_info.symbol}; retrying"
+                    )
+                    continue
+                # Reuse the same exit-sell path as the monitor loop, with a
+                # fresh price floor; MANUAL keeps the exit reason neutral.
+                verdict = await self._attempt_position_exit(
+                    token_info,
+                    position,
+                    ExitReason.MANUAL,
+                    price,
+                )
+                if verdict is ExitSellVerdict.RETRY:
+                    logger.debug(
+                        f"Persistent exit retry needed for {token_info.symbol}"
+                    )
+                else:
+                    del self._unsold_positions[key]
+                    if key in entered:
+                        del entered[key]
+            if self._unsold_positions:
+                await asyncio.sleep(self.persistent_exit_interval)
+
     async def _run_exit_attempt(
         self,
         token_info: TokenInfo,
@@ -1160,9 +1298,10 @@ class UniversalTrader:
         if attempt >= self.max_exit_sell_attempts:
             logger.error(
                 f"Giving up on exiting {token_info.symbol} after "
-                f"{attempt} attempts. Position stays open "
-                f"and is no longer monitored - tokens are still held."
+                f"{attempt} attempts. Handing the position to the persistent "
+                f"exit watcher - tokens are still held."
             )
+            await self._register_unsold_position(token_info, position)
             return True
         return False
 
@@ -1312,8 +1451,20 @@ class UniversalTrader:
         price: float,
         amount: float,
         tx_hash: str | None,
+        quote_spent_sol: float | None = None,
+        quote_received_sol: float | None = None,
     ) -> None:
-        """Log trade information."""
+        """Log trade information to the execution ledger (trades/trades.log).
+
+        Args:
+            action: "buy" or "sell"
+            token_info: The traded token
+            price: Price in the coin's quote asset per whole token
+            amount: Token quantity
+            tx_hash: Transaction signature
+            quote_spent_sol: SOL value paid out (buys, settlement-denominated)
+            quote_received_sol: SOL value received (sells)
+        """
         try:
             trades_dir = Path("trades")
             trades_dir.mkdir(exist_ok=True)
@@ -1327,6 +1478,9 @@ class UniversalTrader:
                 "price": price,
                 "amount": amount,
                 "tx_hash": str(tx_hash) if tx_hash else None,
+                # Phase 6 ledger: net-of-fee settlement in SOL when known.
+                "quote_spent_sol": quote_spent_sol,
+                "quote_received_sol": quote_received_sol,
             }
 
             log_file_path = trades_dir / "trades.log"
