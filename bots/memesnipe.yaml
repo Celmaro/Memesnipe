@@ -58,7 +58,7 @@ trade:
   stuck_sweep_interval: 60 # seconds between wallet scans; 0 disables
   # Improvement #8: shadow/paper mode — record simulated decisions and
   # outcomes without sending transactions (backtest the gates risk-free).
-  shadow_mode: true
+  shadow_mode: false
 
 # Priority fees: transaction speed vs cost (fixed = 0 extra RPC calls)
 priority_fees:
@@ -90,6 +90,7 @@ filters:
   # Improvement #5: bound the tracked queue so a launch flood can't grow it
   # without limit (drop oldest beyond this).
   max_tracked_tokens: 500
+  fail_closed_gates: true # RPC error in a gate = refuse the coin, not pass it
   marry_mode: false # MUST be false so the bot auto-sells
   yolo_mode: true # Phase 3: continuous sniping (freshness fix landed)
 

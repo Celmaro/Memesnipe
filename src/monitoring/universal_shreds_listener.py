@@ -145,7 +145,19 @@ class UniversalShredsListener(BaseTokenListener):
                 )
             )
         creds = grpc.composite_channel_credentials(grpc.ssl_channel_credentials(), auth)
-        channel = grpc.aio.secure_channel(self.geyser_endpoint, creds)
+        channel = grpc.aio.secure_channel(
+            self.geyser_endpoint,
+            creds,
+            options=[
+                ("grpc.max_receive_message_length", 128 * 1024 * 1024),
+                ("grpc.max_send_message_length", 128 * 1024 * 1024),
+                ("grpc.keepalive_time_ms", 30000),
+                ("grpc.keepalive_timeout_ms", 10000),
+                ("grpc.keepalive_permit_without_calls", 1),
+                ("grpc.http2.max_pings_without_data", 0),
+                ("grpc.enable_http_proxy", 0),
+            ],
+        )
 
         return geyser_pb2_grpc.GeyserStub(channel), channel
 

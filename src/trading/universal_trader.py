@@ -35,6 +35,7 @@ from interfaces.core import (
     TradeFailureReason,
 )
 from monitoring.listener_factory import ListenerFactory
+from monitoring.metrics import metrics
 from platforms import get_platform_implementations
 from trading.base import TradeResult
 from trading.platform_aware import PlatformAwareBuyer, PlatformAwareSeller
@@ -207,6 +208,9 @@ class UniversalTrader:
         # Shadow/paper mode (#8): record simulated decisions and outcomes
         # without sending transactions or moving funds.
         shadow_mode: bool = False,
+        # Fail-closed gates: when a quality gate cannot get its data (RPC
+        # error), refuse the coin instead of letting it through unchecked.
+        fail_closed_gates: bool = True,
         marry_mode: bool = False,
         yolo_mode: bool = False,
         # Compute unit configuration
@@ -353,6 +357,7 @@ class UniversalTrader:
         self.sell_priority_fee = sell_priority_fee
         self.stuck_sweep_interval = stuck_sweep_interval
         self.shadow_mode = shadow_mode
+        self.fail_closed_gates = fail_closed_gates
         self.marry_mode = marry_mode
         self.yolo_mode = yolo_mode
 
@@ -530,6 +535,7 @@ class UniversalTrader:
                     "Running in continuous mode - will process tokens until interrupted"
                 )
                 processor_task = asyncio.create_task(self._process_token_queue())
+                metrics_task = asyncio.create_task(self._metrics_logger())
 
                 try:
                     await self.token_listener.listen_for_tokens(
@@ -540,9 +546,18 @@ class UniversalTrader:
                 except Exception:
                     logger.exception("Token listening stopped due to error")
                 finally:
+                    # Drain what is still fresh before cancelling, mirroring
+                    # carbon's ProcessPending shutdown strategy: queued
+                    # launches would otherwise be dropped mid-flight.
+                    await self._drain_token_queue(self.max_token_age)
                     processor_task.cancel()
                     try:
                         await processor_task
+                    except asyncio.CancelledError:
+                        pass
+                    metrics_task.cancel()
+                    try:
+                        await metrics_task
                     except asyncio.CancelledError:
                         pass
 
@@ -731,6 +746,8 @@ class UniversalTrader:
                 token_info = await self.token_queue.get()
                 took_item = True
                 token_key = str(token_info.mint)
+                metrics.set_gauge("token_queue.depth", self.token_queue.qsize())
+                metrics.incr("tokens.dequeued")
 
                 # Check if token is still "fresh". The freshness gate uses the
                 # local discovery time (self.token_timestamps), not the
@@ -753,6 +770,7 @@ class UniversalTrader:
                         f"Skipping token {token_info.symbol} - too old "
                         f"({token_age:.1f}s queue wait{age_note} > {self.max_token_age}s)"
                     )
+                    metrics.incr("tokens.skipped_stale")
                     continue
 
                 self.processed_tokens.add(token_key)
@@ -760,18 +778,71 @@ class UniversalTrader:
                 logger.info(
                     f"Processing fresh token: {token_info.symbol} (age: {token_age:.1f}s)"
                 )
-                await self._handle_token(token_info)
+                started = monotonic()
+                try:
+                    await self._handle_token(token_info)
+                finally:
+                    metrics.record("token.processing", monotonic() - started)
 
             except asyncio.CancelledError:
                 logger.info("Token queue processor was cancelled")
                 break
             except Exception:
                 logger.exception("Error in token queue processor")
+                metrics.incr("tokens.queue_errors")
             finally:
                 # The stale-token `continue` above took an item, so it still
                 # needs this; a cancellation parked on `get()` did not.
                 if took_item:
                     self.token_queue.task_done()
+
+    async def _metrics_logger(self) -> None:
+        """Log runtime metrics every 60s (T1.7)."""
+        while True:
+            await asyncio.sleep(60)
+            snap = metrics.snapshot()
+            hist = snap["hist"].get("token.processing", {})
+            logger.info(
+                "metrics: received=%d detected=%d processed=%d queue_depth=%d "
+                "proc_avg=%ss proc_p95=%ss errors=%d stale=%d",
+                snap["counters"].get("geyser.updates_received", 0),
+                snap["counters"].get("geyser.tokens_detected", 0),
+                snap["counters"].get("tokens.dequeued", 0),
+                snap["gauges"].get("token_queue.depth", 0),
+                hist.get("avg", 0.0),
+                hist.get("p95", 0.0),
+                snap["counters"].get("tokens.queue_errors", 0),
+                snap["counters"].get("tokens.skipped_stale", 0),
+            )
+
+    async def _drain_token_queue(self, max_age: float) -> None:
+        """Process whatever is still fresh in the queue, then stop (T1.7).
+
+        Cancelling the queue processor drops in-flight launches; this drains
+        them first, honoring the same freshness gate the steady-state loop
+        applies. A stale item is `task_done()`d and skipped; a fresh one goes
+        through the normal handler so positions still get exits on shutdown.
+        """
+        while not self.token_queue.empty():
+            token_info = await self.token_queue.get()
+            try:
+                token_key = str(token_info.mint)
+                token_age = monotonic() - self.token_timestamps.get(
+                    token_key, monotonic()
+                )
+                if token_age > max_age:
+                    logger.info(
+                        f"Drain: skipping {token_info.symbol} - too old ({token_age:.1f}s)"
+                    )
+                    metrics.incr("tokens.skipped_stale")
+                    continue
+                self.processed_tokens.add(token_key)
+                logger.info(
+                    f"Drain: processing fresh token {token_info.symbol} (age: {token_age:.1f}s)"
+                )
+                await self._handle_token(token_info)
+            finally:
+                self.token_queue.task_done()
 
     def _skip_reason(self, token_info: TokenInfo) -> str | None:
         """Why the configured filters refuse this coin, or None to trade it.
@@ -871,6 +942,8 @@ class UniversalTrader:
                 )
         except Exception:
             logger.exception("Curve gate check failed")
+            if getattr(self, "fail_closed_gates", True):
+                return "curve gate check failed (RPC error) - fail-closed"
             return None
         return None
 
@@ -1467,8 +1540,7 @@ class UniversalTrader:
                     )
                 else:
                     del self._unsold_positions[key]
-                    if key in entered:
-                        del entered[key]
+                    entered.pop(key, None)
             if self._unsold_positions:
                 await asyncio.sleep(self.persistent_exit_interval)
 

@@ -132,6 +132,14 @@ CONFIG_VALIDATION_RULES = [
     ),
 ]
 
+# Config fields that must be a boolean when present
+BOOL_FIELDS = [
+    "filters.fail_closed_gates",
+    "filters.marry_mode",
+    "filters.yolo_mode",
+    "trade.shadow_mode",
+]
+
 # Config fields that must be a list of strings when present
 LIST_OF_STR_FIELDS = ["filters.blocked_creators"]
 
@@ -255,6 +263,19 @@ def validate_config(config: dict) -> None:
             isinstance(item, str) for item in value
         ):
             raise ValueError(f"{path} must be a list of strings")
+
+    # Validate boolean fields (e.g. filters.fail_closed_gates)
+    for path in BOOL_FIELDS:
+        try:
+            value = get_nested_value(config, path)
+        except ValueError as e:
+            if "Missing required config key" in str(e):
+                continue
+            raise
+        if value is None:
+            continue
+        if not isinstance(value, bool):
+            raise ValueError(f"{path} must be a boolean (true/false)")
 
     # Interval/hold coherence: an exit that checks the price slower than the
     # hold window can never fire on schedule. Require at least 4 checks within

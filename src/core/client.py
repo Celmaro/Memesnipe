@@ -1,6 +1,7 @@
 """Solana client abstraction for blockchain operations."""
 
 import asyncio
+import enum
 import random
 import struct
 from time import monotonic
@@ -20,8 +21,7 @@ from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
-from core.pubkeys import TOKEN_PROGRAM, TOKEN_2022_PROGRAM
-from core.pubkeys import is_sol_paired
+from core.pubkeys import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, is_sol_paired
 from core.rpc_rate_limiter import TokenBucketRateLimiter
 from interfaces.core import ConfirmationStatus, Platform
 from utils.idl_manager import get_idl_parser
@@ -45,6 +45,46 @@ INSTRUCTION_ERROR_PAIR_LEN = 2
 # transaction", which on a load-balanced endpoint is not the same as "it failed".
 TX_RESULT_RETRY_BUDGET = 5.0
 TX_RESULT_RETRY_DELAY = 0.4
+
+
+class TxFailureKind(enum.Enum):
+    """Why a transaction send failed, driving whether retry can help.
+
+    Mapped from the RPC error text at the send call site. `UNKNOWN` is the
+    default and the only safe catch-all: a generic failure string must not be
+    treated as a retryable one.
+    """
+
+    BLOCKHASH_EXPIRED = "blockhash_expired"
+    INSUFFICIENT_FUNDS = "insufficient_funds"
+    TXN_SIMULATION_FAILED = "txn_simulation_failed"
+    SLIPPAGE_EXCEEDED = "slippage_exceeded"
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
+
+
+#: Substrings that classify a send exception. Order matters: check the most
+#: specific first. These are the on-chain / preflight verdicts that come back
+#: as exceptions.
+_FAILURE_MARKERS: tuple[tuple[str, TxFailureKind], ...] = (
+    ("BlockhashNotFound", TxFailureKind.BLOCKHASH_EXPIRED),
+    ("blockhash not found", TxFailureKind.BLOCKHASH_EXPIRED),
+    ("insufficient funds", TxFailureKind.INSUFFICIENT_FUNDS),
+    ("InsufficientFundsForRent", TxFailureKind.INSUFFICIENT_FUNDS),
+    ("Transaction simulation failed", TxFailureKind.TXN_SIMULATION_FAILED),
+    ("simulation failed", TxFailureKind.TXN_SIMULATION_FAILED),
+    ("Slippage", TxFailureKind.SLIPPAGE_EXCEEDED),
+    ("slippage", TxFailureKind.SLIPPAGE_EXCEEDED),
+)
+
+
+def classify_tx_failure(exc: BaseException) -> TxFailureKind:
+    """Classify a send exception into a retry policy category."""
+    text = str(exc)
+    for marker, kind in _FAILURE_MARKERS:
+        if marker in text:
+            return kind
+    return TxFailureKind.UNKNOWN
 
 
 class _Deadline:
@@ -393,9 +433,9 @@ class SolanaClient:
         under load; retry each program's scan with backoff rather than
         dropping the whole sweep on a transient.
         """
-        from solana.rpc.core import TokenAccountOpts
-
         import asyncio as _asyncio
+
+        from solana.rpc.core import TokenAccountOpts
 
         combined: list[dict] = []
         for prog in (SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
@@ -512,15 +552,26 @@ class SolanaClient:
                 return response.value
 
             except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.exception(
-                        f"Failed to send transaction after {max_retries} attempts"
-                    )
+                kind = classify_tx_failure(e)
+                terminal = kind in {
+                    TxFailureKind.INSUFFICIENT_FUNDS,
+                    TxFailureKind.BLOCKHASH_EXPIRED,
+                }
+                if attempt == max_retries - 1 or terminal:
+                    if terminal:
+                        logger.error(
+                            f"Transaction send failed ({kind.value}), not retrying: {e!s}"
+                        )
+                    else:
+                        logger.exception(
+                            f"Failed to send transaction after {max_retries} attempts"
+                        )
                     raise
 
                 wait_time = 2**attempt
                 logger.warning(
-                    f"Transaction attempt {attempt + 1} failed: {e!s}, retrying in {wait_time}s"
+                    f"Transaction attempt {attempt + 1} failed ({kind.value}): "
+                    f"{e!s}, retrying in {wait_time}s"
                 )
                 await asyncio.sleep(wait_time)
 

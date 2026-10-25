@@ -169,6 +169,7 @@ async def start_bot(config_path: str):
             sell_priority_fee=cfg.get("priority_fees", {}).get("sell_fixed_amount"),
             stuck_sweep_interval=cfg.get("trade", {}).get("stuck_sweep_interval", 0),
             shadow_mode=cfg.get("trade", {}).get("shadow_mode", False),
+            fail_closed_gates=cfg.get("filters", {}).get("fail_closed_gates", True),
             marry_mode=cfg["filters"].get("marry_mode", False),
             yolo_mode=cfg["filters"].get("yolo_mode", False),
             # Compute unit configuration
