@@ -25,6 +25,14 @@ geyser:
   auth_type: "x-token"
 
 # Trade execution: amount per trade and acceptable price deviation
+# Research data capture (shadow-mode backtesting). When trade.shadow_mode is
+# on, every detect (token seen + skip reason), sim_open (paper buy) and
+# sim_close (paper sell/exit, incl. realized PnL) is appended as JSONL under
+# shadow_data/YYYY-MM-DD.jsonl. Shadow-only: never active with real funds.
+research:
+  shadow_capture_enabled: true
+  shadow_data_dir: shadow_data
+
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
   # to drain). Scale up only with a live execution ledger (Phase 6).
@@ -160,7 +168,8 @@ filters:
   # T3.2: copy-trader engine (disabled by default; off = safe baseline).
   # Mirrors leader buys only for wallets inserted into the targets DB.
   copy_trader:
-    enabled: false
+    enabled: true # 5 targets loaded 2026-10-26 (Tier 1/3). Shadow-safe: mirror
+                  # buys simulate + record to shadow_data/ in shadow mode.
     db: /home/agentuser/Memesnipe/state/copy_targets.db
     min_buy_interval: 5.0 # seconds between mirrored buys (rate guard)
 

@@ -29,6 +29,7 @@ from config_loader import (
     print_config_summary,
     validate_platform_listener_combination,
 )
+from research.shadow_capture import ShadowDataCapture
 from trading.universal_trader import (
     DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
     UniversalTrader,
@@ -232,6 +233,21 @@ async def start_bot(config_path: str):
             sell_priority_fee=cfg.get("priority_fees", {}).get("sell_fixed_amount"),
             stuck_sweep_interval=cfg.get("trade", {}).get("stuck_sweep_interval", 0),
             shadow_mode=cfg.get("trade", {}).get("shadow_mode", False),
+            # Shadow research capture: when shadow mode is on and capture is
+            # enabled, the trader gets an append-only JSONL ledger of every
+            # detect/sim_open/sim_close event for backtesting.
+            shadow_capture=(
+                ShadowDataCapture(
+                    dir_path=cfg.get("research", {}).get(
+                        "shadow_data_dir", "shadow_data"
+                    )
+                )
+                if (
+                    cfg.get("trade", {}).get("shadow_mode", False)
+                    and cfg.get("research", {}).get("shadow_capture_enabled", True)
+                )
+                else None
+            ),
             fail_closed_gates=cfg.get("filters", {}).get("fail_closed_gates", True),
             marry_mode=cfg["filters"].get("marry_mode", False),
             yolo_mode=cfg["filters"].get("yolo_mode", False),

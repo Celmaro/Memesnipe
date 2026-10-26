@@ -241,6 +241,7 @@ BOOL_FIELDS = [
     "filters.yolo_mode",
     "filters.honeypot_freeze_authority",
     "trade.shadow_mode",
+    "research.shadow_capture_enabled",  # 2026-10-26 shadow research capture
     "trade.backfill.enabled",
     "trade.close_ata_on_sell",  # P2-EXIT-5
     "filters.creator_pnl_blacklist_enabled",  # P2-STRUC-2

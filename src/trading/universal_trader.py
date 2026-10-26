@@ -170,6 +170,11 @@ class UniversalTrader:
         rug_min_unique_buyers: int = 2,
         rug_check_slots: int = 12,
         rug_early_drain_ratio: float = 0.5,
+        # Shadow research capture (off by default): append-only JSONL ledger
+        # of detect/sim_open/sim_close events so shadow runs produce
+        # replayable data for backtesting. Belt-and-suspenders guard with
+        # shadow_mode: capture only writes when BOTH are set.
+        shadow_capture: Any = None,
         # Platform configuration
         platform: Platform | str = Platform.PUMP_FUN,
         # Listener configuration
@@ -438,6 +443,10 @@ class UniversalTrader:
         self.rug_min_unique_buyers = rug_min_unique_buyers
         self.rug_check_slots = rug_check_slots
         self.rug_early_drain_ratio = rug_early_drain_ratio
+        # Shadow research capture — only live when shadow_mode is also on.
+        # Uses the constructor param here: self.shadow_mode is assigned
+        # later in __init__.
+        self.shadow_capture = shadow_capture if shadow_mode else None
         # mint -> set of buyer wallet strings observed via trade events.
         self._rug_buyers: dict[str, set[str]] = {}
         # mint -> (entry_slot, entry_real_quote_lamports)
@@ -733,6 +742,21 @@ class UniversalTrader:
             if self._stuck_sweeper_task is not None:
                 self._stuck_sweeper_task.cancel()
             await self._cleanup_without_interruption()
+            # Shadow research capture: one aggregate row per session so a
+            # backtest can see the whole run at a glance.
+            if self.shadow_capture is not None:
+                try:
+                    self.shadow_capture.summary(
+                        shadow=True,
+                        tokens_traded=len(self.traded_mints),
+                        rug_heuristics=self.rug_heuristics_enabled,
+                        creator_pnl_blacklist=(
+                            self.creator_pnl_blacklist_enabled
+                        ),
+                        exit_strategy=self.exit_strategy,
+                    )
+                except Exception:
+                    logger.exception("Shadow summary capture failed")
             logger.info("Universal Trader has shut down")
 
     async def _init_copy_trader(self) -> None:
@@ -816,8 +840,37 @@ class UniversalTrader:
     async def _mirror_buy(
         self, token_info: TokenInfo, target: Any, size_sol: float
     ) -> bool:
-        """Mirror a leader buy through a fresh buyer sized per target (T3.2)."""
+        """Mirror a leader buy through a fresh buyer sized per target (T3.2).
+
+        Shadow-aware: when shadow_mode is on, the mirror is simulated at the
+        current price and recorded in the research ledger (no transaction is
+        sent). Real mode keeps the dedicated-buyer path.
+        """
         try:
+            if self.shadow_capture is not None:
+                price = await self._read_price(token_info)
+                logger.info(
+                    f"[SHADOW] would mirror {target.alias or target.wallet[:8]} "
+                    f"buy of {token_info.symbol} for {size_sol:.6f} SOL "
+                    f"at {price:.3e} SOL/token (no tx sent)"
+                )
+                self.shadow_capture.sim_open(
+                    mint=str(token_info.mint),
+                    symbol=token_info.symbol,
+                    platform=token_info.platform.value,
+                    price=price,
+                    amount_tokens=(
+                        size_sol / price if price > 0 else 0.0
+                    ),
+                    quote_spent=size_sol,
+                    pool_snapshot=await self._pool_snapshot(token_info),
+                    mirror_of=(
+                        target.alias
+                        or str(target.wallet)[:8]
+                    ),
+                )
+                return True
+
             # The sniper's buyer is sized from config; a copy target carries
             # its own size (fixed or percent-of-leader), so build a dedicated
             # buyer for the mirror.
@@ -1307,9 +1360,78 @@ class UniversalTrader:
             return None
         return None
 
+    def _capture_detect(
+        self, token_info: TokenInfo, skip_reason: str | None = None
+    ) -> None:
+        """Record one detector event (skip reason included) for research."""
+        if self.shadow_capture is None:
+            return
+        try:
+            self.shadow_capture.detect(
+                mint=str(token_info.mint),
+                symbol=token_info.symbol,
+                platform=token_info.platform.value,
+                quote_mint=str(normalize_quote_mint(token_info.quote_mint)),
+                creator=(
+                    str(token_info.creator) if token_info.creator else None
+                ),
+                transfer_fee_bps=token_info.transfer_fee_bps,
+                listener=getattr(self.token_listener, "listener_type", ""),
+                skip_reason=skip_reason,
+            )
+        except Exception:
+            logger.exception("Shadow detect capture failed")
+
+    async def _pool_snapshot(self, token_info: TokenInfo) -> dict:
+        """Real on-chain pool state at this moment, for research capture.
+
+        Returns the curve's decoded state (reserves, graduated, mayhem,
+        cashback, fees, price, MC) or {} on any failure — research data is
+        best-effort and must never raise into the trade path.
+        """
+        if self.shadow_capture is None:
+            return {}
+        try:
+            implementations = get_platform_implementations(
+                token_info.platform, self.solana_client
+            )
+            pool_address = (
+                token_info.bonding_curve
+                or token_info.pool_state
+                or implementations.address_provider.derive_pool_address(
+                    token_info.mint
+                )
+            )
+            state = await implementations.curve_manager.get_pool_state(
+                pool_address
+            )
+            if not state:
+                return {}
+            keep = {
+                "virtual_quote_reserves",
+                "virtual_token_reserves",
+                "real_quote_reserves",
+                "real_token_reserves",
+                "graduated",
+                "is_mayhem_mode",
+                "is_cashback_coin",
+                "fee_fraction",
+                "transfer_fee_bps",
+                "price_per_token",
+            }
+            return {k: state.get(k) for k in keep if k in state}
+        except Exception:
+            logger.exception("Pool snapshot capture failed")
+            return {}
+
     async def _handle_token(self, token_info: TokenInfo) -> None:
         """Handle a new token creation event."""
         try:
+            # Shadow research capture: record every token the detector hands
+            # over — the raw opportunity set — with the reason a filter
+            # refused it (if any), so backtests see what was thrown away.
+            self._capture_detect(token_info)
+
             # Validate that token is for our platform
             if token_info.platform != self.platform:
                 logger.warning(
@@ -1320,6 +1442,7 @@ class UniversalTrader:
             skip_reason = self._skip_reason(token_info)
             if skip_reason:
                 logger.info(f"Skipping {token_info.symbol} - {skip_reason}")
+                self._capture_detect(token_info, skip_reason)
                 return
             token_quote_mint = normalize_quote_mint(token_info.quote_mint)
 
@@ -1342,6 +1465,7 @@ class UniversalTrader:
                 curve_gate_reason = await self._curve_gate_reason(token_info)
                 if curve_gate_reason:
                     logger.info(f"Skipping {token_info.symbol} - {curve_gate_reason}")
+                    self._capture_detect(token_info, curve_gate_reason)
                     return
 
                 # T2.4: confirmation window. A single gate pass can be a
@@ -1394,6 +1518,16 @@ class UniversalTrader:
                     amount=sim_amount,
                     price=sim_price,
                 )
+                if self.shadow_capture is not None:
+                    self.shadow_capture.sim_open(
+                        mint=str(token_info.mint),
+                        symbol=token_info.symbol,
+                        platform=token_info.platform.value,
+                        price=sim_price,
+                        amount_tokens=sim_amount,
+                        quote_spent=self.quote_amounts.get(token_quote_mint, 0.0),
+                        pool_snapshot=await self._pool_snapshot(token_info),
+                    )
             else:
                 buy_result: TradeResult = await self.buyer.execute(token_info)
 
@@ -1578,6 +1712,25 @@ class UniversalTrader:
                     f"[SHADOW] would sell {token_info.symbol} at "
                     f"{price:.3e} SOL/token (no tx sent)"
                 )
+                if self.shadow_capture is not None:
+                    # Shadow close for the time-based path: realized PnL is
+                    # computed off the simulated sell price vs the buy price.
+                    buy_px = buy_result.price or 0.0
+                    amount = buy_result.amount or 0.0
+                    pnl_quote = (price - buy_px) * amount
+                    self.shadow_capture.sim_close(
+                        mint=str(token_info.mint),
+                        symbol=token_info.symbol,
+                        platform=token_info.platform.value,
+                        price=price,
+                        amount_tokens=amount,
+                        quote_received=price * amount,
+                        exit_reason="time_based_sell",
+                        pnl_quote=pnl_quote,
+                        pnl_pct=(price - buy_px) / buy_px if buy_px > 0 else 0.0,
+                        hold_seconds=self.wait_time_after_buy or 0.0,
+                        pool_snapshot=await self._pool_snapshot(token_info),
+                    )
             else:
                 sell_result = await self.seller.execute(
                     token_info,
@@ -2215,6 +2368,23 @@ class UniversalTrader:
                 f"[SHADOW] would exit {token_info.symbol} at "
                 f"{sim_price:.3e} SOL/token ({exit_reason.value}, no tx sent)"
             )
+            if self.shadow_capture is not None:
+                hold_seconds = (
+                    datetime.now() - position.entry_time
+                ).total_seconds()
+                self.shadow_capture.sim_close(
+                    mint=str(token_info.mint),
+                    symbol=token_info.symbol,
+                    platform=token_info.platform.value,
+                    price=sim_price,
+                    amount_tokens=position.quantity,
+                    quote_received=sim_price * position.quantity,
+                    exit_reason=exit_reason.value,
+                    pnl_quote=float(pnl.get("unrealized_pnl_quote", 0.0)),
+                    pnl_pct=float(pnl.get("price_change_pct", 0.0)),
+                    hold_seconds=hold_seconds,
+                    pool_snapshot=await self._pool_snapshot(token_info),
+                )
         else:
             sell_result = await self.seller.execute(
                 token_info,
