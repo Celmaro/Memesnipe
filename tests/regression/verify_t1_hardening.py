@@ -128,6 +128,7 @@ check("watchdog sets force-reconnect", asyncio.run(_watchdog_probe()))
 from trading.universal_trader import UniversalTrader
 
 stub = object.__new__(UniversalTrader)
+stub.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
 stub.max_market_cap_sol = 40.0
 stub.min_curve_progress_sol = None
 stub.min_market_cap_sol = None

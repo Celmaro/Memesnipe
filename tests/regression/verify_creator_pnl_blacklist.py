@@ -87,6 +87,11 @@ def main() -> int:
             "So11111111111111111111111111111111111111112": 0.01
         },
         max_transfer_fee_bps=None,
+        allow_mayhem_mode=False,  # R3-P0-2 off in verifiers
+        holder_reward_mode="trade",  # R3-P0-3 default
+        min_unique_holders=0,  # R3-P1-5 off in verifiers
+        max_top10_concentration=0.0,
+        min_metadata_extensions=0,  # R3-P2-8 off in verifiers
     )
     token = SimpleNamespace(
         creator="c1", user=None, quote_mint="So11111111111111111111111111111111111111112"
@@ -105,6 +110,11 @@ def main() -> int:
             "So11111111111111111111111111111111111111112": 0.01
         },
         max_transfer_fee_bps=None,
+        allow_mayhem_mode=False,  # R3-P0-2 off in verifiers
+        holder_reward_mode="trade",  # R3-P0-3 default
+        min_unique_holders=0,  # R3-P1-5 off in verifiers
+        max_top10_concentration=0.0,
+        min_metadata_extensions=0,  # R3-P2-8 off in verifiers
     )
     reason2 = UniversalTrader._skip_reason(t2, token)
     check(

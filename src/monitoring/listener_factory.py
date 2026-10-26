@@ -18,6 +18,7 @@ class ListenerFactory:
         geyser_api_token: str | None = None,
         geyser_auth_type: str = "x-token",
         platforms: list[Platform] | None = None,
+        in_stream_updates_enabled: bool = False,
     ) -> BaseTokenListener:
         """Create a token listener based on the specified type.
 
@@ -28,6 +29,9 @@ class ListenerFactory:
             geyser_endpoint: Geyser gRPC endpoint URL (geyser/shreds listeners)
             geyser_api_token: Geyser API token (geyser/shreds listeners)
             platforms: List of platforms to monitor (if None, monitor all)
+            in_stream_updates_enabled: R3-P2-15 — queue-fed request stream so
+                update_subscription() changes filters without a reconnect
+                (off by default)
 
         Returns:
             Configured token listener
@@ -50,6 +54,7 @@ class ListenerFactory:
                 geyser_api_token=geyser_api_token,
                 geyser_auth_type=geyser_auth_type,
                 platforms=platforms,
+                in_stream_updates_enabled=in_stream_updates_enabled,
             )
             logger.info("Created Universal Geyser listener for token monitoring")
             return listener

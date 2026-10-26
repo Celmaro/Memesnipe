@@ -176,5 +176,6 @@ trades/trades.log
 state/
 # Shadow-mode research capture (JSONL backtest feed)
 shadow_data/
+shadow_data_shreds/
 # Mac OS X
 .DS_Store

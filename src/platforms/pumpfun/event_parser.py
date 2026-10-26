@@ -164,7 +164,7 @@ class PumpFunEventParser(EventParser):
             )
 
     def parse_trade_event_from_logs(
-        self, logs: list[str]
+        self, logs: list[str], outer_signer: str | None = None
     ) -> dict[str, Any] | None:
         """Decode a pump.fun TradeEvent from transaction logs (T3.2).
 
@@ -173,6 +173,12 @@ class PumpFunEventParser(EventParser):
 
         Args:
             logs: List of log strings from a transaction
+            outer_signer: Optional base58 of the transaction's outer signer
+                (message.account_keys[0]). When the decoded TradeEvent's
+                ``user`` differs from it — an aggregator/CPI router sent the
+                trade on the human's behalf — attribution is corrected to
+                the outer signer (R3-P2-11), so copy-trading and the rug
+                buyer heuristic follow the human, not the router.
 
         Returns:
             Dict with ``trader`` (Pubkey str), ``mint`` (Pubkey str),
@@ -203,7 +209,18 @@ class PumpFunEventParser(EventParser):
                 fields = event.get("fields", {})
                 if not fields:
                     continue
-                return self._trade_event_to_dict(fields, event)
+                result = self._trade_event_to_dict(fields, event)
+                # R3-P2-11: CPI outer-signer attribution. If the decoded
+                # trader is a router (differs from the outer signer), the
+                # outer signer is the human who initiated the trade — that is
+                # who we mirror / attribute.
+                if outer_signer:
+                    result["outer_signer"] = outer_signer
+                    if str(fields.get("user", "")) != outer_signer:
+                        result["trader"] = outer_signer
+                        result["user"] = outer_signer
+                        result["attribution"] = "outer_signer"
+                return result
             except Exception:
                 logger.debug(
                     f"TradeEvent decode failed at log {i}: {log[:80]}",

@@ -97,6 +97,13 @@ def qualify_leader(profile: LeaderProfile) -> LeaderVerdict:
         return LeaderVerdict.INSUFFICIENT_TRADES
     if not (w30.profitable and profile.window(7).profitable):
         return LeaderVerdict.NEGATIVE_NET
+    # R3-P2-7: keep-all-windows-positive. The 24h window is the freshness
+    # check per the baseline rules, but when a 24h summary IS present (the
+    # multi-window profiler now fetches one), a non-positive 24h also fails
+    # qualification — "simultaneous presence in 24h/7d/30d leaderboards".
+    w1 = profile.window(1)
+    if w1.closed_trades > 0 and not w1.profitable:
+        return LeaderVerdict.NEGATIVE_NET
     if profile.last_seen_days_ago > 1.0:
         return LeaderVerdict.STALE_24H
     return LeaderVerdict.QUALIFIED

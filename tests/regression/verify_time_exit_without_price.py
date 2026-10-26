@@ -173,6 +173,20 @@ def _make_trader(
     trader.shadow_mode = False
     trader.min_pool_depth_sol = 0.0  # P2-EXIT-1 off in verifiers
     trader.rug_heuristics_enabled = False  # P2-EXIT-4 off
+    trader.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
+    trader.holder_reward_mode = "trade"  # R3-P0-3 default
+    trader.tp_ranges = []  # R3-P1-2 staged exits off
+    trader.sl_ranges = []  # R3-P1-2 staged exits off
+    trader._tp_fired = set()  # noqa: SLF001
+    trader._sl_fired = set()  # noqa: SLF001
+    trader.exit_on_creator_sell = False  # R3-P1-4 off in verifiers
+    trader._creator_sold_for_exit = set()  # noqa: SLF001
+    trader.event_driven_exits_enabled = False  # R3-P2-12 off in verifiers
+    trader._own_trade_prompt = set()  # noqa: SLF001
+    from trading.risk_guard import RiskTracker
+    trader.risk_tracker = RiskTracker()  # R3-P2-10 off in verifiers
+    import asyncio as _asyncio
+    trader._trade_serialization_lock = _asyncio.Lock()  # R3-P2-13
     trader._rug_entry = {}  # noqa: SLF001
     trader._rug_buyers = {}  # noqa: SLF001
     trader.creator_pnl_store = None  # P2-STRUC-2 feature off

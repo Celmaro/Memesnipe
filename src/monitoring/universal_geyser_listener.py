@@ -81,11 +81,17 @@ class UniversalGeyserListener(BaseTokenListener):
         geyser_api_token: str,
         geyser_auth_type: str,
         platforms: list[Platform] | None = None,
+        in_stream_updates_enabled: bool = False,
     ):
         """Initialize universal Geyser listener."""
         super().__init__()
         self.geyser_endpoint = geyser_endpoint
         self.geyser_api_token = geyser_api_token
+        # R3-P2-15: in-stream filter updates (off by default). When on, the
+        # request side of the Subscribe RPC becomes a queue-fed stream so
+        # update_subscription() can change watched filters with no reconnect.
+        self.in_stream_updates_enabled = in_stream_updates_enabled
+        self._in_stream_updates = in_stream_updates_enabled
 
         valid_auth_types = {"x-token", "basic"}
         self.auth_type: str = (geyser_auth_type or "x-token").lower()
@@ -120,10 +126,20 @@ class UniversalGeyserListener(BaseTokenListener):
         self._reconnect_delay_max = 30.0
         self._force_reconnect = asyncio.Event()
 
+        # R3-P2-15: continuity revision — bumped on every discontinuity
+        # (reconnect/resume, in-stream filter update). Consumers that cache
+        # state built from the stream (curve cache, shadow capture) compare
+        # the revision and invalidate pre-gap state, so a resume never
+        # replays events against a cache primed from a different epoch.
+        self._continuity_revision = 0
+        self._in_stream_updates = False
+        self._update_queue: asyncio.Queue | None = None
+        self._stream_request_iter = None
+
         # T3.2: optional copy-trader callback. When set, every transaction
         # update's logs are forwarded after the token-creation check so a
         # leader-buy TradeEvent can be mirrored without extra RPC.
-        self.trade_callback: Callable[[list[str]], Awaitable[None]] | None = None
+        self.trade_callback: Callable[[list[str], str | None], Awaitable[None]] | None = None
 
         for platform in self.platforms:
             try:
@@ -157,6 +173,69 @@ class UniversalGeyserListener(BaseTokenListener):
 
             except Exception as e:
                 logger.warning(f"Could not register platform {platform.value}: {e}")
+
+    @property
+    def continuity_revision(self) -> int:
+        """Stream generation counter; consumers invalidate pre-gap state."""
+        return self._continuity_revision
+
+    def _bump_continuity(self) -> int:
+        """Bump the continuity revision; consumers invalidate pre-gap state.
+
+        Called on every stream discontinuity (reconnect/resume, in-stream
+        filter update). Returns the new revision.
+        """
+        self._continuity_revision += 1
+        return self._continuity_revision
+
+    async def update_subscription(
+        self,
+        program_ids: set[str] | None = None,
+        platforms: list[str] | None = None,
+    ) -> int:
+        """Apply a filter change WITHOUT closing the stream (R3-P2-15).
+
+        Only effective when ``_in_stream_updates`` is enabled; otherwise the
+        change is recorded and applied on the next reconnect (today's
+        behavior), and the revision still bumps so consumers drop pre-gap
+        state either way.
+
+        Args:
+            program_ids: New watched program ID set (None = keep current).
+            platforms: New platform list (None = keep current).
+
+        Returns:
+            The new continuity revision.
+        """
+        if program_ids is not None:
+            self.platform_program_ids = set(program_ids)
+        if platforms is not None and platforms:
+            self.platforms = [Platform(p) for p in platforms]
+        rev = self._bump_continuity()
+        if self._in_stream_updates and self._update_queue is not None:
+            request = self._create_subscription_request()
+            self._update_queue.put_nowait(request)
+            logger.info(
+                f"In-stream subscription update queued " f"(revision {rev})"
+            )
+        else:
+            logger.info(
+                f"Filter update recorded (revision {rev}); applies on "
+                f"next reconnect (in-stream updates disabled)"
+            )
+        return rev
+
+    async def _request_iterator(self, initial: geyser_pb2.SubscribeRequest):
+        """Request stream: the initial subscription then queued updates.
+
+        Yellowstone's Subscribe RPC takes a stream of requests; sending a
+        fresh SubscribeRequest on the same stream updates the filters with no
+        reconnect gap. Only used when in-stream updates are enabled.
+        """
+        yield initial
+        while True:
+            request = await self._update_queue.get()
+            yield request
 
     async def _create_geyser_connection(self):
         """Establish a secure connection to the Geyser endpoint.
@@ -280,6 +359,14 @@ class UniversalGeyserListener(BaseTokenListener):
                 logger.info(
                     f"Monitoring accounts: {[str(pid) for pid in self.platform_program_ids]}"
                 )
+                # A reconnect is a stream discontinuity: any cached state a
+                # consumer built from the previous stream generation is stale
+                # the moment we resume from _last_slot + 1. Bump the revision
+                # so cache-holding consumers drop pre-gap state.
+                self.continuity_revision += 1
+                logger.info(
+                    f"Continuity revision -> {self.continuity_revision}"
+                )
                 self._stream_healthy = True
                 self._reconnect_delay = 1.0
 
@@ -289,7 +376,17 @@ class UniversalGeyserListener(BaseTokenListener):
                     # grpc.aio's StreamStreamCall exposes __aiter__ (async
                     # iterator) but not __anext__ directly; pull the iterator
                     # once and drive it with __anext__ calls.
-                    stream_iter = stub.Subscribe(iter([request])).__aiter__()
+                    # R3-P2-15: with in-stream updates enabled the request
+                    # side is a queue-fed stream so update_subscription can
+                    # change filters without a reconnect gap.
+                    if self._in_stream_updates:
+                        self._update_queue = asyncio.Queue()
+                        request_iter = self._request_iterator(request)
+                        self._stream_request_iter = request_iter
+                    else:
+                        self._stream_request_iter = None
+                        request_iter = iter([request])
+                    stream_iter = stub.Subscribe(request_iter).__aiter__()
                     while True:
                         if self._force_reconnect.is_set():
                             logger.warning(
@@ -409,7 +506,17 @@ class UniversalGeyserListener(BaseTokenListener):
                 if meta is not None:
                     logs = list(meta.log_messages or [])
                 if logs:
-                    await self.trade_callback(logs)
+                    # R3-P2-11: pass the outer signer (message account_keys[0])
+                    # so the parser can correct CPI/aggregator attribution.
+                    outer_signer = None
+                    try:
+                        msg = update.transaction.transaction.message
+                        keys = msg.account_keys
+                        if keys:
+                            outer_signer = str(keys[0])
+                    except Exception:
+                        outer_signer = None
+                    await self.trade_callback(logs, outer_signer)
 
             return None
 

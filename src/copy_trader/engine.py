@@ -181,15 +181,18 @@ class CopyTraderEngine:
 
         # T3.3: consult the GMGN profile when configured — risk filter, not a
         # hard gate. A fetch failure logs and proceeds (mirror is explicit opt-in).
+        # R3-P2-7: the multi-window profile adds the 24h window so
+        # keep-all-windows-positive qualification has the data it needs.
         if self.profiler is not None:
             try:
-                profile = await self.profiler.profile(trader)
+                profile = await self.profiler.profile_multiwindow(trader)
                 if profile:
+                    windows = profile.get("windows", {})
                     logger.info(
-                        f"Copy-trader: leader {trader[:8]} profile "
-                        f"win_rate={profile.get('win_rate')} "
-                        f"realized_pnl={profile.get('realized_pnl')} "
-                        f"trades={profile.get('total_trades')}"
+                        f"Copy-trader: leader {trader[:8]} multi-window profile "
+                        f"1d={windows.get('1d', {}).get('realized_pnl')} "
+                        f"7d={windows.get('7d', {}).get('realized_pnl')} "
+                        f"30d={windows.get('30d', {}).get('realized_pnl')}"
                     )
             except Exception:
                 logger.exception(

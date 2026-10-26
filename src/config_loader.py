@@ -124,6 +124,48 @@ CONFIG_VALIDATION_RULES = [
         "filters.max_tracked_tokens must be between 1 and 100000",
     ),
     (
+        "filters.min_unique_holders",
+        int,
+        0,
+        1_000_000,
+        "filters.min_unique_holders must be a non-negative integer (0 = off)",
+    ),
+    (
+        "filters.max_top10_concentration",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.max_top10_concentration must be a fraction between 0 and 1 (0 = off)",
+    ),
+    (
+        "filters.min_metadata_extensions",
+        int,
+        0,
+        1_000,
+        "filters.min_metadata_extensions must be a non-negative integer (0 = off)",
+    ),
+    (
+        "risk.max_concurrent_positions",
+        int,
+        0,
+        1_000_000,
+        "risk.max_concurrent_positions must be a non-negative integer (0 = off)",
+    ),
+    (
+        "risk.daily_loss_limit_sol",
+        (int, float),
+        0.0,
+        1_000_000.0,
+        "risk.daily_loss_limit_sol must be a non-negative number (0 = off)",
+    ),
+    (
+        "risk.budget_sol",
+        (int, float),
+        0.0,
+        1_000_000.0,
+        "risk.budget_sol must be a non-negative number (0 = off)",
+    ),
+    (
         "filters.consecutive_match_count",
         int,
         1,
@@ -173,11 +215,32 @@ CONFIG_VALIDATION_RULES = [
         "trade.max_sell_impact_bps must be between 0 and 5000 bps",
     ),
     (
+        "trade.aggregator_slippage_bps",
+        int,
+        1,
+        10_000,
+        "trade.aggregator_slippage_bps must be between 1 and 10000 bps",
+    ),
+    (
+        "trade.aggregator_max_price_impact_pct",
+        (int, float),
+        0.0,
+        100.0,
+        "trade.aggregator_max_price_impact_pct must be between 0 and 100",
+    ),
+    (
         "trade.blockhash_refresh_interval",
         (int, float),
         0.05,
         60.0,
         "trade.blockhash_refresh_interval must be between 0.05 and 60 seconds",
+    ),
+    (
+        "trade.durable_nonce_account",
+        (str, type(None)),
+        0,
+        0,
+        "trade.durable_nonce_account must be a base58 nonce account or null",
     ),
     (
         "filters.creator_pnl_min_trades",
@@ -242,19 +305,34 @@ BOOL_FIELDS = [
     "filters.honeypot_freeze_authority",
     "trade.shadow_mode",
     "research.shadow_capture_enabled",  # 2026-10-26 shadow research capture
+    "research.pumpswap_migrate_watcher",  # R3-P2-5
+    "research.slot_ordered_feed_enabled",  # R3-P2-14
+    "research.in_stream_updates_enabled",  # R3-P2-15
     "trade.backfill.enabled",
     "trade.close_ata_on_sell",  # P2-EXIT-5
+    "trade.aggregator_fallback",  # R3-P1-3
     "filters.creator_pnl_blacklist_enabled",  # P2-STRUC-2
     "filters.rug_heuristics_enabled",  # P2-EXIT-4
+    "filters.allow_mayhem_mode",  # R3-P0-2
+    "filters.exit_on_creator_sell",  # R3-P1-4
+    "trade.event_driven_exits_enabled",  # R3-P2-12
     "copy_trader.enabled",
+    "jito.dontfront",  # R3-P2-6
 ]
 
 # Config fields that must be a list of strings when present
-LIST_OF_STR_FIELDS = ["filters.blocked_creators"]
+LIST_OF_STR_FIELDS = [
+    "filters.blocked_creators",
+    "trade.alt_addresses",  # R3-P2-3: address lookup tables
+]
+
+# Config fields that must be lists of staged-exit range mappings when present.
+LIST_OF_RANGE_FIELDS = ["trade.tp_ranges", "trade.sl_ranges"]
 
 # Valid values for enum-like fields
 VALID_VALUES = {
     "filters.listener_type": ["logs", "blocks", "geyser", "shreds"],
+    "filters.holder_reward_mode": ["trade", "skip"],  # R3-P0-3
     "cleanup.mode": ["disabled", "on_fail", "after_sell", "post_session"],
     "trade.exit_strategy": ["time_based", "tp_sl", "manual"],
     "platform": ["pump_fun", "lets_bonk", "stonk_fun"],
@@ -386,6 +464,33 @@ def validate_config(config: dict) -> None:
         if not isinstance(value, bool):
             raise ValueError(f"{path} must be a boolean (true/false)")
 
+    # Validate staged-exit range fields (R3-P1-2): each must be a list of
+    # mappings with numeric from_pct/to_pct/step/share. The ShareRange parser
+    # in trading/staged_exit.py is the source of truth for semantics; here we
+    # only enforce the container shape so a typo fails at config load.
+    for path in LIST_OF_RANGE_FIELDS:
+        try:
+            value = get_nested_value(config, path)
+        except ValueError as e:
+            if "Missing required config key" in str(e):
+                continue
+            raise
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(
+            isinstance(item, dict) for item in value
+        ):
+            raise ValueError(
+                f"{path} must be a list of {{from_pct, to_pct, step, share}} "
+                f"mappings (empty list = feature off)"
+            )
+        for item in value:
+            missing = {"from_pct", "to_pct", "step", "share"} - set(item)
+            if missing:
+                raise ValueError(
+                    f"{path} entry missing keys {sorted(missing)}: {item!r}"
+                )
+
     # Interval/hold coherence: an exit that checks the price slower than the
     # hold window can never fire on schedule. Require at least 4 checks within
     # max_hold_time (when both are set and exit_strategy is tp_sl).
@@ -403,6 +508,24 @@ def validate_config(config: dict) -> None:
                 f"trade.price_check_interval ({interval}s) is too large for "
                 f"trade.max_hold_time ({hold}s): a tp_sl exit needs at least "
                 f"4 checks inside the hold window (interval <= hold/4)"
+            )
+    except ValueError as e:
+        if "Missing required config key" not in str(e):
+            raise
+
+    # R3-P1-6: anti-bundler extreme-fast calibration. When extreme-fast is
+    # enabled, the fixed token amount must stay above the dev-bundle revert
+    # threshold documented in bots/README (below it the dust/6024 window
+    # reopens on sell). Off = no-op.
+    try:
+        ef_mode = get_nested_value(config, "trade.extreme_fast_mode")
+        ef_amount = get_nested_value(config, "trade.extreme_fast_token_amount")
+        if ef_mode and (ef_amount is None or ef_amount < 2_620_000):
+            raise ValueError(
+                "trade.extreme_fast_token_amount must be >= 2_620_000 when "
+                "extreme_fast_mode is on (below the dev-bundle revert "
+                "threshold, dust positions hit pump.fun 6024 Overflow on "
+                "sell — see bots/README R3-P1-6)"
             )
     except ValueError as e:
         if "Missing required config key" not in str(e):

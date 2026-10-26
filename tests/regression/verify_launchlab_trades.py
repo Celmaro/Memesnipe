@@ -494,7 +494,16 @@ def check_f_single_token_mode_waits_past_refused_coins() -> bool:
         allowed_quote_mints=None,
         quote_amounts={WSOL_MINT: 0.001},
         max_transfer_fee_bps=100,
+        allow_mayhem_mode=False,  # R3-P0-2 off in verifiers
+        holder_reward_mode="trade",  # R3-P0-3 default
+        min_unique_holders=0,  # R3-P1-5 off in verifiers
+        max_top10_concentration=0.0,
+        min_metadata_extensions=0,  # R3-P2-8 off in verifiers
+        exit_on_creator_sell=False,  # R3-P1-4 off in verifiers
     )
+    from trading.risk_guard import RiskTracker
+
+    trader.risk_tracker = RiskTracker()  # R3-P2-10 off
     trader._skip_reason = lambda token: UniversalTrader._skip_reason(trader, token)
     found = asyncio.run(UniversalTrader._wait_for_token(trader))
     ok = found is not None and found.symbol == "BUYABLE"

@@ -16,6 +16,7 @@ class ExitReason(Enum):
     MANUAL = "manual"
     LIQUIDITY = "liquidity_depth"  # P2-EXIT-1: pool too shallow to exit later
     RUG = "rug_heuristics"  # P2-EXIT-4: rug signals right after entry
+    CREATOR_SELL = "creator_sell"  # R3-P1-4: the creator sold
 
 
 @dataclass

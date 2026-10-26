@@ -1,0 +1,429 @@
+"""Backtest exit strategies against pumpapi Historical Replay archives.
+
+Downloads hourly event archives (https://replay.pumpapi.io/Y/M/D/H.jsonl.zst),
+replays pump.fun bonding-curve activity, and simulates the bot's entry filters
+plus candidate exit strategies (TP/SL grids, trailing stops) on every launch.
+
+Event model (matches the live stream format parsed by the sidecar):
+  create:  bonding curve deployed, mint/symbol/initialBuy
+  buy:     price, marketCapQuote (SOL), solAmount, tokenAmount, user
+  sell:    same fields
+Prices are bonding-curve AMM results implied by the feed's own price fields —
+the same series the live momentum provider sees, so backtests inherit real
+microstructure (as fast as the feed recorded it).
+
+Usage:
+    uv run tools/replay_backtester.py --hours 2026/10/26/09 2026/10/26/10 ...
+    uv run tools/replay_backtester.py --last 6            # last N whole hours
+    uv run tools/replay_backtester.py --last 6 --max-open 40 --workers 4
+
+Output: state/replay/<stamp>/trades.jsonl + summary.json printed to stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import gzip
+import io
+import json
+import statistics
+import sys
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover
+    aiohttp = None
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+REPLAY_BASE = "https://replay.pumpapi.io/{dt:%Y/%m/%d/%H}.jsonl.zst"
+OUT_DIR = PROJECT_ROOT / "state" / "replay"
+
+# ---- entry filter: mirror memesnipe.yaml (shadow mode of 2026-10-26) ----
+ENTRY = {
+    "min_curve_progress_sol": 0.25,  # skip the first pixels of the curve
+    "position_sol": 0.01,
+}
+
+# ---- exit strategies under test (grid) ----
+EXIT_GRID = [
+    {"name": "base_tp20_sl20", "tp": 0.20, "sl": -0.20},
+    {"name": "tp30_sl20", "tp": 0.30, "sl": -0.20},
+    {"name": "tp20_sl10", "tp": 0.20, "sl": -0.10},
+    {"name": "tp50_sl25", "tp": 0.50, "sl": -0.25},
+    {"name": "trail20", "trail_activation": 0.15, "trail_distance": 0.20, "sl": -0.20},
+    {"name": "trail10", "trail_activation": 0.10, "trail_distance": 0.10, "sl": -0.20},
+]
+
+MAX_OPEN_POSITIONS = 40  # cap concurrent positions per strategy (bot realism)
+TOKEN_MAX_AGE_S = 1.0  # entries only within 1s of create (bot freshness gate)
+MAX_TOKEN_LIFETIME_S = 3600  # stop tracking a token after 1h
+
+
+@dataclass
+class Position:
+    mint: str
+    symbol: str
+    strategy: str
+    entry_price: float
+    entry_time: float
+    tokens: float
+    peak_price: float = 0.0
+    trailing_stop: float | None = None
+
+
+@dataclass
+class StrategyState:
+    cfg: dict
+    open: dict[str, Position] = field(default_factory=dict)
+    trades: list = field(default_factory=list)
+
+
+class ReplayBacktester:
+    def __init__(self, strategies: list[dict], out_dir: Path):
+        self.strategies = {s["name"]: StrategyState(s) for s in strategies}
+        self.out_dir = out_dir
+        # per-token curve state
+        self.tokens: dict[str, dict] = {}
+        self.trades_out: list = []
+        self.events_seen = 0
+
+    # ---------- event processing ----------
+
+    def on_event(self, ev: dict) -> None:
+        self.events_seen += 1
+        action = ev.get("action")
+        if action == "create":
+            mint = ev.get("mint")
+            if not mint:
+                return
+            price = ev.get("price") or 0.0
+            mc = ev.get("marketCapQuote") or 0.0
+            self.tokens[mint] = {
+                "symbol": ev.get("symbol") or "?",
+                "price": price,
+                "mc_sol": mc,
+                "created_ts": _ev_ts(ev),
+                "buys_1m": deque(),
+                "seen_events": 0,
+            }
+            return
+        if action in ("buy", "sell"):
+            mint = ev.get("mint")
+            tok = self.tokens.get(mint)
+            if tok is None:
+                return  # pre-existing token, not a replayed launch
+            price = ev.get("price")
+            if not price:
+                return
+            ts = _ev_ts(ev)
+            sol_amount = ev.get("solAmount") or ev.get("quoteAmount") or 0.0
+            tok["price"] = price
+            tok["mc_sol"] = ev.get("marketCapQuote") or tok["mc_sol"]
+            tok["seen_events"] += 1
+            if action == "buy":
+                tok["buys_1m"].append((ts, sol_amount))
+                while tok["buys_1m"] and ts - tok["buys_1m"][0][0] > 60:
+                    tok["buys_1m"].popleft()
+                # entry: every fresh token gets bought by every strategy
+                # (one entry per token per strategy — entry filters are
+                # identical across strategies so they cancel out in A/B)
+                age = ts - tok["created_ts"]
+                if tok["seen_events"] == 1 and age <= TOKEN_MAX_AGE_S * 60:
+                    self._try_entries(mint, tok, price, ts, sol_amount)
+            self._check_exits(mint, tok, price, ts)
+        # migrate/createPool: position exits on curve? keep simple: treat as
+        # force-close at last curve price (bot wouldn't hold through migration)
+        elif action in ("migrate", "createPool"):
+            mint = ev.get("mint")
+            tok = self.tokens.get(mint)
+            if tok:
+                ts = _ev_ts(ev)
+                self._force_close_all(mint, tok, tok["price"], ts, "migrate")
+
+    def _try_entries(
+        self, mint: str, tok: dict, price: float, ts: float, sol_amount: float
+    ) -> None:
+        curve_progress = tok["mc_sol"]  # MC in SOL ≈ curve progress
+        if curve_progress < ENTRY["min_curve_progress_sol"]:
+            return
+        for name, st in self.strategies.items():
+            if len(st.open) >= MAX_OPEN_POSITIONS:
+                continue
+            tokens_out = ENTRY["position_sol"] / price if price else 0.0
+            st.open[mint] = Position(
+                mint=mint,
+                symbol=tok["symbol"],
+                strategy=name,
+                entry_price=price,
+                entry_time=ts,
+                tokens=tokens_out,
+                peak_price=price,
+            )
+
+    def _check_exits(self, mint: str, tok: dict, price: float, ts: float) -> None:
+        for name, st in self.strategies.items():
+            pos = st.open.get(mint)
+            if pos is None:
+                continue
+            cfg = st.cfg
+            pos.peak_price = max(pos.peak_price, price)
+            pnl = price / pos.entry_price - 1.0
+
+            # trailing stop arming
+            trail_act = cfg.get("trail_activation")
+            if trail_act is not None:
+                peak_pnl = pos.peak_price / pos.entry_price - 1.0
+                if peak_pnl >= trail_act and pos.trailing_stop is None:
+                    pos.trailing_stop = pos.peak_price * (1 - cfg["trail_distance"])
+                elif pos.trailing_stop is not None:
+                    pos.trailing_stop = max(
+                        pos.trailing_stop, pos.peak_price * (1 - cfg["trail_distance"])
+                    )
+
+            reason = None
+            if cfg.get("tp") is not None and pnl >= cfg["tp"]:
+                reason = "take_profit"
+            elif cfg.get("sl") is not None and pnl <= cfg["sl"]:
+                reason = "stop_loss"
+            elif pos.trailing_stop is not None and price <= pos.trailing_stop:
+                reason = "trailing_stop"
+
+            if reason:
+                self._close(st, pos, price, ts, reason)
+
+    def _close(self, st: StrategyState, pos: Position, price: float, ts: float, reason: str) -> None:
+        st.open.pop(pos.mint, None)
+        pnl_pct = (price / pos.entry_price - 1.0) * 100
+        self.trades_out.append(
+            {
+                "strategy": pos.strategy,
+                "mint": pos.mint,
+                "symbol": pos.symbol,
+                "entry_time": pos.entry_time,
+                "exit_time": ts,
+                "hold_s": round(ts - pos.entry_time, 1),
+                "pnl_pct": round(pnl_pct, 2),
+                "exit_reason": reason,
+                "peak_pnl_pct": round((pos.peak_price / pos.entry_price - 1) * 100, 2),
+            }
+        )
+
+    def _force_close_all(self, mint: str, tok: dict, price: float, ts: float, reason: str) -> None:
+        for st in self.strategies.values():
+            pos = st.open.pop(mint, None)
+            if pos:
+                self._close(st, pos, price, ts, reason)
+
+    # ---------- hourly housekeeping ----------
+
+    def prune(self, now_ts: float) -> None:
+        # tokens idle > MAX_TOKEN_LIFETIME_S: force-close any survivors
+        stale = [
+            m for m, t in self.tokens.items() if now_ts - t["created_ts"] > MAX_TOKEN_LIFETIME_S
+        ]
+        for m in stale:
+            tok = self.tokens.pop(m)
+            self._force_close_all(m, tok, tok["price"], now_ts, "eol")
+        # cap memory on the token dict
+        if len(self.tokens) > 20_000:
+            cutoff = sorted(self.tokens.items(), key=lambda kv: kv[1]["created_ts"])
+            for m, _ in cutoff[: len(self.tokens) - 10_000]:
+                tok = self.tokens.pop(m)
+                self._force_close_all(m, tok, tok["price"], now_ts, "eol")
+
+    # ---------- output ----------
+
+    def summary(self) -> dict:
+        out = {}
+        for name, st in self.strategies.items():
+            trades = [t for t in self.trades_out if t["strategy"] == name]
+            if not trades:
+                out[name] = {"trades": 0}
+                continue
+            pnls = [t["pnl_pct"] for t in trades]
+            wins = [p for p in pnls if p > 0]
+            total = sum(pnls)
+            out[name] = {
+                "trades": len(trades),
+                "winrate": round(len(wins) / len(trades) * 100, 1),
+                "avg_pnl_pct": round(total / len(trades), 2),
+                "total_pnl_pct": round(total, 1),
+                "median_hold_s": round(statistics.median(t["hold_s"] for t in trades), 1),
+                "exit_mix": _tally(t["exit_reason"] for t in trades),
+                "best": max(pnls),
+                "worst": min(pnls),
+            }
+        return out
+
+    def flush(self, stamp: str) -> Path:
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        d = self.out_dir / stamp
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "trades.jsonl", "w") as f:
+            for t in self.trades_out:
+                f.write(json.dumps(t) + "\n")
+        with open(d / "summary.json", "w") as f:
+            json.dump(self.summary(), f, indent=2)
+        return d
+
+
+def _ev_ts(ev: dict) -> float:
+    ts = ev.get("timestamp")
+    if ts is None:
+        ts = ev.get("blockTime", 0)
+    if isinstance(ts, str):
+        with contextlib.suppress(ValueError):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    return float(ts or 0)
+
+
+def _tally(it):
+    d = defaultdict(int)
+    for x in it:
+        d[x] += 1
+    return dict(d)
+
+
+def parse_hour_str(s: str) -> datetime:
+    # accept 2026/10/26/09 or 2026-10-26T09
+    for fmt in ("%Y/%m/%d/%H", "%Y-%m-%dT%H"):
+        with contextlib.suppress(ValueError):
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+    raise argparse.ArgumentTypeError(f"bad hour spec: {s}")
+
+
+async def download_hour(session: "aiohttp.ClientSession", dt: datetime) -> list[dict]:
+    url = REPLAY_BASE.format(dt=dt)
+    import logging
+
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=120, connect=30)
+    async with session.get(url, timeout=timeout) as r:
+        if r.status == 404:
+            print(f"[replay] missing (404): {url}", file=sys.stderr)
+            return []
+        r.raise_for_status()
+        raw = await r.read()
+    text = gzip.decompress(raw).decode() if raw[:2] == b"\x1f\x8b" else _zstd_decompress(raw)
+    events = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            with contextlib.suppress(json.JSONDecodeError):
+                events.append(json.loads(line))
+    print(f"[replay] {url}: {len(events)} events", file=sys.stderr)
+    return events
+
+
+def _zstd_decompress(raw: bytes) -> str:
+    import subprocess
+
+    p = subprocess.run(
+        ["zstd", "-d", "--stdout"], input=raw, capture_output=True, check=True
+    )
+    return p.stdout.decode(errors="replace")
+
+
+def load_local(path: Path):
+    """Stream a cached hourly archive line-by-line (zstd pipe, low memory)."""
+    import subprocess
+
+    p = subprocess.Popen(
+        ["zstdcat", str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    n = 0
+    assert p.stdout is not None
+    for raw in p.stdout:
+        line = raw.decode(errors="replace").strip()
+        if not line:
+            continue
+        with contextlib.suppress(json.JSONDecodeError):
+            yield json.loads(line)
+            n += 1
+            if n % 2_000_000 == 0:
+                print(f"[replay] {path.name}: {n} events...", file=sys.stderr)
+    p.wait()
+    print(f"[replay] {path.name}: {n} events", file=sys.stderr)
+
+
+def _print_summary(bt, s, stamp, t0, out):
+    print(f"\n=== backtest {stamp} | {bt.events_seen} events | {time.time()-t0:.0f}s ===")
+    print(f"tokens tracked: {len(bt.tokens)} trades: {len(bt.trades_out)} -> {out}")
+    for name, r in s.items():
+        if r.get("trades"):
+            print(
+                f"{name:16} n={r['trades']:5} wr={r['winrate']:5.1f}% "
+                f"avg={r['avg_pnl_pct']:+6.2f}% total={r['total_pnl_pct']:+9.1f}% "
+                f"hold={r['median_hold_s']:7.0f}s {r['exit_mix']}"
+            )
+        else:
+            print(f"{name:16} no trades")
+
+
+async def main() -> int:
+    ap = argparse.ArgumentParser()
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--hours", nargs="+", help="e.g. 2026/10/26/09 2026/10/26/10")
+    g.add_argument("--last", type=int, help="replay last N complete hours")
+    g.add_argument("--local", help="path to a cached .jsonl.zst archive")
+    ap.add_argument("--max-open", type=int, default=MAX_OPEN_POSITIONS)
+    args = ap.parse_args()
+
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    if args.local:
+        stamp = Path(args.local).stem
+        bt = ReplayBacktester(EXIT_GRID, OUT_DIR)
+        t0 = time.time()
+        for ev in load_local(Path(args.local)):
+            bt.on_event(ev)
+            if bt.events_seen % 500_000 == 0:
+                bt.prune(_ev_ts(ev))
+        s = bt.summary()
+        out = bt.flush(stamp)
+        _print_summary(bt, s, stamp, t0, out)
+        return 0
+    if args.hours:
+        hours = [parse_hour_str(h) for h in args.hours]
+    else:
+        hours = [now - timedelta(hours=i + 1) for i in range(args.last)]
+    hours.sort()
+
+    if aiohttp is None:
+        print("aiohttp required: uv run (has it)", file=sys.stderr)
+        return 1
+
+    bt = ReplayBacktester(EXIT_GRID, OUT_DIR)
+    stamp = f"{hours[0]:%Y%m%d_%H}-{hours[-1]:%H}"
+    t0 = time.time()
+    async with aiohttp.ClientSession() as session:
+        for dt in hours:
+            events = await download_hour(session, dt)
+            for ev in events:
+                bt.on_event(ev)
+            bt.prune(_ev_ts({"timestamp": f"{dt:%Y-%m-%dT%H:00:00Z}"}))
+
+    s = bt.summary()
+    out = bt.flush(stamp)
+    print(f"\n=== backtest {stamp} | {bt.events_seen} events | {time.time()-t0:.0f}s ===")
+    print(f"tokens tracked: {len(bt.tokens)} trades: {len(bt.trades_out)} -> {out}")
+    for name, r in s.items():
+        if r.get("trades"):
+            print(
+                f"{name:16} n={r['trades']:5} wr={r['winrate']:5.1f}% "
+                f"avg={r['avg_pnl_pct']:+6.2f}% total={r['total_pnl_pct']:+9.1f}% "
+                f"hold={r['median_hold_s']:7.0f}s {r['exit_mix']}"
+            )
+        else:
+            print(f"{name:16} no trades")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

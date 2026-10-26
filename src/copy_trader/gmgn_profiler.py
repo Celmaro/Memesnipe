@@ -62,8 +62,30 @@ class WalletProfiler:
         self._cache[wallet] = (time.monotonic(), profile)
         return profile
 
-    async def _fetch(self, wallet: str) -> dict[str, Any]:
+    async def profile_multiwindow(self, wallet: str) -> dict[str, Any]:
+        """R3-P2-7: fetch 24h/7d/30d profiles and merge into one payload.
+
+        GMGN exposes the same rank endpoint with a `period` query; the 24h
+        fetch doubles as the single-window profile. A failed window falls
+        back to {} so qualification's fail-open semantics apply.
+        """
+        now = time.monotonic()
+        cache_key = f"{wallet}:multi"
+        cached = self._cache.get(cache_key)
+        if cached and now - cached[0] < self.ttl_seconds:
+            return cached[1]
+        merged: dict[str, Any] = {}
+        for period in ("1d", "7d", "30d"):
+            p = await self._fetch(wallet, period=period)
+            if p:
+                merged.setdefault("windows", {})[period] = p
+        self._cache[cache_key] = (time.monotonic(), merged)
+        return merged
+
+    async def _fetch(self, wallet: str, period: str | None = None) -> dict[str, Any]:
         url = self.api_base + f"/api/v1/wallet_rank/sol/{wallet}"
+        if period:
+            url += f"?period={period}"
         for attempt in range(self.max_retries + 1):
             try:
                 async with aiohttp.ClientSession() as session:

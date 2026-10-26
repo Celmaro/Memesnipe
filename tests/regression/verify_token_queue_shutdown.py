@@ -67,6 +67,9 @@ def _make_trader() -> UniversalTrader:
     are set directly.
     """
     trader = object.__new__(UniversalTrader)
+    trader.allow_mayhem_mode = False  # R3-P2-0 off in verifiers
+    from trading.risk_guard import RiskTracker
+    trader.risk_tracker = RiskTracker()  # R3-P2-10 off
     trader.token_queue = asyncio.Queue()
     trader.processed_tokens = set()
     trader.token_timestamps = {}

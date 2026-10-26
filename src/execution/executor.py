@@ -149,9 +149,26 @@ class JitoExecutor:
         tip_accounts: list[Pubkey] | None = None,
         timeout_s: float = 10.0,
         auth_keypairs: list[Keypair] | None = None,
+        dontfront: bool = False,
     ):
         self.client = client
-        self.endpoints = endpoints or JITO_BUNDLE_ENDPOINTS
+        # R3-P2-6: DontFront route. The DontFront-compatible block-engine
+        # variant runs the same sendBundle JSON API; the endpoint string is
+        # the differ. When the flag is on, the configured endpoints are
+        # assumed to already be the DontFront variant (the user's RPC
+        # provider maps block-engine + DontFront).
+        self.dontfront = dontfront
+        if dontfront and endpoints:
+            self.endpoints = [
+                ep.replace(
+                    "block-engine.jito.wtf", "dontfront.block-engine.jito.wtf"
+                )
+                if "block-engine" in ep
+                else ep
+                for ep in endpoints
+            ]
+        else:
+            self.endpoints = endpoints or JITO_BUNDLE_ENDPOINTS
         self.tip_lamports = tip_lamports
         self._tip_accounts = tip_accounts
         self.timeout_s = timeout_s

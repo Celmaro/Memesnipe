@@ -9,6 +9,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+import aiohttp
+
 from solders.pubkey import Pubkey
 
 from backfill.transaction_crawler import TransactionCrawler
@@ -41,6 +43,7 @@ from monitoring.metrics import metrics
 from platforms import get_platform_implementations
 from screening.honeypot import honeypot_reason
 from trading.base import TradeResult
+from trading.staged_exit import ShareRange
 from trading.platform_aware import PlatformAwareBuyer, PlatformAwareSeller
 from trading.position import ExitReason, Position
 from utils.logger import get_logger
@@ -133,6 +136,12 @@ def _resolve_quote_config(
     return amounts, allowed
 
 
+# Module constants for the shadow research capture (ruff PLR2004).
+_SOL_PRICE_TTL_SECONDS = 60
+_SOL_PRICE_TIMEOUT_SECONDS = 5
+_HTTP_OK = 200
+
+
 class UniversalTrader:
     """Universal trading coordinator that works with any supported platform."""
 
@@ -157,6 +166,12 @@ class UniversalTrader:
         # P2-EXIT-5: close the user's token ATA in the same tx as a
         # full-balance sell (off by default; balance is RPC-verified first).
         close_ata_on_sell: bool = False,
+        # R3-P1-3: Jupiter aggregator sell fallback (off by default). When a
+        # platform sell fails with a pool-gone / liquidity signal, route the
+        # exit through Jupiter's quote+swap API at the configured caps.
+        aggregator_fallback: bool = False,
+        aggregator_slippage_bps: int = 500,
+        aggregator_max_price_impact_pct: float = 20.0,
         # P2-EXIT-1: absolute pool-depth floor (SOL). When the pool's real
         # quote reserves drop below this, force-exit immediately instead of
         # waiting for TP/SL — a pool that shallow may not absorb the sell
@@ -196,6 +211,10 @@ class UniversalTrader:
         exit_strategy: str = "time_based",
         take_profit_percentage: float | None = None,
         stop_loss_percentage: float | None = None,
+        # R3-P1-2: staged TP/SL ranges (off by default = current single
+        # TP/SL unchanged). Lists of {from_pct, to_pct, step, share}.
+        tp_ranges: list | None = None,
+        sl_ranges: list | None = None,
         max_hold_time: int | None = None,
         price_check_interval: int = 10,
         max_exit_sell_attempts: int = DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
@@ -236,6 +255,51 @@ class UniversalTrader:
         max_market_cap_sol: float | None = None,
         min_curve_progress_sol: float | None = None,
         min_market_cap_sol: float | None = None,
+        # R3-P0-2: Mayhem Mode coins are a distinct asset class (AI agent
+        # mints +1B tokens and trades randomly for 24h; 1 in 50 graduations
+        # fills the pool). Off by default: mayhem coins are skipped entirely.
+        allow_mayhem_mode: bool = False,
+        # R3-P1-4: force-exit when the creator sells (off by default).
+        # The monitor loop watches the listener trade feed for a sell whose
+        # trader is the tracked coin's creator, and exits on trigger.
+        exit_on_creator_sell: bool = False,
+        # R3-P2-12: event-driven sell-fill (off by default = current polling).
+        # When on, a TradeEvent from the bot's OWN wallet on the log feed flags
+        # the mint so the monitor evaluates the exit immediately instead of
+        # waiting for the next price-check tick.
+        event_driven_exits_enabled: bool = False,
+        # R3-P2-14: slot-ordered feed (off by default = unordered). When on,
+        # copy/monitor fills release in ascending slot order (out-of-order
+        # fills would corrupt position state); the snipe path stays unordered.
+        slot_ordered_feed_enabled: bool = False,
+        # R3-P2-15: in-stream filter updates (off by default). When on, the
+        # geyser request stream is queue-fed so update_subscription() changes
+        # watched filters without a reconnect gap; the continuity revision
+        # still bumps so consumers invalidate pre-gap cache state.
+        in_stream_updates_enabled: bool = False,
+        # R3-P1-5: holder-concentration gates (0 = off). min_unique_holders
+        # refuses coins whose observed top-account set is smaller than the
+        # floor; max_top10_concentration refuses coins where the top-10
+        # holders control more than this fraction of supply. The background
+        # refresher fills an immutable snapshot; _skip_reason reads only the
+        # snapshot (never RPC on the hot path) and FAILS OPEN when a mint has
+        # no snapshot yet.
+        min_unique_holders: int = 0,
+        max_top10_concentration: float = 0.0,
+        # R3-P2-8: metadata socials gate (0 = off). When >0, the pre-buy
+        # gate requires the token's metadata JSON to carry at least this many
+        # non-empty extensions (socials/description). The URI read happens in
+        # the background refresher; _skip_reason checks the snapshot only.
+        min_metadata_extensions: int = 0,
+        # R3-P2-10: session risk guards (0 = off).
+        max_concurrent_positions: int = 0,
+        daily_loss_limit_sol: float = 0.0,
+        budget_sol: float = 0.0,
+        # R3-P0-3: holder-reward coins (creator fee to holders; creator is a
+        # pump.fun address). Trading is identical, so the default is "trade";
+        # "skip" refuses them. cashback coins are legacy-only (create_v2
+        # rejects them) but keep trading, so they are never gated here.
+        holder_reward_mode: str = "trade",
         max_tracked_tokens: int = 500,
         # T2.4 confirmation window: require this many consecutive curve-gate
         # passes (1 = single check, current behavior) before buying.
@@ -278,10 +342,27 @@ class UniversalTrader:
         # P2-STRUC-4: base58 auth keypairs rotated per request (region
         # rotation); empty = unsigned (pre-existing behavior).
         jito_auth_keypairs: list[str] | None = None,
+        # R3-P2-6: DontFront/MEV shield (off by default). When real mode is
+        # armed and jito is on, route sends through the DontFront-compatible
+        # block-engine variant (sandwich protection). Shadow mode unaffected.
+        jito_dontfront: bool = False,
         # Node provider configuration
         max_rps: float = 25.0,
         # P2-STRUC-1: background blockhash refresh cadence (s); 0.05 min.
         blockhash_refresh_interval: float = 5.0,
+        # R3-P2-2: durable nonce (off by default). When set to the base58
+        # nonce ACCOUNT address, sends use the nonce account's stored
+        # blockhash (advance + authority) instead of the short-lived recent
+        # blockhash — replay-protected and valid far beyond 150 blocks.
+        durable_nonce_account: str | None = None,
+        # R3-P2-3: address lookup tables (off by default). When set to a list
+        # of base58 ALT addresses, the buy/sell message compresses static keys
+        # through the tables (smaller tx, lower fee, faster validation).
+        alt_addresses: list[str] | None = None,
+        # R3-P2-5: PumpSwap graduation watcher (off by default). Detects the
+        # CompletePumpAmmMigrationEvent in logs so post-graduation leader
+        # activity is seen as PumpSwap trades, not curve trades.
+        migrate_watcher_enabled: bool = False,
     ):
         """Initialize the universal trader."""
         # Core components
@@ -289,6 +370,8 @@ class UniversalTrader:
             rpc_endpoint,
             max_rps=max_rps,
             blockhash_refresh_interval=blockhash_refresh_interval,
+            durable_nonce_account=durable_nonce_account,
+            alt_addresses=alt_addresses,
         )
         self.wallet = Wallet(private_key)
         self.priority_fee_manager = PriorityFeeManager(
@@ -379,12 +462,25 @@ class UniversalTrader:
                         endpoints=jito_endpoints,
                         tip_lamports=jito_tip_lamports,
                         auth_keypairs=auth_keypairs or None,
+                        dontfront=jito_dontfront,
                     ),
                     DefaultExecutor(self.solana_client, max_retries=max_retries),
                 ]
             )
         else:
             self.executor = None
+
+        # R3-P1-3: Jupiter aggregator fallback client (only built when the
+        # feature is enabled; None otherwise keeps the fallback off).
+        if aggregator_fallback:
+            from execution.jupiter_client import JupiterClient
+
+            self.jupiter_client = JupiterClient(
+                slippage_bps=aggregator_slippage_bps,
+                max_price_impact_pct=aggregator_max_price_impact_pct,
+            )
+        else:
+            self.jupiter_client = None
 
         self.buyer, self.seller = (
             PlatformAwareBuyer(
@@ -417,6 +513,11 @@ class UniversalTrader:
                 max_sell_impact_bps=max_sell_impact_bps,
                 # P2-EXIT-5: close ATA in-tx on full-balance sell.
                 close_ata_on_sell=close_ata_on_sell,
+                # R3-P1-3: Jupiter aggregator sell fallback (off by default).
+                aggregator_fallback=aggregator_fallback,
+                jupiter_client=self.jupiter_client,
+                aggregator_slippage_bps=aggregator_slippage_bps,
+                aggregator_max_price_impact_pct=aggregator_max_price_impact_pct,
             ),
         )
 
@@ -428,6 +529,9 @@ class UniversalTrader:
             geyser_api_token=geyser_api_token,
             geyser_auth_type=geyser_auth_type,
             platforms=[self.platform],  # Only listen for our platform
+            in_stream_updates_enabled=getattr(
+                self, "in_stream_updates_enabled", False
+            ),
         )
 
         # Trading parameters
@@ -437,6 +541,11 @@ class UniversalTrader:
         self.sell_slippage_inflation_bps = sell_slippage_inflation_bps
         self.max_sell_impact_bps = max_sell_impact_bps
         self.close_ata_on_sell = close_ata_on_sell
+        # R3-P1-3: Jupiter aggregator fallback (off by default). The client is
+        # built once and shared by the seller; None when the feature is off.
+        self.aggregator_fallback = aggregator_fallback
+        self.aggregator_slippage_bps = aggregator_slippage_bps
+        self.aggregator_max_price_impact_pct = aggregator_max_price_impact_pct
         self.min_pool_depth_sol = min_pool_depth_sol
         # P2-EXIT-4: rug-heuristic state (off by default).
         self.rug_heuristics_enabled = rug_heuristics_enabled
@@ -459,6 +568,25 @@ class UniversalTrader:
         self.exit_strategy = exit_strategy.lower()
         self.take_profit_percentage = take_profit_percentage
         self.stop_loss_percentage = stop_loss_percentage
+        # R3-P1-2: staged exits. Parse once at construction; [] = feature off
+        # (single TP/SL unchanged). Parse failures are loud (config error),
+        # not silently ignored.
+        self.tp_ranges: list = []
+        self.sl_ranges: list = []
+        if tp_ranges:
+            self.tp_ranges = [
+                ShareRange.from_dict(r) if not isinstance(r, ShareRange) else r
+                for r in tp_ranges
+            ]
+        if sl_ranges:
+            self.sl_ranges = [
+                ShareRange.from_dict(r) if not isinstance(r, ShareRange) else r
+                for r in sl_ranges
+            ]
+        # One-order state: per-step fired markers (band_index, trigger price)
+        # so a partial sell does not repeat every price check.
+        self._tp_fired: set[tuple[int, float]] = set()  # noqa: SLF001
+        self._sl_fired: set[tuple[int, float]] = set()  # noqa: SLF001
         self.max_hold_time = max_hold_time
         # The attempt cap is clamped: below 1 would mean "never try to sell".
         self.price_check_interval, self.max_exit_sell_attempts = (
@@ -492,16 +620,74 @@ class UniversalTrader:
         # Trading filters/modes
         self.match_string = match_string
         self.bro_address = bro_address
-        self.blocked_creators = {
-            str(a) for a in (blocked_creators or [])
-        }
+        self.blocked_creators = {str(a) for a in (blocked_creators or [])}
         self.max_market_cap_sol = max_market_cap_sol
         self.min_curve_progress_sol = min_curve_progress_sol
         self.min_market_cap_sol = min_market_cap_sol
+        self.allow_mayhem_mode = allow_mayhem_mode
+        self.holder_reward_mode = holder_reward_mode
+        self.exit_on_creator_sell = exit_on_creator_sell
+        # R3-P1-4: mint key -> set of known creator wallets; when the trade
+        # feed sees a sell from one of these for a tracked mint, the monitor
+        # exits on trigger.
+        self._creator_sellers: dict[str, set[str]] = {}
+        self._creator_sold_for_exit: set[str] = set()
+        # R3-P2-12: event-driven sell-fill (off by default = current polling).
+        self.event_driven_exits_enabled = event_driven_exits_enabled
+        self._own_trade_prompt: set[str] = set()
+        # R3-P1-5: holder-concentration snapshot store + gate config.
+        from screening.holder_snapshot import HolderSnapshotStore
+
+        self._holder_store = HolderSnapshotStore()
+        self.min_unique_holders = min_unique_holders
+        self.max_top10_concentration = max_top10_concentration
+        self._holder_refresh_task = None
+        # R3-P2-8: metadata socials gate (0 = off) + snapshot store.
+        self.min_metadata_extensions = min_metadata_extensions
+        from screening.metadata_socials import MetadataStore
+
+        self._metadata_store = MetadataStore()
+        # R3-P2-10: session risk guards (off by default: 0).
+        from trading.risk_guard import RiskTracker
+
+        self.risk_tracker = RiskTracker(
+            max_concurrent_positions=max_concurrent_positions or 0,
+            daily_loss_limit_sol=daily_loss_limit_sol or 0.0,
+            budget_sol=budget_sol or 0.0,
+        )
+        # R3-P2-13: strict buy/sell serialization. One lock guards the
+        # buy-vs-sell overlap (WSOL wrap/unwrap balance races): a sell never
+        # starts while a buy is in flight and vice versa. Off-by-default
+        # semantics are preserved (a lock held by nobody is a no-op).
+        self._trade_serialization_lock = asyncio.Lock()
+        # R3-P2-14: slot-ordered delivery for the monitor/copy path. The
+        # geyser stream can deliver fills out of order; this buffer releases
+        # them in ascending slot order so a copy fill is never processed
+        # before the buy it depends on. Disabled-first (None = unordered).
+        self.slot_ordered_feed_enabled = slot_ordered_feed_enabled
+        self._slot_buffer = None
+        if slot_ordered_feed_enabled:
+            from monitoring.slot_buffer import SlotBuffer
+
+            self._slot_buffer = SlotBuffer()
+        self.in_stream_updates_enabled = in_stream_updates_enabled
+        # R3-P2-5: PumpSwap graduation watcher (off by default).
+        if migrate_watcher_enabled:
+            from research.migrate_watcher import MigrateWatcher
+
+            self.migrate_watcher = MigrateWatcher()
+        else:
+            self.migrate_watcher = None
         self.max_tracked_tokens = max_tracked_tokens
         self.consecutive_match_count = max(1, consecutive_match_count)
         self.gate_recheck_interval = max(0.1, gate_recheck_interval)
         self.honeypot_freeze_authority = honeypot_freeze_authority
+        # R3-P2-1: pre-buy risk gate snapshot. Honeypot verdicts are cached
+        # with a TTL so the gate never RPCs on the hot path when warm; the
+        # holder-concentration + creator-PnL lookups are already local
+        # (snapshot store / SQLite). Cache is mint -> (checked_at, reason).
+        self._honeypot_cache: dict[str, tuple[float, str | None]] = {}
+        self._honeypot_cache_ttl = 30.0
         self.min_curve_hold_fraction = max(0.0, min_curve_hold_fraction)
         self.backfill_enabled = backfill_enabled
         self.backfill_fetch_concurrency = backfill_fetch_concurrency
@@ -582,8 +768,10 @@ class UniversalTrader:
         while True:
             await asyncio.sleep(self.stuck_sweep_interval)
             try:
-                accounts = await self.solana_client.get_token_accounts_by_owner_all_programs(
-                    self.wallet.pubkey
+                accounts = (
+                    await self.solana_client.get_token_accounts_by_owner_all_programs(
+                        self.wallet.pubkey
+                    )
                 )
             except Exception:
                 logger.exception("Stuck-token sweep: wallet scan failed")
@@ -695,6 +883,11 @@ class UniversalTrader:
                 logger.info(
                     "Running in single token mode - will process one token and exit"
                 )
+                # R3-P1-5: holder-snapshot refresher (only when gates on).
+                if self._holder_gates_on():
+                    self._holder_refresh_task = asyncio.create_task(
+                        self._holder_refresh_loop()
+                    )
                 token_info = await self._wait_for_token()
                 if token_info:
                     await self._handle_token(token_info)
@@ -710,6 +903,11 @@ class UniversalTrader:
                 )
                 processor_task = asyncio.create_task(self._process_token_queue())
                 metrics_task = asyncio.create_task(self._metrics_logger())
+                # R3-P1-5: holder-snapshot refresher (only when gates on).
+                if self._holder_gates_on():
+                    self._holder_refresh_task = asyncio.create_task(
+                        self._holder_refresh_loop()
+                    )
 
                 try:
                     await self.token_listener.listen_for_tokens(
@@ -741,6 +939,13 @@ class UniversalTrader:
         finally:
             if self._stuck_sweeper_task is not None:
                 self._stuck_sweeper_task.cancel()
+            # R3-P1-5: cancel the holder-snapshot refresher if running.
+            if self._holder_refresh_task is not None:
+                self._holder_refresh_task.cancel()
+                try:
+                    await self._holder_refresh_task
+                except asyncio.CancelledError:
+                    pass
             await self._cleanup_without_interruption()
             # Shadow research capture: one aggregate row per session so a
             # backtest can see the whole run at a glance.
@@ -750,13 +955,26 @@ class UniversalTrader:
                         shadow=True,
                         tokens_traded=len(self.traded_mints),
                         rug_heuristics=self.rug_heuristics_enabled,
-                        creator_pnl_blacklist=(
-                            self.creator_pnl_blacklist_enabled
-                        ),
+                        creator_pnl_blacklist=(self.creator_pnl_blacklist_enabled),
                         exit_strategy=self.exit_strategy,
                     )
                 except Exception:
                     logger.exception("Shadow summary capture failed")
+            # R3-P1-1: net-metrics report from the research ledger. Shadow
+            # mode: summarize shadow_data/ (the sim trades just recorded).
+            # Real mode: also fold in trades/ when present. Best-effort —
+            # a metrics failure must never break shutdown.
+            if self.shadow_capture is not None:
+                try:
+                    from research.net_metrics import compute_metrics
+
+                    metrics = compute_metrics(
+                        real_trades_dir="trades" if not self.shadow_mode else None,
+                        source="session",
+                    )
+                    logger.info("\n%s", metrics.to_report())
+                except Exception:
+                    logger.exception("Net-metrics report failed")
             logger.info("Universal Trader has shut down")
 
     async def _init_copy_trader(self) -> None:
@@ -782,9 +1000,20 @@ class UniversalTrader:
                 profiler=WalletProfiler(),
             )
 
-            async def on_trade_logs(logs: list[str]) -> None:
+            async def on_trade_logs(
+                logs: list[str], outer_signer: str | None = None
+            ) -> None:
+                # R3-P2-5: scan the same logs for the PumpSwap migration
+                # event so post-graduation leader sells are seen.
+                if self.migrate_watcher is not None:
+                    migrated_mint = self.migrate_watcher.on_logs(logs)
+                    if migrated_mint:
+                        logger.info(
+                            f"R3-P2-5: copy feed mint {migrated_mint} "
+                            f"migrated to PumpSwap"
+                        )
                 trade = self.platform_implementations.event_parser.parse_trade_event_from_logs(
-                    logs
+                    logs, outer_signer=outer_signer
                 )
                 if trade:
                     # P2-EXIT-4: count unique buyers for the rug heuristic
@@ -794,9 +1023,7 @@ class UniversalTrader:
                         mint_key = str(trade.get("mint", ""))
                         trader_key = str(trade.get("trader") or "")
                         if mint_key and trader_key:
-                            self._rug_buyers.setdefault(mint_key, set()).add(
-                                trader_key
-                            )
+                            self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
                     await engine.on_trade_event(trade)
 
             if hasattr(self.token_listener, "trade_callback"):
@@ -817,25 +1044,109 @@ class UniversalTrader:
         unique-buyer test cannot run — the drain test still works.
         """
         try:
-            async def on_rug_trade_logs(logs: list[str]) -> None:
-                trade = (
-                    self.platform_implementations.event_parser.parse_trade_event_from_logs(
-                        logs
-                    )
-                )
-                if trade and trade.get("is_buy"):
-                    mint_key = str(trade.get("mint", ""))
-                    trader_key = str(trade.get("trader") or "")
-                    if mint_key and trader_key:
-                        self._rug_buyers.setdefault(mint_key, set()).add(
-                            trader_key
+
+            async def on_rug_trade_logs(
+                logs: list[str], outer_signer: str | None = None
+            ) -> None:
+                # R3-P2-5: scan logs for the PumpSwap migration event first
+                # (the same logs carry both events).
+                if self.migrate_watcher is not None:
+                    migrated_mint = self.migrate_watcher.on_logs(logs)
+                    if migrated_mint:
+                        logger.info(
+                            f"R3-P2-5: mint {migrated_mint} migrated to "
+                            f"PumpSwap (watcher armed)"
                         )
+                trade = self.platform_implementations.event_parser.parse_trade_event_from_logs(
+                    logs, outer_signer=outer_signer
+                )
+                if not trade:
+                    return
+                mint_key = str(trade.get("mint", ""))
+                trader_key = str(trade.get("trader") or "")
+                # R3-P1-4: creator-sell trigger — a sell whose trader matches
+                # a registered creator for this mint marks it for exit.
+                if self.exit_on_creator_sell and not trade.get("is_buy"):
+                    creators = self._creator_sellers.get(mint_key, set())
+                    if creators and trader_key in creators:
+                        self._creator_sold_for_exit.add(mint_key)
+                if trade.get("is_buy") and mint_key and trader_key:
+                    self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
+                # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
+                # is the bot's wallet prompts the monitor for an immediate
+                # exit evaluation (off by default = current polling).
+                if self.event_driven_exits_enabled and self.wallet is not None:
+                    if str(trade.get("trader") or "") == str(self.wallet.public_key):
+                        self._own_trade_prompt.add(mint_key)
 
             if hasattr(self.token_listener, "trade_callback"):
                 self.token_listener.trade_callback = on_rug_trade_logs
                 logger.info("P2-EXIT-4: rug trade feed wired (buyer counting)")
         except Exception:
             logger.exception("Rug trade feed init failed; drain test only")
+
+    def _holder_gates_on(self) -> bool:
+        """R3-P1-5: whether either holder-concentration gate is configured."""
+        return self.min_unique_holders > 0 or self.max_top10_concentration > 0
+
+    async def _holder_refresh_loop(self, interval: float = 30.0) -> None:
+        """R3-P1-5: background holder-snapshot refresher.
+
+        Pulls `getTokenLargestAccounts` + supply for every mint the detector
+        has queued/tracked, publishing immutable snapshots. `_skip_reason`
+        reads only the snapshot store — this loop owns the RPC. Best-effort:
+        a failed pull leaves the old snapshot (fail-open for missing mints).
+        """
+        try:
+            while True:
+                mints = set()
+                for key in list(getattr(self, "processed_tokens", set()) or set()) + [
+                    str(m) for m in getattr(self, "traded_mints", set())
+                ]:
+                    if key:
+                        mints.add(key)
+                # Also refresh mints seen by the detector queue (may not be
+                # processed yet): the gate should see fresh distribution
+                # before the buy, not only after.
+                queue_mints = set()
+                try:
+                    q = getattr(self, "token_queue", None)
+                    if q is not None and hasattr(q, "_queue"):
+                        for item in list(q._queue):  # noqa: SLF001
+                            mint = getattr(item, "mint", None)
+                            if mint:
+                                queue_mints.add(str(mint))
+                except Exception:
+                    pass
+                mints |= queue_mints
+                for mint in list(mints)[: self.max_tracked_tokens]:
+                    await self._refresh_one_holder_snapshot(mint)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Holder snapshot refresher stopped")
+            raise
+
+    async def _refresh_one_holder_snapshot(self, mint: str) -> None:
+        """Pull largest accounts + supply for one mint and store a snapshot."""
+        try:
+            client = await self.solana_client.get_client()
+            mint_pk = Pubkey.from_string(mint)
+            largest = await client.get_token_largest_accounts(mint_pk)
+            supply = await client.get_token_supply(mint_pk)
+            rows = [
+                (str(item.address), int(str(item.amount)))
+                for item in (largest.value or [])
+            ]
+            total_raw = int(str(supply.value.amount)) if supply.value else 0
+            slot = largest.context.slot if largest.context else 0
+            from screening.holder_snapshot import compute_snapshot
+
+            self._holder_store.put(compute_snapshot(mint, rows, total_raw, slot=slot))
+        except Exception:
+            # Fail-open: keep whatever snapshot exists (or none) for this mint.
+            logger.debug("Holder snapshot pull failed for %s", mint)
 
     async def _mirror_buy(
         self, token_info: TokenInfo, target: Any, size_sol: float
@@ -859,15 +1170,10 @@ class UniversalTrader:
                     symbol=token_info.symbol,
                     platform=token_info.platform.value,
                     price=price,
-                    amount_tokens=(
-                        size_sol / price if price > 0 else 0.0
-                    ),
+                    amount_tokens=(size_sol / price if price > 0 else 0.0),
                     quote_spent=size_sol,
                     pool_snapshot=await self._pool_snapshot(token_info),
-                    mirror_of=(
-                        target.alias
-                        or str(target.wallet)[:8]
-                    ),
+                    mirror_of=(target.alias or str(target.wallet)[:8]),
                 )
                 return True
 
@@ -913,16 +1219,13 @@ class UniversalTrader:
                 page_size=self.backfill_page_size,
                 max_retries=3,
                 checkpoint_path=(
-                    Path(self.backfill_checkpoint)
-                    if self.backfill_checkpoint
-                    else None
+                    Path(self.backfill_checkpoint) if self.backfill_checkpoint else None
                 ),
             )
 
             async def handle_replay(tx: dict, sig) -> None:  # noqa: ANN001
                 logs = (
-                    tx.get("meta", {})
-                    .get("logMessages", [])
+                    tx.get("meta", {}).get("logMessages", [])
                     if isinstance(tx, dict)
                     else []
                 )
@@ -1233,12 +1536,9 @@ class UniversalTrader:
         otherwise spend its one token on a coin it was never going to buy.
         """
         quote_mint = normalize_quote_mint(token_info.quote_mint)
-        if (
-            self.blocked_creators
-            and (
-                str(token_info.creator) in self.blocked_creators
-                or str(token_info.user) in self.blocked_creators
-            )
+        if self.blocked_creators and (
+            str(token_info.creator) in self.blocked_creators
+            or str(token_info.user) in self.blocked_creators
         ):
             return f"creator {token_info.creator or token_info.user} is blocked"
         # P2-STRUC-2: creator whose realized net PnL is non-positive over
@@ -1258,10 +1558,47 @@ class UniversalTrader:
                     f"creator {creator} on PnL blacklist "
                     f"({trades} trades, net {net:.4f} SOL)"
                 )
-        if self.allowed_quote_mints is not None and quote_mint not in self.allowed_quote_mints:
+        if (
+            self.allowed_quote_mints is not None
+            and quote_mint not in self.allowed_quote_mints
+        ):
             return f"quote mint {quote_mint} not in allowed_quote_mints"
         if quote_mint not in self.quote_amounts:
             return f"no buy amount configured for quote mint {quote_mint}"
+        if not self.allow_mayhem_mode and getattr(token_info, "is_mayhem_mode", False):
+            return "mayhem-mode coin (distinct asset class; allow_mayhem_mode is off)"
+        if self.holder_reward_mode == "skip" and getattr(
+            token_info, "is_holder_reward", False
+        ):
+            return "holder-reward coin (holder_reward_mode=skip)"
+        # R3-P1-5: holder-concentration gates (0 = off). Local snapshot lookup
+        # only — the background refresher owns the RPC. Fail-open: a mint with
+        # no snapshot yet is allowed (the refresher may simply not have run).
+        if self.min_unique_holders > 0 or self.max_top10_concentration > 0:
+            snap = self._holder_store.get(str(token_info.mint))
+            if snap is not None and not snap.passes(
+                min_unique_holders=self.min_unique_holders,
+                max_top10_concentration=self.max_top10_concentration,
+            ):
+                return (
+                    f"holder distribution: {snap.unique_holders} unique "
+                    f"holders, top-10 {snap.top10_fraction:.1%} of supply "
+                    f"(min_unique_holders={self.min_unique_holders}, "
+                    f"max_top10_concentration={self.max_top10_concentration})"
+                )
+        # R3-P2-8: metadata socials gate (0 = off). Local snapshot lookup
+        # only — the background refresher owns the URI fetch. Fail-open: a
+        # mint with no snapshot yet is allowed.
+        if self.min_metadata_extensions > 0:
+            meta = self._metadata_store.get(str(token_info.mint))
+            if meta is not None and (
+                meta.non_empty_extensions < self.min_metadata_extensions
+            ):
+                return (
+                    f"metadata has {meta.non_empty_extensions} non-empty "
+                    f"extension(s) < min_metadata_extensions "
+                    f"{self.min_metadata_extensions}"
+                )
         if (
             self.max_transfer_fee_bps is not None
             and token_info.transfer_fee_bps > self.max_transfer_fee_bps
@@ -1313,18 +1650,12 @@ class UniversalTrader:
             # Improvement #4: breakout mode — buy only after the market cap
             # has risen THROUGH min_market_cap_sol (momentum confirmation),
             # complementing the max cap that rejects already-pumped coins.
-            if (
-                self.min_market_cap_sol is not None
-                and mc_sol < self.min_market_cap_sol
-            ):
+            if self.min_market_cap_sol is not None and mc_sol < self.min_market_cap_sol:
                 return (
                     f"market cap {mc_sol:.2f} SOL below "
                     f"min_market_cap_sol {self.min_market_cap_sol} (breakout not triggered)"
                 )
-            if (
-                self.max_market_cap_sol is not None
-                and mc_sol > self.max_market_cap_sol
-            ):
+            if self.max_market_cap_sol is not None and mc_sol > self.max_market_cap_sol:
                 return (
                     f"market cap {mc_sol:.2f} SOL exceeds "
                     f"max_market_cap_sol {self.max_market_cap_sol}"
@@ -1344,21 +1675,66 @@ class UniversalTrader:
             # Uses the state already fetched above (no extra curve RPC); the
             # mint read is the one additional call, only when enabled.
             if self.honeypot_freeze_authority or self.min_curve_hold_fraction > 0:
-                honeypot_reason = await honeypot_reason(
-                    self.solana_client,
-                    token_info,
-                    state,
-                    check_freeze_authority=self.honeypot_freeze_authority,
-                    min_curve_hold_fraction=self.min_curve_hold_fraction,
-                )
-                if honeypot_reason:
-                    return honeypot_reason
+                mint_key = str(token_info.mint)
+                # R3-P2-1: warm snapshot lookup — a verdict cached within the
+                # TTL is reused without any RPC on the hot path.
+                cached = self._honeypot_cache.get(mint_key)
+                if (
+                    cached is not None
+                    and (monotonic() - cached[0]) < self._honeypot_cache_ttl
+                ):
+                    if cached[1]:
+                        return cached[1]
+                else:
+                    hp_reason = await honeypot_reason(
+                        self.solana_client,
+                        token_info,
+                        state,
+                        check_freeze_authority=self.honeypot_freeze_authority,
+                        min_curve_hold_fraction=self.min_curve_hold_fraction,
+                    )
+                    self._honeypot_cache[mint_key] = (
+                        monotonic(),
+                        hp_reason,
+                    )
+                    if hp_reason:
+                        return hp_reason
         except Exception:
             logger.exception("Curve gate check failed")
             if getattr(self, "fail_closed_gates", True):
                 return "curve gate check failed (RPC error) - fail-closed"
             return None
         return None
+
+    async def _fee_estimate_fields(self) -> dict:
+        """R3-P2-4: fee ground-truth fields for research capture.
+
+        Estimates what the configured send path would pay (priority fee +
+        jito tip) and returns capture fields. Best-effort: any failure yields
+        empty fields (fee_source unknown), never raises into the trade path.
+        """
+        try:
+            from research.fee_capture import estimate_send_fee
+
+            priority_fee = await self.priority_fee_manager.calculate_priority_fee()
+            tip_lamports = 0
+            tip_account = None
+            executor = getattr(self, "executor", None)
+            if executor is not None:
+                tip = getattr(executor, "tip_lamports", 0) or 0
+                tip_account = getattr(executor, "_tip_account", None)  # noqa: SLF001
+                if tip_account is not None:
+                    tip_account = str(tip_account)
+                tip_lamports = int(tip)
+            est = estimate_send_fee(
+                priority_fee,
+                tip_lamports=tip_lamports,
+                tip_account_b58=tip_account,
+                compute_units=100_000,
+            )
+            return est.to_capture_fields()
+        except Exception:
+            return {"fee_source": "unknown"}
 
     def _capture_detect(
         self, token_info: TokenInfo, skip_reason: str | None = None
@@ -1372,15 +1748,44 @@ class UniversalTrader:
                 symbol=token_info.symbol,
                 platform=token_info.platform.value,
                 quote_mint=str(normalize_quote_mint(token_info.quote_mint)),
-                creator=(
-                    str(token_info.creator) if token_info.creator else None
-                ),
+                creator=(str(token_info.creator) if token_info.creator else None),
                 transfer_fee_bps=token_info.transfer_fee_bps,
                 listener=getattr(self.token_listener, "listener_type", ""),
                 skip_reason=skip_reason,
+                is_mayhem_mode=bool(getattr(token_info, "is_mayhem_mode", False)),
+                is_holder_reward=bool(getattr(token_info, "is_holder_reward", False)),
+                is_cashback_coin=bool(getattr(token_info, "is_cashback_coin", False)),
             )
         except Exception:
             logger.exception("Shadow detect capture failed")
+
+    async def _sol_price_usd(self) -> float | None:
+        """Current SOL/USD price for research capture, or None on failure.
+
+        Cached for 60s so repeated snapshots cost at most one HTTP request a
+        minute. Best-effort: research data must never raise into the trade
+        path, so any failure yields None and the USD field is simply omitted.
+        """
+        cached = getattr(self, "_sol_price_cache", None)
+        now = monotonic()
+        if cached is not None and (now - cached[1]) < _SOL_PRICE_TTL_SECONDS:
+            return cached[0]
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_SOL_PRICE_TIMEOUT_SECONDS)
+            ) as session:
+                async with session.get(
+                    "https://api.coingecko.com/api/v3/simple/price"
+                    "?ids=solana&vs_currencies=usd"
+                ) as resp:
+                    if resp.status != _HTTP_OK:
+                        return None
+                    data = await resp.json()
+                    price = float(data["solana"]["usd"])
+            self._sol_price_cache = (price, now)
+            return price
+        except Exception:
+            return None
 
     async def _pool_snapshot(self, token_info: TokenInfo) -> dict:
         """Real on-chain pool state at this moment, for research capture.
@@ -1398,13 +1803,9 @@ class UniversalTrader:
             pool_address = (
                 token_info.bonding_curve
                 or token_info.pool_state
-                or implementations.address_provider.derive_pool_address(
-                    token_info.mint
-                )
+                or implementations.address_provider.derive_pool_address(token_info.mint)
             )
-            state = await implementations.curve_manager.get_pool_state(
-                pool_address
-            )
+            state = await implementations.curve_manager.get_pool_state(pool_address)
             if not state:
                 return {}
             keep = {
@@ -1418,11 +1819,64 @@ class UniversalTrader:
                 "fee_fraction",
                 "transfer_fee_bps",
                 "price_per_token",
+                "token_total_supply",
             }
-            return {k: state.get(k) for k in keep if k in state}
+            snapshot = {k: state.get(k) for k in keep if k in state}
+
+            # Market cap in the quote asset (whole units) and USD. SOL-paired
+            # curves only for USD — a USDC quote is already dollars.
+            supply = snapshot.get("token_total_supply")
+            quote_units = 10 ** (await self._quote_decimals_for(token_info))
+            if supply and quote_units:
+                vq = snapshot.get("virtual_quote_reserves", 0) or 0
+                vt = snapshot.get("virtual_token_reserves", 0) or 0
+                if vt > 0:
+                    mcap_quote = (vq / quote_units) * (supply / vt)
+                    snapshot["market_cap_quote"] = mcap_quote
+                    if token_info.quote_mint is not None and str(
+                        token_info.quote_mint
+                    ) in (
+                        "So11111111111111111111111111111111111111112",
+                        "11111111111111111111111111111111",
+                    ):
+                        sol_usd = await self._sol_price_usd()
+                        if sol_usd:
+                            snapshot["market_cap_usd"] = mcap_quote * sol_usd
+                    else:
+                        snapshot["market_cap_usd"] = mcap_quote
+            # Entry-MC band for strategy analysis. Every pump.fun launch is
+            # born at the ~28-SOL floor, so raw MC carries no selection signal
+            # at detection — the band makes the cohort explicit in the ledger
+            # so backtests can prove (or kill) the "floor band = coin flip"
+            # hypothesis directly.
+            mc_usd = snapshot.get("market_cap_usd")
+            if mc_usd is not None:
+                if mc_usd < 3000:
+                    snapshot["mc_band"] = "floor_lt_3k"
+                elif mc_usd < 5000:
+                    snapshot["mc_band"] = "3k_5k"
+                elif mc_usd < 10000:
+                    snapshot["mc_band"] = "5k_10k"
+                else:
+                    snapshot["mc_band"] = "gt_10k"
+            return snapshot
         except Exception:
             logger.exception("Pool snapshot capture failed")
             return {}
+
+    async def _quote_decimals_for(self, token_info: TokenInfo) -> int:
+        """Quote mint decimals for the snapshot, defaulting to 9 (SOL).
+
+        Research-only: an unresolved non-SOL quote mint reports an approximate
+        market cap rather than failing the capture.
+        """
+        try:
+            mint = token_info.quote_mint
+            if mint is None:
+                return 9
+            return quote_decimals(resolve_quote_mint(mint))
+        except Exception:
+            return 9
 
     async def _handle_token(self, token_info: TokenInfo) -> None:
         """Handle a new token creation event."""
@@ -1475,9 +1929,7 @@ class UniversalTrader:
                 if self.consecutive_match_count > 1:
                     for recheck in range(1, self.consecutive_match_count):
                         await asyncio.sleep(self.gate_recheck_interval)
-                        curve_gate_reason = await self._curve_gate_reason(
-                            token_info
-                        )
+                        curve_gate_reason = await self._curve_gate_reason(token_info)
                         if curve_gate_reason:
                             logger.info(
                                 f"Skipping {token_info.symbol} - "
@@ -1491,6 +1943,13 @@ class UniversalTrader:
                     )
 
             # Buy token
+            # R3-P2-10: session risk guards — the loss limit blocks NEW buys
+            # while sells still run; never traps money in a falling position.
+            if not self.risk_tracker.buy_allowed:
+                reason = self.risk_tracker.blocked_reason or "risk guard blocked"
+                logger.warning(f"Skipping {token_info.symbol} - {reason}")
+                self._capture_detect(token_info, reason)
+                return
             logger.info(
                 f"Buying {self.quote_amounts[token_quote_mint]:.6f} of quote "
                 f"{token_quote_mint} worth of {token_info.symbol} "
@@ -1519,6 +1978,7 @@ class UniversalTrader:
                     price=sim_price,
                 )
                 if self.shadow_capture is not None:
+                    fee_fields = await self._fee_estimate_fields()
                     self.shadow_capture.sim_open(
                         mint=str(token_info.mint),
                         symbol=token_info.symbol,
@@ -1527,11 +1987,19 @@ class UniversalTrader:
                         amount_tokens=sim_amount,
                         quote_spent=self.quote_amounts.get(token_quote_mint, 0.0),
                         pool_snapshot=await self._pool_snapshot(token_info),
+                        **fee_fields,
                     )
             else:
-                buy_result: TradeResult = await self.buyer.execute(token_info)
+                # R3-P2-13: a buy never overlaps an in-flight sell (WSOL
+                # wrap/unwrap balance race). No-op without contention.
+                async with self._trade_serialization_lock:
+                    buy_result: TradeResult = await self.buyer.execute(token_info)
 
             if buy_result.success:
+                # R3-P2-10: track the buy for concurrency/budget accounting.
+                self.risk_tracker.record_buy(
+                    float(self.quote_amounts.get(token_quote_mint, 0.0))
+                )
                 await self._handle_successful_buy(token_info, buy_result)
             else:
                 await self._handle_failed_buy(token_info, buy_result)
@@ -1563,9 +2031,9 @@ class UniversalTrader:
             # logged as None until a quote->SOL conversion exists).
             quote_spent_sol=(
                 buy_result.price * buy_result.amount
-                if buy_result.price and buy_result.amount and (
-                    normalize_quote_mint(token_info.quote_mint) == WSOL_MINT
-                )
+                if buy_result.price
+                and buy_result.amount
+                and (normalize_quote_mint(token_info.quote_mint) == WSOL_MINT)
                 else None
             ),
         )
@@ -1603,9 +2071,7 @@ class UniversalTrader:
                         state.get("virtual_quote_reserves", 0) or 0,
                     )
                 except Exception:
-                    logger.exception(
-                        "Rug heuristics: entry depth unavailable"
-                    )
+                    logger.exception("Rug heuristics: entry depth unavailable")
                 if entry_slot is not None:
                     self._rug_entry[str(token_info.mint)] = (
                         entry_slot,
@@ -1621,7 +2087,15 @@ class UniversalTrader:
         # Choose exit strategy
         if not self.marry_mode:
             if self.exit_strategy == "tp_sl":
-                await self._handle_tp_sl_exit(token_info, buy_result)
+                # The monitor runs for the position's whole life; with
+                # max_hold_time removed it may never return. Await it inline
+                # only for the single-token modes; in yolo mode it must run
+                # as a task or the token-queue processor starves behind the
+                # first open position (seen live: 1306 queued, 2 processed).
+                if self.yolo_mode:
+                    asyncio.create_task(self._handle_tp_sl_exit(token_info, buy_result))
+                else:
+                    await self._handle_tp_sl_exit(token_info, buy_result)
             elif self.exit_strategy == "time_based":
                 await self._handle_time_based_exit(token_info, buy_result)
             elif self.exit_strategy == "manual":
@@ -1668,6 +2142,14 @@ class UniversalTrader:
         )
 
         logger.info(f"Created position: {position}")
+        # R3-P1-4: register the coin's creator wallet(s) so the trade feed can
+        # flag a creator sell for a monitored position.
+        if self.exit_on_creator_sell:
+            mint_key = str(token_info.mint)
+            creators = self._creator_sellers.setdefault(mint_key, set())
+            for creator in (token_info.creator, token_info.user):
+                if creator:
+                    creators.add(str(creator))
         quote_label = quote_symbol(normalize_quote_mint(token_info.quote_mint))
         if position.take_profit_price:
             logger.info(
@@ -1718,6 +2200,7 @@ class UniversalTrader:
                     buy_px = buy_result.price or 0.0
                     amount = buy_result.amount or 0.0
                     pnl_quote = (price - buy_px) * amount
+                    fee_fields = await self._fee_estimate_fields()
                     self.shadow_capture.sim_close(
                         mint=str(token_info.mint),
                         symbol=token_info.symbol,
@@ -1730,16 +2213,32 @@ class UniversalTrader:
                         pnl_pct=(price - buy_px) / buy_px if buy_px > 0 else 0.0,
                         hold_seconds=self.wait_time_after_buy or 0.0,
                         pool_snapshot=await self._pool_snapshot(token_info),
+                        **fee_fields,
                     )
             else:
-                sell_result = await self.seller.execute(
-                    token_info,
-                    token_amount=buy_result.amount or 0.0,
-                    token_price=token_price,
-                )  # type: ignore[arg-type]  # token_price is built from buy_result.price
+                # R3-P2-13: serialize the sell against any in-flight buy.
+                async with self._trade_serialization_lock:
+                    sell_result = await self.seller.execute(
+                        token_info,
+                        token_amount=buy_result.amount or 0.0,
+                        token_price=token_price,
+                    )  # type: ignore[arg-type]  # token_price is built from buy_result.price
 
             if sell_result.success:
                 logger.info(f"Successfully sold {token_info.symbol}")
+                # R3-P2-10: track realized PnL for the risk guards. The
+                # time-based path has the buy price; PnL = (sell-buy)*amount.
+                try:
+                    _buy_px = buy_result.price or 0.0
+                    _qty = sell_result.amount or buy_result.amount or 0.0
+                    _pnl = (
+                        (sell_result.price - _buy_px) * _qty
+                        if sell_result.price and _buy_px
+                        else 0.0
+                    )
+                    self.risk_tracker.record_close(_pnl)
+                except Exception:
+                    self.risk_tracker.record_close(0.0)
                 self._log_trade(
                     "sell",
                     token_info,
@@ -1748,9 +2247,9 @@ class UniversalTrader:
                     sell_result.tx_signature,
                     quote_received_sol=(
                         sell_result.price * sell_result.amount
-                        if sell_result.price and sell_result.amount and (
-                            normalize_quote_mint(token_info.quote_mint) == WSOL_MINT
-                        )
+                        if sell_result.price
+                        and sell_result.amount
+                        and (normalize_quote_mint(token_info.quote_mint) == WSOL_MINT)
                         else None
                     ),
                 )
@@ -2002,13 +2501,9 @@ class UniversalTrader:
             pool_address = (
                 token_info.bonding_curve
                 or token_info.pool_state
-                or implementations.address_provider.derive_pool_address(
-                    token_info.mint
-                )
+                or implementations.address_provider.derive_pool_address(token_info.mint)
             )
-            state = await implementations.curve_manager.get_pool_state(
-                pool_address
-            )
+            state = await implementations.curve_manager.get_pool_state(pool_address)
             current_depth = max(
                 state.get("real_quote_reserves", 0) or 0,
                 state.get("virtual_quote_reserves", 0) or 0,
@@ -2085,6 +2580,22 @@ class UniversalTrader:
                             break
                         continue
 
+                # R3-P1-2: staged TP/SL partial sells. When ranges are
+                # configured, they fire BEFORE the single TP/SL check — a
+                # step at +40% sells its share, and the position stays open
+                # for the next step / the final close.
+                if self.tp_ranges or self.sl_ranges:
+                    staged = await self._handle_staged_exit(
+                        token_info, position, current_price
+                    )
+                    if staged:
+                        # A staged sell consumed part/all of the position.
+                        if not position.is_active:
+                            break
+                        # The final band step may have closed the position
+                        # already; otherwise keep monitoring for more steps.
+                        continue
+
                 # Check if position should be exited
                 should_exit, exit_reason = position.should_exit(current_price)
 
@@ -2096,9 +2607,7 @@ class UniversalTrader:
                         )
                         exit_reason = ExitReason.RUG
                         exit_price = (
-                            current_price
-                            if current_price > 0
-                            else last_known_price
+                            current_price if current_price > 0 else last_known_price
                         )
                         exit_sell_attempts += 1
                         if await self._run_exit_attempt(
@@ -2110,6 +2619,30 @@ class UniversalTrader:
                         ):
                             break
                         continue
+
+                # R3-P1-4: the creator sold — force exit (off by default).
+                if (
+                    self.exit_on_creator_sell
+                    and str(token_info.mint) in self._creator_sold_for_exit
+                ):
+                    logger.warning(
+                        f"Creator-sell exit for {token_info.symbol}: creator "
+                        f"wallet sold on the feed"
+                    )
+                    exit_reason = ExitReason.CREATOR_SELL
+                    exit_price = (
+                        current_price if current_price > 0 else last_known_price
+                    )
+                    exit_sell_attempts += 1
+                    if await self._run_exit_attempt(
+                        token_info,
+                        position,
+                        exit_reason,
+                        exit_price,
+                        exit_sell_attempts,
+                    ):
+                        break
+                    continue
 
                 if should_exit and exit_reason:
                     logger.info(f"Exit condition met: {exit_reason.value}")
@@ -2142,12 +2675,52 @@ class UniversalTrader:
                     # Log current status
                     exit_sell_attempts = 0
                     pnl = position.get_pnl(current_price)
-                    logger.debug(
-                        f"Position status: {current_price:.8f} {quote_label} "
-                        f"({pnl['price_change_pct']:+.2f}%)"
+                    # Unrealized PnL is normally a debug line; in shadow mode
+                    # surface it at INFO every ~15s and record a `sim_mark`
+                    # research event, so open positions are replayable without
+                    # waiting for the close.
+                    mark_interval = max(1, 15 // max(1, self.price_check_interval))
+                    self._mark_tick = getattr(self, "_mark_tick", 0) + 1
+                    shadow_mark = (
+                        self.shadow_mode
+                        and self.shadow_capture is not None
+                        and self._mark_tick % mark_interval == 0
                     )
+                    if shadow_mark:
+                        logger.info(
+                            f"[SHADOW] {token_info.symbol} unrealized: "
+                            f"{pnl['price_change_pct']:+.2f}% "
+                            f"({pnl['unrealized_pnl_quote']:+.6f} {quote_label}) "
+                            f"price {current_price:.3e}"
+                        )
+                        self.shadow_capture.mark(
+                            mint=str(token_info.mint),
+                            symbol=token_info.symbol,
+                            platform=token_info.platform.value,
+                            price=current_price,
+                            pnl_pct=float(pnl["price_change_pct"]),
+                            pnl_quote=float(pnl["unrealized_pnl_quote"]),
+                            hold_seconds=(
+                                datetime.now() - position.entry_time
+                            ).total_seconds(),
+                        )
+                    elif logger.isEnabledFor(10):
+                        logger.debug(
+                            f"Position status: {current_price:.8f} {quote_label} "
+                            f"({pnl['price_change_pct']:+.2f}%)"
+                        )
 
                 # Wait before next price check
+                # R3-P2-12: an own-wallet trade prompt skips the wait so the
+                # exit is evaluated immediately (off by default = polling).
+                if self.event_driven_exits_enabled and str(
+                    token_info.mint
+                ) in self._own_trade_prompt:
+                    self._own_trade_prompt.discard(str(token_info.mint))
+                    logger.debug(
+                        f"Event-driven exit prompt for {token_info.symbol}"
+                    )
+                    continue
                 await asyncio.sleep(self.price_check_interval)
 
             except Exception:
@@ -2290,6 +2863,117 @@ class UniversalTrader:
         except OSError:
             logger.exception("Failed to log attempt telemetry")
 
+    async def _handle_staged_exit(
+        self,
+        token_info: TokenInfo,
+        position: Position,
+        current_price: float,
+    ) -> bool:
+        """Fire any staged TP/SL steps the current price has reached.
+
+        Returns True when at least one staged sell ran (or the position
+        closed); False when nothing was due.
+
+        Semantics (R3-P1-2):
+        - TP steps walk low-to-high; each fires once, selling its share of the
+          position at the current price (partial sell, position stays open).
+        - SL steps walk high-to-low; the band bottom sells the remaining
+          position (final close). An SL final step marks the position closed.
+        - A single-step band (from_pct == to_pct) fires on a jump past it.
+        """
+        if not (self.tp_ranges or self.sl_ranges):
+            return False
+        from trading.staged_exit import due_sl_steps, due_tp_steps
+
+        fired_any = False
+        # TP first (take profit as it runs), then SL (protect on the way down).
+        tp_due = due_tp_steps(
+            position.entry_price, current_price, self.tp_ranges, self._tp_fired
+        )
+        for step in tp_due:
+            self._tp_fired.add((step.band_index, step.trigger_price))
+            fired_any = True
+            await self._staged_partial_sell(
+                token_info, position, step.share, "staged_tp", step.trigger_price
+            )
+            if not position.is_active:
+                return True
+
+        sl_due = due_sl_steps(
+            position.entry_price, current_price, self.sl_ranges, self._sl_fired
+        )
+        for step in sl_due:
+            self._sl_fired.add((step.band_index, step.trigger_price))
+            fired_any = True
+            if step.is_final:
+                # Band bottom: close the position in full.
+                await self._run_exit_attempt(
+                    token_info,
+                    position,
+                    ExitReason.STOP_LOSS,
+                    current_price,
+                    1,
+                )
+                return True
+            await self._staged_partial_sell(
+                token_info, position, step.share, "staged_sl", step.trigger_price
+            )
+            if not position.is_active:
+                return True
+        return fired_any
+
+    async def _staged_partial_sell(
+        self,
+        token_info: TokenInfo,
+        position: Position,
+        share: float,
+        exit_reason: str,
+        trigger_price: float,
+    ) -> None:
+        """Sell ``share`` of the position at the current price (staged)."""
+        qty = position.quantity * share
+        if qty <= 0:
+            return
+        price = await self._read_price(token_info)
+        if price <= 0:
+            price = trigger_price  # floor the partial at the trigger level
+        if self.shadow_mode and self.shadow_capture is not None:
+            fee_fields = await self._fee_estimate_fields()
+            self.shadow_capture.sim_close(
+                mint=str(token_info.mint),
+                symbol=token_info.symbol,
+                platform=token_info.platform.value,
+                price=price,
+                amount_tokens=qty,
+                quote_received=price * qty,
+                exit_reason=exit_reason,
+                pnl_quote=(price - position.entry_price) * qty,
+                pnl_pct=(price - position.entry_price) / position.entry_price
+                if position.entry_price > 0
+                else 0.0,
+                hold_seconds=(datetime.now() - position.entry_time).total_seconds(),
+                pool_snapshot=await self._pool_snapshot(token_info),
+                **fee_fields,
+            )
+            logger.info(
+                f"[SHADOW] staged {exit_reason} sell {qty:.6f} {token_info.symbol} "
+                f"@ {price:.3e} (no tx sent)"
+            )
+        else:
+            sell_result = await self.seller.execute(
+                token_info, token_amount=qty, token_price=price
+            )
+            if not sell_result.success:
+                logger.warning(
+                    f"Staged {exit_reason} sell failed for {token_info.symbol}: "
+                    f"{sell_result.error_message}"
+                )
+                return
+        # Reduce position quantity by the sold share (keep entry price).
+        position.quantity = max(0.0, position.quantity - qty)
+        if position.quantity <= 0:
+            position.close_position(price, ExitReason.TAKE_PROFIT)
+
     async def _run_exit_attempt(
         self,
         token_info: TokenInfo,
@@ -2369,9 +3053,8 @@ class UniversalTrader:
                 f"{sim_price:.3e} SOL/token ({exit_reason.value}, no tx sent)"
             )
             if self.shadow_capture is not None:
-                hold_seconds = (
-                    datetime.now() - position.entry_time
-                ).total_seconds()
+                hold_seconds = (datetime.now() - position.entry_time).total_seconds()
+                fee_fields = await self._fee_estimate_fields()
                 self.shadow_capture.sim_close(
                     mint=str(token_info.mint),
                     symbol=token_info.symbol,
@@ -2384,17 +3067,27 @@ class UniversalTrader:
                     pnl_pct=float(pnl.get("price_change_pct", 0.0)),
                     hold_seconds=hold_seconds,
                     pool_snapshot=await self._pool_snapshot(token_info),
+                    **fee_fields,
                 )
         else:
-            sell_result = await self.seller.execute(
-                token_info,
-                token_amount=position.quantity,
-                token_price=price,
-            )
+            # R3-P2-13: serialize the exit sell against any in-flight buy.
+            async with self._trade_serialization_lock:
+                sell_result = await self.seller.execute(
+                    token_info,
+                    token_amount=position.quantity,
+                    token_price=price,
+                )
 
         if sell_result.success:
             # Close position with actual exit price
             position.close_position(sell_result.price, exit_reason)
+            # R3-P2-10: track realized PnL for the risk guards.
+            try:
+                self.risk_tracker.record_close(
+                    float(pnl.get("unrealized_pnl_quote", 0.0))
+                )
+            except Exception:
+                self.risk_tracker.record_close(0.0)
 
             logger.info(f"Successfully exited position: {exit_reason.value}")
             self._log_trade(
@@ -2405,9 +3098,9 @@ class UniversalTrader:
                 sell_result.tx_signature,
                 quote_received_sol=(
                     sell_result.price * sell_result.amount
-                    if sell_result.price and sell_result.amount and (
-                        normalize_quote_mint(token_info.quote_mint) == WSOL_MINT
-                    )
+                    if sell_result.price
+                    and sell_result.amount
+                    and (normalize_quote_mint(token_info.quote_mint) == WSOL_MINT)
                     else None
                 ),
             )
@@ -2427,9 +3120,7 @@ class UniversalTrader:
                 creator = str(token_info.creator or "") or (
                     str(token_info.user) if token_info.user else ""
                 )
-                if creator and normalize_quote_mint(
-                    token_info.quote_mint
-                ) == WSOL_MINT:
+                if creator and normalize_quote_mint(token_info.quote_mint) == WSOL_MINT:
                     try:
                         self.creator_pnl_store.record_trade(
                             creator,

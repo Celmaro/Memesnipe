@@ -12,6 +12,7 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Processed
 from solana.rpc.core import TxOptsModel
 from solders.account import Account
+from solders.address_lookup_table_account import AddressLookupTableAccount
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.hash import Hash
 from solders.instruction import Instruction
@@ -19,6 +20,7 @@ from solders.keypair import Keypair
 from solders.message import MessageV0
 from solders.pubkey import Pubkey
 from solders.signature import Signature
+from solders.system_program import AdvanceNonceAccountParams, advance_nonce_account
 from solders.transaction import VersionedTransaction
 
 from core.pubkeys import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, is_sol_paired
@@ -226,6 +228,8 @@ class SolanaClient:
         rpc_endpoint: str,
         max_rps: float = 25.0,
         blockhash_refresh_interval: float = 5.0,
+        durable_nonce_account: str | None = None,
+        alt_addresses: list[str] | None = None,
     ):
         """Initialize Solana client with RPC endpoint.
 
@@ -237,6 +241,15 @@ class SolanaClient:
                 send hot path never waits on a getLatestBlockhash round trip.
                 5.0 is friendly to rate-limited public RPCs; a private RPC can
                 go lower (validation floor 0.05).
+            durable_nonce_account: Base58 nonce ACCOUNT address (R3-P2-2).
+                When set, sends use the nonce account's stored blockhash with
+                a nonce-advance instruction instead of the short-lived recent
+                blockhash (replay-protected, valid far beyond 150 blocks).
+                Off by default.
+            alt_addresses: List of base58 Address Lookup Table addresses
+                (R3-P2-3). When set, static keys are compressed through the
+                tables (smaller tx, lower fee, faster validation). Off by
+                default.
         """
         self.rpc_endpoint = rpc_endpoint
         self._client = None
@@ -247,6 +260,10 @@ class SolanaClient:
         self._blockhash_updater_task = asyncio.create_task(
             self.start_blockhash_updater(self.blockhash_refresh_interval)
         )
+        # R3-P2-2/R3-P2-3: durable nonce + ALTs (off by default).
+        self.durable_nonce_account = durable_nonce_account
+        self.alt_addresses = alt_addresses or []
+        self._alt_cache_ts: dict[str, float] = {}
         self._rate_limiter = TokenBucketRateLimiter(max_rps=max_rps)
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
@@ -656,10 +673,23 @@ class SolanaClient:
 
             instructions = fee_instructions + instructions
 
-        recent_blockhash = await self.get_cached_blockhash()
-        # No address lookup tables: the bot builds every account list itself.
+        if self.durable_nonce_account:
+            # R3-P2-2: durable nonce. Use the nonce account's stored
+            # blockhash (valid far beyond 150 blocks) and prepend a nonce
+            # advance instruction. The nonce authority is the signer wallet.
+            recent_blockhash, nonce_ix = await self._nonce_blockhash(
+                self.durable_nonce_account, signer_keypair.pubkey()
+            )
+            instructions = [nonce_ix] + instructions
+        else:
+            recent_blockhash = await self.get_cached_blockhash()
+
+        # R3-P2-3: Address Lookup Tables (off by default). Compress static
+        # keys through the configured tables so the message is smaller and
+        # cheaper to validate; identical instruction data.
+        lookup_tables = await self._lookup_tables() if self.alt_addresses else []
         message = MessageV0.try_compile(
-            signer_keypair.pubkey(), instructions, [], recent_blockhash
+            signer_keypair.pubkey(), instructions, lookup_tables, recent_blockhash
         )
         transaction = VersionedTransaction(message, [signer_keypair])
 
@@ -695,6 +725,63 @@ class SolanaClient:
                     f"{e!s}, retrying in {wait_time}s"
                 )
                 await asyncio.sleep(wait_time)
+
+    async def _nonce_blockhash(
+        self, nonce_account_b58: str, authority: Pubkey
+    ) -> tuple[Hash, Instruction]:
+        """R3-P2-2: read the nonce account's stored blockhash + advance ix.
+
+        The nonce account layout (32-byte authority + 32-byte blockhash at
+        offset 4 after the 4-byte state discriminator) is stable; a readable
+        account with the expected length is required, else the send fails
+        closed (never guess a blockhash).
+
+        Returns:
+            (blockhash, nonce_advance_instruction) to prepend to the message.
+        """
+        nonce_pk = Pubkey.from_string(nonce_account_b58)
+        account_info = await self.get_account_info(nonce_pk)
+        data = account_info.data if account_info else None
+        # NonceAccount: 4-byte version + 32-byte authority + 32-byte blockhash
+        # + 8-byte fee calculator.
+        if not data or len(data) < 72:
+            raise ValueError(
+                f"durable nonce account {nonce_account_b58} unreadable or "
+                f"malformed (len={len(data) if data else 0}); refusing to guess"
+            )
+        stored_hash = data[36:68]
+        return (
+            Hash.from_bytes(stored_hash),
+            advance_nonce_account(
+                AdvanceNonceAccountParams(nonce_pubkey=nonce_pk, authorized_pubkey=authority)
+            ),
+        )
+
+    async def _lookup_tables(self) -> list[AddressLookupTableAccount]:
+        """R3-P2-3: load configured Address Lookup Tables for the message.
+
+        Best-effort: an unreadable / malformed table is skipped (the message
+        still compiles with the remaining tables). The cache TTL avoids
+        re-reading the tables on every send.
+        """
+        loaded: list[AddressLookupTableAccount] = []
+        now = monotonic()
+        for alt_b58 in self.alt_addresses:
+            # 60s cache per table.
+            ts = self._alt_cache_ts.get(alt_b58, 0.0)
+            if now - ts < 60.0:
+                continue
+            try:
+                pk = Pubkey.from_string(alt_b58)
+                info = await self.get_account_info(pk)
+                if not info or not info.data:
+                    continue
+                loaded.append(AddressLookupTableAccount.from_bytes(info.data))
+                self._alt_cache_ts[alt_b58] = now
+            except Exception:  # noqa: BLE001
+                logger.warning("ALT %s could not be loaded; skipping", alt_b58)
+                continue
+        return loaded
 
     async def confirm_transaction(
         self, signature: str | Signature, commitment: str = "confirmed"

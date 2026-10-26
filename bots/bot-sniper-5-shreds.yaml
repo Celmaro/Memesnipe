@@ -19,7 +19,7 @@ rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
 private_key: "${SOLANA_PRIVATE_KEY}"
 
-enabled: false # You can turn off the bot w/o removing its config
+enabled: false # Disabled 2026-10-26: provider RPC lacks SubscribeDeshred (UNIMPLEMENTED); re-enable when the geyser provider supports deshred
 separate_process: true
 
 # Options: "pump_fun" (default), "lets_bonk", "stonk_fun"
@@ -51,6 +51,7 @@ trade:
 
   # Exit strategy configuration
   exit_strategy: "time_based" # Options: "time_based", "tp_sl", "manual"
+  shadow_mode: true # SHADOW ON (log-only, no real sends) — A/B vs geyser bot
   #take_profit_percentage: 0.1 # Take profit at 10% gain (0.1 = 10%)
   #stop_loss_percentage: 0.1 # Stop loss at 10% loss (0.1 = 10%)
   max_hold_time: 5 # Maximum hold time in seconds for TP/SL strategy, for time_based - see wait_after_buy
@@ -134,3 +135,9 @@ cleanup:
 # Node provider configuration
 node:
   max_rps: 25 # Maximum requests per second
+
+# Shadow research capture: separate ledger dir so the shreds A/B cohort never
+# mixes with the geyser bot's sim trades.
+research:
+  shadow_capture_enabled: true
+  shadow_data_dir: shadow_data_shreds

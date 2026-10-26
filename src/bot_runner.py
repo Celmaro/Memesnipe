@@ -108,6 +108,12 @@ async def start_bot(config_path: str):
             max_sell_impact_bps=cfg["trade"].get("max_sell_impact_bps", 0),
             # P2-EXIT-5: close user ATA in-tx on full-balance sell
             close_ata_on_sell=cfg["trade"].get("close_ata_on_sell", False),
+            # R3-P1-3: Jupiter aggregator sell fallback (off by default)
+            aggregator_fallback=cfg["trade"].get("aggregator_fallback", False),
+            aggregator_slippage_bps=cfg["trade"].get("aggregator_slippage_bps", 500),
+            aggregator_max_price_impact_pct=cfg["trade"].get(
+                "aggregator_max_price_impact_pct", 20.0
+            ),
             # P2-EXIT-1: absolute pool-depth floor (SOL); 0 = off
             min_pool_depth_sol=cfg["trade"].get("min_pool_depth_sol", 0.0),
             # P2-EXIT-4: slot-delta rug heuristics (off by default)
@@ -134,6 +140,8 @@ async def start_bot(config_path: str):
             exit_strategy=cfg["trade"].get("exit_strategy", "time_based"),
             take_profit_percentage=cfg["trade"].get("take_profit_percentage"),
             stop_loss_percentage=cfg["trade"].get("stop_loss_percentage"),
+            tp_ranges=cfg["trade"].get("tp_ranges") or [],
+            sl_ranges=cfg["trade"].get("sl_ranges") or [],
             max_hold_time=cfg["trade"].get("max_hold_time"),
             price_check_interval=cfg["trade"].get("price_check_interval", 10),
             max_exit_sell_attempts=cfg["trade"].get(
@@ -206,6 +214,34 @@ async def start_bot(config_path: str):
             max_market_cap_sol=cfg["filters"].get("max_market_cap_sol"),
             min_curve_progress_sol=cfg["filters"].get("min_curve_progress_sol"),
             min_market_cap_sol=cfg["filters"].get("min_market_cap_sol"),
+            allow_mayhem_mode=cfg["filters"].get("allow_mayhem_mode", False),
+            holder_reward_mode=cfg["filters"].get("holder_reward_mode", "trade"),
+            exit_on_creator_sell=cfg["filters"].get("exit_on_creator_sell", False),
+            # R3-P2-12: event-driven sell-fill (off by default)
+            event_driven_exits_enabled=cfg.get("trade", {}).get(
+                "event_driven_exits_enabled", False
+            ),
+            # R3-P2-14: slot-ordered copy/monitor feed (off by default)
+            slot_ordered_feed_enabled=cfg.get("research", {}).get(
+                "slot_ordered_feed_enabled", False
+            ),
+            # R3-P2-15: in-stream filter updates (off by default)
+            in_stream_updates_enabled=cfg.get("research", {}).get(
+                "in_stream_updates_enabled", False
+            ),
+            min_unique_holders=cfg["filters"].get("min_unique_holders", 0),
+            max_top10_concentration=cfg["filters"].get(
+                "max_top10_concentration", 0.0
+            ),
+            min_metadata_extensions=cfg["filters"].get(
+                "min_metadata_extensions", 0
+            ),
+            # R3-P2-10: session risk guards (0 = off)
+            max_concurrent_positions=cfg.get("risk", {}).get(
+                "max_concurrent_positions", 0
+            ),
+            daily_loss_limit_sol=cfg.get("risk", {}).get("daily_loss_limit_sol", 0.0),
+            budget_sol=cfg.get("risk", {}).get("budget_sol", 0.0),
             max_tracked_tokens=cfg["filters"].get("max_tracked_tokens", 500),
             consecutive_match_count=cfg["filters"].get("consecutive_match_count", 1),
             gate_recheck_interval=cfg["filters"].get("gate_recheck_interval", 0.5),
@@ -259,12 +295,22 @@ async def start_bot(config_path: str):
             blockhash_refresh_interval=cfg["trade"].get(
                 "blockhash_refresh_interval", 5.0
             ),
+            # R3-P2-2: durable nonce account (off by default)
+            durable_nonce_account=cfg["trade"].get("durable_nonce_account"),
+            # R3-P2-3: address lookup tables (off by default)
+            alt_addresses=cfg["trade"].get("alt_addresses") or [],
+            # R3-P2-5: PumpSwap graduation watcher (off by default)
+            migrate_watcher_enabled=cfg.get("research", {}).get(
+                "pumpswap_migrate_watcher", False
+            ),
             # T2.2 Jito bundle executor (disabled by default)
             jito_enabled=cfg.get("jito", {}).get("enabled", False),
             jito_tip_lamports=cfg.get("jito", {}).get("tip_lamports", 10_000),
             jito_endpoints=cfg.get("jito", {}).get("endpoints"),
             # P2-STRUC-4: per-request auth keypairs (region rotation)
             jito_auth_keypairs=cfg.get("jito", {}).get("auth_keypairs") or [],
+            # R3-P2-6: DontFront/MEV shield (off by default)
+            jito_dontfront=cfg.get("jito", {}).get("dontfront", False),
         )
 
         await trader.start()

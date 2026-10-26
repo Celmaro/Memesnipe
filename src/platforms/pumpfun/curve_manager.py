@@ -13,6 +13,12 @@ from core.pubkeys import (
     normalize_quote_mint,
 )
 from interfaces.core import CurveGraduatedError, CurveManager, Platform
+from platforms.pumpfun.address_provider import PumpFunAddresses
+from platforms.pumpfun.fee_tiers import (
+    bonding_curve_market_cap_lamports,
+    calculate_fee_tier,
+    decode_fee_config,
+)
 from utils.idl_parser import IDLParser
 from utils.logger import get_logger
 
@@ -54,12 +60,23 @@ def buy_amount_out(
     virtual_sol_reserves: int,
     amount_in: int,
     fee_bps: int,
+    real_token_reserves: int | None = None,
 ) -> int:
-    """Fee-aware pump.fun buy output: tokens received for ``amount_in`` SOL."""
+    """Fee-aware pump.fun buy output: tokens received for ``amount_in`` SOL.
+
+    Args:
+        real_token_reserves: Optional on-chain real token holdings of the
+            curve. When supplied as a positive value (R3-P2-16), the quote is
+            capped at it — a near-completion curve can never quote more tokens
+            than actually remain. 0/None = uncapped (today's behavior).
+    """
     net_in = amount_in - fee_on_input(amount_in, fee_bps)
     if net_in <= 0:
         return 0
-    return (net_in * virtual_token_reserves) // (virtual_sol_reserves + net_in)
+    out = (net_in * virtual_token_reserves) // (virtual_sol_reserves + net_in)
+    if real_token_reserves:
+        out = min(out, real_token_reserves)
+    return out
 
 
 def sell_amount_out(
@@ -139,6 +156,9 @@ class PumpFunCurveManager(CurveManager):
         # T2.1 warm-read cache: {pool_address: (fetched_at, state)}. Bounded by
         # the TTL; a commitment override still forces a fresh read.
         self._state_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # R3-P0-1: decoded FeeConfig account (market-cap tiers), TTL-cached.
+        self._fee_config_cache: tuple[float, Any] | None = None
+        self._FEE_CONFIG_TTL = 60.0
 
         logger.info("Pump.Fun curve manager initialized with injected IDL parser")
 
@@ -185,6 +205,18 @@ class PumpFunCurveManager(CurveManager):
 
             if commitment is None:
                 self._state_cache[key] = (time.monotonic(), curve_state_data)
+
+            # R3-P0-1: resolve the market-cap-scaled fee tier for SOL-paired
+            # curves. Conservative contract: any failure keeps the flat
+            # launch-tier default (never understates cost). Non-SOL pairs are
+            # left alone (fee_config SOL tier list does not apply).
+            if curve_state_data.get("is_sol_paired") and not curve_state_data.get(
+                "graduated"
+            ):
+                tier_bps = await self._resolve_tiered_fee_bps(curve_state_data)
+                if tier_bps is not None:
+                    curve_state_data["fee_bps"] = tier_bps
+                    curve_state_data["fee_fraction"] = tier_bps / 10_000
 
             return curve_state_data
 
@@ -280,11 +312,18 @@ class PumpFunCurveManager(CurveManager):
         virtual_token_reserves = pool_state["virtual_token_reserves"]
         virtual_sol_reserves = pool_state["virtual_sol_reserves"]
 
+        # R3-P2-16: cap the quote at the curve's real token holdings when the
+        # snapshot carries a positive reading — a near-completion curve must
+        # never quote more tokens than actually remain. A 0/absent reading
+        # (decode hiccup or a completed curve, which the graduated gate
+        # already handles) keeps the legacy uncapped behavior.
+        real_tokens = pool_state.get("real_token_reserves") or None
         return buy_amount_out(
             virtual_token_reserves,
             virtual_sol_reserves,
             amount_in,
             pool_state.get("fee_bps", DEFAULT_PUMP_FEE_BPS),
+            real_token_reserves=real_tokens,
         )
 
     async def calculate_sell_amount_out(
@@ -312,6 +351,57 @@ class PumpFunCurveManager(CurveManager):
             amount_in,
             pool_state.get("fee_bps", DEFAULT_PUMP_FEE_BPS),
         )
+
+    async def _fetch_fee_config(self) -> Any:
+        """Fetch + decode the FeeConfig account (TTL-cached, fail-open).
+
+        Returns a ``FeeConfigState`` (or None on any error/unreadable
+        account). None means "keep the conservative launch-tier default".
+        """
+        now = time.monotonic()
+        if self._fee_config_cache is not None:
+            fetched_at, state = self._fee_config_cache
+            if (now - fetched_at) < self._FEE_CONFIG_TTL:
+                return state
+        try:
+            fee_config_address = PumpFunAddresses.find_fee_config()
+            account = await self.client.get_account_info(fee_config_address)
+            state = decode_fee_config(account.data) if account and account.data else None
+            if state is None:
+                # Unreadable/malformed: cache a negative result briefly so we
+                # don't hammer the RPC on every quote, then keep the default.
+                self._fee_config_cache = (now, None)
+                return None
+            self._fee_config_cache = (now, state)
+            return state
+        except Exception:
+            logger.debug("FeeConfig read failed; keeping launch-tier default")
+            self._fee_config_cache = (now, None)
+            return None
+
+    async def _resolve_tiered_fee_bps(self, curve_state: dict[str, Any]) -> int | None:
+        """Resolve the market-cap-scaled fee bps for a curve state.
+
+        Conservative contract (R3-P0-1): any failure returns None so the
+        caller keeps the flat launch-tier default — never understates cost,
+        never overstates output. A tier total that is not sane (<=0 or above
+        MAX_FEE_BPS) also yields None.
+        """
+        fee_config = await self._fetch_fee_config()
+        if fee_config is None or not fee_config.fee_tiers:
+            return None
+        mcap = bonding_curve_market_cap_lamports(
+            curve_state.get("virtual_quote_reserves", 0),
+            curve_state.get("virtual_token_reserves", 0),
+            curve_state.get("token_total_supply", 0),
+        )
+        tier = calculate_fee_tier(fee_config.fee_tiers, mcap)
+        if tier is None:
+            return None
+        total = tier.total_bps
+        if total <= 0 or total > MAX_FEE_BPS:
+            return None
+        return total
 
     async def get_reserves(self, pool_address: Pubkey) -> tuple[int, int]:
         """Get current bonding curve reserves.

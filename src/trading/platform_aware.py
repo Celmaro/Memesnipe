@@ -677,6 +677,13 @@ class PlatformAwareSeller(Trader):
         sell_slippage_inflation_bps: int = 10,
         max_sell_impact_bps: int = 0,
         close_ata_on_sell: bool = False,
+        # R3-P1-3: Jupiter aggregator sell fallback (off by default). When a
+        # platform sell fails with a pool-gone / liquidity signal, route the
+        # exit through Jupiter's quote+swap API instead of giving up.
+        aggregator_fallback: bool = False,
+        jupiter_client=None,
+        aggregator_slippage_bps: int = 500,
+        aggregator_max_price_impact_pct: float = 20.0,
     ):
         """Initialize platform-aware token seller.
 
@@ -712,11 +719,74 @@ class PlatformAwareSeller(Trader):
         self.sell_slippage_inflation_bps = sell_slippage_inflation_bps
         self.max_sell_impact_bps = max_sell_impact_bps
         self.close_ata_on_sell = close_ata_on_sell
+        self.aggregator_fallback = aggregator_fallback
+        self.jupiter_client = jupiter_client
+        self.aggregator_slippage_bps = aggregator_slippage_bps
+        self.aggregator_max_price_impact_pct = aggregator_max_price_impact_pct
         self.max_retries = max_retries
         self.compute_units = compute_units or {}
         self.executor = executor
 
     async def execute(
+        self, token_info: TokenInfo, token_amount: float, token_price: float
+    ) -> TradeResult:
+        """Sell via the platform path, with optional Jupiter fallback (R3-P1-3).
+
+        When ``aggregator_fallback`` is on and the platform sell fails with a
+        pool-gone / liquidity signal, the exit is routed through Jupiter's
+        quote+swap API at the configured slippage cap. Off by default — the
+        platform sell result is returned unchanged.
+        """
+        result = await self._execute_platform_sell(
+            token_info, token_amount, token_price
+        )
+        if not self.aggregator_fallback:
+            return result
+        if result.success:
+            return result
+        if self.jupiter_client is None:
+            return result
+        # Pool-gone / liquidity signal: retry through the aggregator once.
+        # A submit failure on the platform path (nothing reached the chain)
+        # is also worth routing — the pool may be gone, which is exactly the
+        # aggregator's job. But a reverted transaction (the pool took it and
+        # bounced it) is not: the position state is unknown and re-routing
+        # would double-sell. Only SUBMIT_FAILED triggers the fallback.
+        from trading.base import TradeFailureReason
+
+        if result.failure_reason is not TradeFailureReason.SUBMIT_FAILED:
+            return result
+        try:
+            quote = await self.jupiter_client.get_quote(
+                input_mint=str(token_info.mint),
+                output_mint=str(normalize_quote_mint(token_info.quote_mint)),
+                amount_in=int(token_amount * 10**TOKEN_DECIMALS),
+                slippage_bps=self.aggregator_slippage_bps,
+            )
+            if quote is None:
+                return result
+            if self.aggregator_max_price_impact_pct > 0 and (
+                quote.price_impact_pct is not None
+                and quote.price_impact_pct > self.aggregator_max_price_impact_pct
+            ):
+                logger.warning(
+                    "Jupiter fallback refused: impact %.2f%% > cap %.1f%%",
+                    quote.price_impact_pct,
+                    self.aggregator_max_price_impact_pct,
+                )
+                return result
+            return await self.jupiter_client.swap(
+                token_info,
+                amount_tokens=token_amount,
+                quote=quote,
+                wallet=self.wallet,
+                shadow_mode=bool(getattr(self, "shadow_mode", False)),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Jupiter fallback failed")
+            return result
+
+    async def _execute_platform_sell(
         self, token_info: TokenInfo, token_amount: float, token_price: float
     ) -> TradeResult:
         """Execute sell operation using platform-specific implementations.

@@ -70,6 +70,7 @@ async def _shutdown_with(  # noqa: ANN202
         Tuple of (how the caller ended, WARNING+ records emitted)
     """
     trader = object.__new__(UniversalTrader)
+    trader.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
     trader._cleanup_resources = cleanup  # noqa: SLF001
     if budget is not None:
         trader._CLEANUP_SHUTDOWN_BUDGET = budget  # noqa: SLF001

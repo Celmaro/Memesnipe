@@ -163,3 +163,31 @@ class ShadowDataCapture:
     def summary(self, **fields: Any) -> None:
         """One aggregate row at session end (seen/traded/skipped counts)."""
         self._emit("summary", **fields)
+
+    def mark(
+        self,
+        *,
+        mint: str,
+        symbol: str,
+        platform: str,
+        price: float,
+        pnl_pct: float,
+        pnl_quote: float,
+        hold_seconds: float,
+    ) -> None:
+        """Unrealized-PnL tick for an open shadow position (research data).
+
+        Emitted on a cadence from the monitor loop, so a replay can trace the
+        price path between sim_open and sim_close instead of only the
+        endpoints. Best-effort like every capture method.
+        """
+        self._emit(
+            "sim_mark",
+            mint=mint,
+            symbol=symbol,
+            platform=platform,
+            price=price,
+            pnl_pct=pnl_pct,
+            pnl_quote=pnl_quote,
+            hold_seconds=hold_seconds,
+        )
