@@ -19,6 +19,8 @@ class PriorityFeeManager:
         fixed_fee: int,
         extra_fee: float,
         hard_cap: int,
+        bid_multiplier: float = 1.0,
+        fee_cache_ttl: float = 2.0,
     ):
         """Initialize the priority fee manager.
 
@@ -29,6 +31,13 @@ class PriorityFeeManager:
             fixed_fee: Fixed priority fee in microlamports.
             extra_fee: Percentage increase to apply to the base fee.
             hard_cap: Maximum allowed priority fee in microlamports.
+            bid_multiplier: Auction bid (T1.4): multiply the sampled base fee
+                by this before the extra_fee percentage. >1.0 raises the bid
+                above the observed top fee to win the race; 1.0 = match the
+                sample exactly. Applied to the dynamic sample; ignored for
+                fixed-fee mode.
+            fee_cache_ttl: How long the dynamic sampler reuses one RPC sample
+                (seconds), so the auction re-prices without a hot-path RPC.
         """
         self.client = client
         self.enable_dynamic_fee = enable_dynamic_fee
@@ -36,9 +45,10 @@ class PriorityFeeManager:
         self.fixed_fee = fixed_fee
         self.extra_fee = extra_fee
         self.hard_cap = hard_cap
+        self.bid_multiplier = bid_multiplier
 
         # Initialize plugins
-        self.dynamic_fee_plugin = DynamicPriorityFee(client)
+        self.dynamic_fee_plugin = DynamicPriorityFee(client, cache_ttl=fee_cache_ttl)
         self.fixed_fee_plugin = FixedPriorityFee(fixed_fee)
 
     async def calculate_priority_fee(
@@ -56,6 +66,18 @@ class PriorityFeeManager:
         base_fee = await self._get_base_fee(accounts)
         if base_fee is None:
             return None
+
+        if self.enable_dynamic_fee:
+            # Auction bid (T1.4): raise the sampled base above the observed
+            # top before applying the extra percentage. Log both so the
+            # ledger/run shows what the market asked vs what we bid.
+            auctioned = int(base_fee * self.bid_multiplier)
+            if self.bid_multiplier != 1.0:
+                logger.debug(
+                    f"Fee auction: sampled={base_fee} bid={auctioned} "
+                    f"(multiplier {self.bid_multiplier})"
+                )
+            base_fee = auctioned
 
         # Apply extra fee (percentage increase)
         final_fee = int(base_fee * (1 + self.extra_fee))

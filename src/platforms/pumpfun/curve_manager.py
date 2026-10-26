@@ -1,5 +1,6 @@
 """Pump.fun CurveManager: bonding curve reads and pricing, IDL-decoded."""
 
+import time
 from typing import Any
 
 from solders.pubkey import Pubkey
@@ -17,9 +18,114 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+#: Canonical pump.fun total fee on SOL-paired launch-tier coins: 100 bps (1%).
+#: The program splits it ~25 bps protocol + 75 bps creator; the tiered
+#: FeeConfig only ever reduces fees as market cap grows, so pricing every
+#: quote at this launch-tier max is conservative (never understates cost,
+#: never overstates output). Custom creator-fee coins derive a higher total
+#: below.
+DEFAULT_PUMP_FEE_BPS = 100
+#: Protocol share of the fee, added on top of a decoded `creator_fee_bps`
+#: when the curve carries a custom creator fee.
+PROTOCOL_FEE_BPS = 25
+#: Ceiling guard so a corrupt/foreign decode can never quote absurd fees.
+MAX_FEE_BPS = 1000
+
+
+def _ceil_div(a: int, b: int) -> int:
+    """Ceiling integer division (SDK uses ceilDiv per fee component)."""
+    return -(-a // b)
+
+
+def fee_on_input(amount: int, fee_bps: int) -> int:
+    """Fee charged on the input side: ceil(amount * fee_bps / 10000).
+
+    Matches the pump.fun/SDK model: the fee is skimmed from the asset the
+    trader provides (quote for buys, tokens for sells) before the
+    constant-product swap, so the curve receives ``amount - fee``.
+    """
+    if amount <= 0 or fee_bps <= 0:
+        return 0
+    return _ceil_div(amount * fee_bps, 10_000)
+
+
+def buy_amount_out(
+    virtual_token_reserves: int,
+    virtual_sol_reserves: int,
+    amount_in: int,
+    fee_bps: int,
+) -> int:
+    """Fee-aware pump.fun buy output: tokens received for ``amount_in`` SOL."""
+    net_in = amount_in - fee_on_input(amount_in, fee_bps)
+    if net_in <= 0:
+        return 0
+    return (net_in * virtual_token_reserves) // (virtual_sol_reserves + net_in)
+
+
+def sell_amount_out(
+    virtual_token_reserves: int,
+    virtual_sol_reserves: int,
+    amount_in: int,
+    fee_bps: int,
+) -> int:
+    """Fee-aware pump.fun sell output: SOL received for ``amount_in`` tokens."""
+    net_in = amount_in - fee_on_input(amount_in, fee_bps)
+    if net_in <= 0:
+        return 0
+    return (net_in * virtual_sol_reserves) // (virtual_token_reserves + net_in)
+
+
+def _total_fee_bps(creator_fee_bps: int) -> int:
+    """Total pump.fun fee in bps for a curve.
+
+    A decoded custom creator fee (custom pair / creator-fee coin) adds the
+    protocol share on top; standard coins carry no per-curve creator fee in
+    the decode and use the canonical launch-tier 100 bps total. Clamped so a
+    corrupt/foreign decode can never quote absurd fees.
+    """
+    if creator_fee_bps and creator_fee_bps > 0:
+        return min(creator_fee_bps + PROTOCOL_FEE_BPS, MAX_FEE_BPS)
+    return DEFAULT_PUMP_FEE_BPS
+
+
+U64_MAX = 2**64 - 1
+U128_MAX = 2**128 - 1
+
+
+def max_safe_sell_amount(
+    token_balance: int, virtual_quote_reserves: int
+) -> int:
+    """Clamp an oversized sell to the on-chain safe bound (P2-FEE-2).
+
+    pump.fun encodes the sell token amount as u64 and the curve math
+    multiplies it by ``virtual_quote_reserves`` in u128; a raw token balance
+    near completion (or a high-decimals coin) can overflow both and revert
+    with AnchorError 6024 (Overflow). Matching the reference SDK's bound:
+    ``min(u64::MAX, floor(0.9 * u128::MAX / virtualQuoteReserves))``.
+
+    Returns the amount that can be sold in one instruction — strictly ≤ the
+    requested balance. The caller re-runs per chunk (or per periodic sweep)
+    to drain the remainder.
+    """
+    if token_balance <= 0:
+        return 0
+    if virtual_quote_reserves > 0:
+        # 0.9 * u128::MAX, integer math (no float precision loss).
+        bound = ((9 * U128_MAX) // 10) // virtual_quote_reserves
+    else:
+        bound = U64_MAX
+    return min(token_balance, min(bound, U64_MAX))
+
 
 class PumpFunCurveManager(CurveManager):
     """Pump.Fun implementation of CurveManager interface using IDL-based decoding."""
+
+    #: How long a curve read may be reused. The quality gate reads pool state
+    #: right before the buy, and the buy would otherwise read it again
+    #: milliseconds later (T2.1: warm read). Exits poll every
+    #: price_check_interval (>=1s), so a 1s TTL adds no stale-price exposure
+    #: beyond the existing cadence.
+    _POOL_STATE_TTL = 1.0
 
     def __init__(self, client: SolanaClient, idl_parser: IDLParser):
         """Initialize pump.fun curve manager with injected IDL parser.
@@ -30,6 +136,9 @@ class PumpFunCurveManager(CurveManager):
         """
         self.client = client
         self._idl_parser = idl_parser
+        # T2.1 warm-read cache: {pool_address: (fetched_at, state)}. Bounded by
+        # the TTL; a commitment override still forces a fresh read.
+        self._state_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
         logger.info("Pump.Fun curve manager initialized with injected IDL parser")
 
@@ -43,6 +152,10 @@ class PumpFunCurveManager(CurveManager):
     ) -> dict[str, Any]:
         """Get the current state of a pump.fun bonding curve.
 
+        Reads are cached for a short TTL so the pre-buy quality gate and the
+        buy itself share one RPC call; exits poll on their own cadence and are
+        not materially delayed by the 1s window.
+
         Args:
             pool_address: Address of the bonding curve
             commitment: Optional commitment override. Pass "processed" right
@@ -52,6 +165,14 @@ class PumpFunCurveManager(CurveManager):
         Returns:
             Dictionary containing bonding curve state data
         """
+        key = str(pool_address)
+        if commitment is None:
+            cached = self._state_cache.get(key)
+            if cached is not None:
+                fetched_at, state = cached
+                if (time.monotonic() - fetched_at) < self._POOL_STATE_TTL:
+                    return state
+
         try:
             account = await self.client.get_account_info(
                 pool_address, commitment=commitment
@@ -61,6 +182,9 @@ class PumpFunCurveManager(CurveManager):
 
             # Decode bonding curve state using injected IDL parser
             curve_state_data = self._decode_curve_state_with_idl(account.data)
+
+            if commitment is None:
+                self._state_cache[key] = (time.monotonic(), curve_state_data)
 
             return curve_state_data
 
@@ -156,16 +280,12 @@ class PumpFunCurveManager(CurveManager):
         virtual_token_reserves = pool_state["virtual_token_reserves"]
         virtual_sol_reserves = pool_state["virtual_sol_reserves"]
 
-        # Use virtual reserves for bonding curve calculation
-        # Formula: tokens_out = (amount_in * virtual_token_reserves) / (virtual_sol_reserves + amount_in)
-        numerator = amount_in * virtual_token_reserves
-        denominator = virtual_sol_reserves + amount_in
-
-        if denominator == 0:
-            return 0
-
-        tokens_out = numerator // denominator
-        return tokens_out
+        return buy_amount_out(
+            virtual_token_reserves,
+            virtual_sol_reserves,
+            amount_in,
+            pool_state.get("fee_bps", DEFAULT_PUMP_FEE_BPS),
+        )
 
     async def calculate_sell_amount_out(
         self, pool_address: Pubkey, amount_in: int
@@ -186,16 +306,12 @@ class PumpFunCurveManager(CurveManager):
         virtual_token_reserves = pool_state["virtual_token_reserves"]
         virtual_sol_reserves = pool_state["virtual_sol_reserves"]
 
-        # Use virtual reserves for bonding curve calculation
-        # Formula: sol_out = (amount_in * virtual_sol_reserves) / (virtual_token_reserves + amount_in)
-        numerator = amount_in * virtual_sol_reserves
-        denominator = virtual_token_reserves + amount_in
-
-        if denominator == 0:
-            return 0
-
-        sol_out = numerator // denominator
-        return sol_out
+        return sell_amount_out(
+            virtual_token_reserves,
+            virtual_sol_reserves,
+            amount_in,
+            pool_state.get("fee_bps", DEFAULT_PUMP_FEE_BPS),
+        )
 
     async def get_reserves(self, pool_address: Pubkey) -> tuple[int, int]:
         """Get current bonding curve reserves.
@@ -270,6 +386,18 @@ class PumpFunCurveManager(CurveManager):
             "creator_fee_bps": decoded_curve_state.get("creator_fee_bps", 0),
             "quote_mint": quote_mint,
             "is_sol_paired": is_sol_paired(quote_mint),
+            # P2-FEE-1: total fee in bps. A decoded custom creator fee (custom
+            # pair / configurable) adds the protocol share; standard coins use
+            # the canonical launch-tier 100 bps total. Grabbed by the quote
+            # methods and exposed as fee_fraction for the platform-aware
+            # buyer/seller (which price from the curve, not these helpers).
+            "fee_bps": _total_fee_bps(
+                decoded_curve_state.get("creator_fee_bps", 0)
+            ),
+            "fee_fraction": _total_fee_bps(
+                decoded_curve_state.get("creator_fee_bps", 0)
+            )
+            / 10_000,
         }
 
         # Back-compat aliases for the pre-quote-mint field names.

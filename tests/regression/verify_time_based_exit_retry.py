@@ -151,6 +151,10 @@ def _make_trader(
     trader.sell_priority_fee = None
     trader.min_market_cap_sol = None
     trader.max_tracked_tokens = 500
+    trader.creator_pnl_store = None  # P2-STRUC-2 feature off
+    trader.rug_heuristics_enabled = False  # P2-EXIT-4 off
+    trader._rug_entry = {}  # noqa: SLF001
+    trader._rug_buyers = {}  # noqa: SLF001
     # Keep a verification run from writing to ./trades.
     trader._log_trade = lambda *_args, **_kwargs: None  # noqa: SLF001
     trader._log_attempt = lambda *_args, **_kwargs: None  # noqa: SLF001

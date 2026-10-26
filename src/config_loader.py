@@ -68,6 +68,20 @@ CONFIG_VALIDATION_RULES = [
         "priority_fees.hard_cap must be a non-negative integer",
     ),
     (
+        "priority_fees.bid_multiplier",
+        (int, float),
+        1.0,
+        10.0,
+        "priority_fees.bid_multiplier must be between 1.0 and 10.0",
+    ),
+    (
+        "priority_fees.fee_cache_ttl",
+        (int, float),
+        0.0,
+        60.0,
+        "priority_fees.fee_cache_ttl must be between 0 and 60 seconds",
+    ),
+    (
         "retries.max_attempts",
         int,
         0,
@@ -110,6 +124,94 @@ CONFIG_VALIDATION_RULES = [
         "filters.max_tracked_tokens must be between 1 and 100000",
     ),
     (
+        "filters.consecutive_match_count",
+        int,
+        1,
+        100,
+        "filters.consecutive_match_count must be between 1 and 100",
+    ),
+    (
+        "filters.gate_recheck_interval",
+        (int, float),
+        0.1,
+        60.0,
+        "filters.gate_recheck_interval must be between 0.1 and 60 seconds",
+    ),
+    (
+        "filters.min_curve_hold_fraction",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.min_curve_hold_fraction must be between 0 and 1",
+    ),
+    (
+        "copy_trader.min_buy_interval",
+        (int, float),
+        0.1,
+        3600.0,
+        "copy_trader.min_buy_interval must be between 0.1 and 3600 seconds",
+    ),
+    (
+        "trade.sell_slippage_inflation_bps",
+        int,
+        0,
+        5000,
+        "trade.sell_slippage_inflation_bps must be between 0 and 5000 bps",
+    ),
+    (
+        "trade.min_pool_depth_sol",
+        (int, float),
+        0.0,
+        1_000_000.0,
+        "trade.min_pool_depth_sol must be between 0 and 1,000,000 SOL",
+    ),
+    (
+        "trade.max_sell_impact_bps",
+        int,
+        0,
+        5000,
+        "trade.max_sell_impact_bps must be between 0 and 5000 bps",
+    ),
+    (
+        "trade.blockhash_refresh_interval",
+        (int, float),
+        0.05,
+        60.0,
+        "trade.blockhash_refresh_interval must be between 0.05 and 60 seconds",
+    ),
+    (
+        "filters.creator_pnl_min_trades",
+        int,
+        1,
+        100_000,
+        "filters.creator_pnl_min_trades must be between 1 and 100000",
+    ),
+    (
+        "filters.creator_pnl_max_net_sol",
+        (int, float),
+        -1_000_000.0,
+        1_000_000.0,
+        "filters.creator_pnl_max_net_sol must be between -1e6 and 1e6 SOL",
+    ),
+    (
+        "filters.rug_min_unique_buyers",
+        int,
+        1,
+        10_000,
+        "filters.rug_min_unique_buyers must be between 1 and 10000",
+    ),
+    (
+        "filters.rug_check_slots",
+        int,
+        1,
+        100_000,
+        "filters.rug_check_slots must be between 1 and 100000",
+    ),
+    ("filters.rug_early_drain_ratio", (int, float), 0.0, 1.0, "filters.rug_early_drain_ratio must be between 0 and 1"),
+    # P2-STRUC-4: jito.auth_keypairs is a list of strings (validated as such)
+    # with no numeric range — the base58-keypair validation happens at trader
+    # construction (invalid keys are logged and skipped, never fatal).
+    (
         "priority_fees.buy_fixed_amount",
         (int, float),
         0,
@@ -137,7 +239,13 @@ BOOL_FIELDS = [
     "filters.fail_closed_gates",
     "filters.marry_mode",
     "filters.yolo_mode",
+    "filters.honeypot_freeze_authority",
     "trade.shadow_mode",
+    "trade.backfill.enabled",
+    "trade.close_ata_on_sell",  # P2-EXIT-5
+    "filters.creator_pnl_blacklist_enabled",  # P2-STRUC-2
+    "filters.rug_heuristics_enabled",  # P2-EXIT-4
+    "copy_trader.enabled",
 ]
 
 # Config fields that must be a list of strings when present
@@ -299,13 +407,17 @@ def validate_config(config: dict) -> None:
         if "Missing required config key" not in str(e):
             raise
 
-    # Cannot enable both dynamic and fixed priority fees
+    # Priority fee sources: the manager prefers the dynamic sample and falls
+    # back to the fixed fee when the sample is unavailable, so enabling both
+    # is the intended resilience combination (T1.4), not a conflict. Require
+    # at least one source.
     try:
         dynamic = get_nested_value(config, "priority_fees.enable_dynamic")
         fixed = get_nested_value(config, "priority_fees.enable_fixed")
-        if dynamic and fixed:
+        if not dynamic and not fixed:
             raise ValueError(
-                "Cannot enable both dynamic and fixed priority fees simultaneously"
+                "At least one of priority_fees.enable_dynamic / enable_fixed "
+                "must be true"
             )
     except ValueError as e:
         if "Missing required config key" not in str(e):

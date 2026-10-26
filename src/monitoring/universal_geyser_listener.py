@@ -120,6 +120,11 @@ class UniversalGeyserListener(BaseTokenListener):
         self._reconnect_delay_max = 30.0
         self._force_reconnect = asyncio.Event()
 
+        # T3.2: optional copy-trader callback. When set, every transaction
+        # update's logs are forwarded after the token-creation check so a
+        # leader-buy TradeEvent can be mirrored without extra RPC.
+        self.trade_callback: Callable[[list[str]], Awaitable[None]] | None = None
+
         for platform in self.platforms:
             try:
                 # Create a simple dummy client that doesn't start blockhash updater
@@ -394,6 +399,17 @@ class UniversalGeyserListener(BaseTokenListener):
                 token_info = parser.parse_token_creation_from_geyser(update)
                 if token_info:
                     return token_info
+
+            # T3.2: no token creation here, but a leader may have traded an
+            # existing mint. Forward the transaction's logs to the copy engine
+            # (guarded so a slow mirror never blocks the geyser loop).
+            if self.trade_callback is not None:
+                logs = []
+                meta = getattr(update.transaction, "meta", None)
+                if meta is not None:
+                    logs = list(meta.log_messages or [])
+                if logs:
+                    await self.trade_callback(logs)
 
             return None
 

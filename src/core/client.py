@@ -221,42 +221,84 @@ def _describe_program_error(err: object) -> str | None:
 class SolanaClient:
     """Abstraction for Solana RPC client operations."""
 
-    def __init__(self, rpc_endpoint: str, max_rps: float = 25.0):
+    def __init__(
+        self,
+        rpc_endpoint: str,
+        max_rps: float = 25.0,
+        blockhash_refresh_interval: float = 5.0,
+    ):
         """Initialize Solana client with RPC endpoint.
 
         Args:
             rpc_endpoint: URL of the Solana RPC endpoint
             max_rps: Maximum RPC requests per second (rate limiter)
+            blockhash_refresh_interval: Seconds between background cached-
+                blockhash refreshes (P2-STRUC-1). A fresh cache means the
+                send hot path never waits on a getLatestBlockhash round trip.
+                5.0 is friendly to rate-limited public RPCs; a private RPC can
+                go lower (validation floor 0.05).
         """
         self.rpc_endpoint = rpc_endpoint
         self._client = None
         self._cached_blockhash: Hash | None = None
+        self._cached_blockhash_ts: float = 0.0
         self._blockhash_lock = asyncio.Lock()
+        self.blockhash_refresh_interval = blockhash_refresh_interval
         self._blockhash_updater_task = asyncio.create_task(
-            self.start_blockhash_updater()
+            self.start_blockhash_updater(self.blockhash_refresh_interval)
         )
         self._rate_limiter = TokenBucketRateLimiter(max_rps=max_rps)
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
 
     async def start_blockhash_updater(self, interval: float = 5.0):
-        """Start background task to update recent blockhash."""
+        """Start background task to update recent blockhash.
+
+        Runs from the constructor (P2-STRUC-1), so the cache is warm before
+        the first send and the hot path never waits on a getLatestBlockhash
+        round trip. The interval is configurable; 5.0s default is friendly
+        to rate-limited public RPCs.
+        """
         while True:
             try:
                 blockhash = await self.get_latest_blockhash()
                 async with self._blockhash_lock:
                     self._cached_blockhash = blockhash
+                    self._cached_blockhash_ts = monotonic()
             except Exception as e:
                 logger.warning(f"Blockhash fetch failed: {e!s}")
             finally:
                 await asyncio.sleep(interval)
 
     async def get_cached_blockhash(self) -> Hash:
-        """Return the most recently cached blockhash."""
+        """Return the most recently cached blockhash.
+
+        Refreshes synchronously if the cache is stale (older than twice the
+        configured refresh interval, floored at 1s) or empty — the send hot
+        path must never sign with a blockhash that could expire mid-flight.
+        Falls back to the last-known (possibly stale) hash only when the
+        refresh itself fails, so a transient RPC blip cannot block a send.
+        """
         async with self._blockhash_lock:
-            if self._cached_blockhash is None:
-                raise RuntimeError("No cached blockhash available yet")
-            return self._cached_blockhash
+            stale_seconds = max(2 * self.blockhash_refresh_interval, 1.0)
+            stale = (
+                self._cached_blockhash is None
+                or monotonic() - self._cached_blockhash_ts > stale_seconds
+            )
+            if stale:
+                try:
+                    blockhash = await self.get_latest_blockhash()
+                    self._cached_blockhash = blockhash
+                    self._cached_blockhash_ts = monotonic()
+                except Exception:
+                    if self._cached_blockhash is None:
+                        raise RuntimeError(
+                            "No cached blockhash available yet"
+                        ) from None
+                    logger.warning(
+                        "Blockhash refresh failed; using last-known blockhash"
+                    )
+            return self._cached_blockhash  # type: ignore[return-value]
 
     async def get_client(self) -> AsyncClient:
         """Get or create the AsyncClient instance."""
@@ -355,6 +397,85 @@ class SolanaClient:
             kwargs["commitment"] = commitment
         response = await client.get_multiple_accounts(pubkeys, **kwargs)
         return list(response.value)
+
+    async def get_token_supply(
+        self, mint: Pubkey, commitment: str | None = None
+    ) -> int | None:
+        """Get the total supply of a mint (T2.5 honeypot burn-ratio gate).
+
+        Args:
+            mint: Mint address
+            commitment: Optional commitment override (default "confirmed")
+
+        Returns:
+            Raw supply (no decimals applied), or None if the RPC fails.
+            The caller applies the mint's decimals.
+        """
+        await self._rate_limiter.acquire()
+        client = await self.get_client()
+        kwargs: dict[str, Any] = {}
+        if commitment is not None:
+            kwargs["commitment"] = commitment
+        try:
+            response = await client.get_token_supply(mint, **kwargs)
+            if not response.value:
+                return None
+            return response.value.amount
+        except Exception:
+            logger.exception(f"get_token_supply failed for {mint}")
+            return None
+
+    async def get_slot(self, commitment: str = "processed") -> int | None:
+        """Get the current slot (P2-EXIT-4 slot-delta rug checks).
+
+        Args:
+            commitment: Commitment level for the read. Defaults to
+                "processed" so the slot advances with the frontier the
+                listeners see, not the finalized chain.
+
+        Returns:
+            Current slot, or None if the RPC failed (fails open — a missing
+            slot means the rug heuristic cannot judge, not that it fires).
+        """
+        try:
+            await self._rate_limiter.acquire()
+            client = await self.get_client()
+            response = await client.get_slot(commitment=commitment)
+            return int(response.value)
+        except Exception:
+            logger.exception("get_slot failed")
+            return None
+
+    async def get_program_accounts(
+        self,
+        program_id: Pubkey,
+        filters: list[object] | None = None,
+        commitment: str = "processed",
+    ) -> list[tuple[Pubkey, Account]]:
+        """List accounts owned by a program, with optional memcmp filters.
+
+        Args:
+            program_id: Program owning the accounts to list.
+            filters: solana-py filters (``int`` dataSize entries and
+                ``MemcmpOpts`` instances), e.g. the Raydium AmmInfo memcmp
+                pair (P2-STRUC-3).
+            commitment: Commitment level for the read.
+
+        Returns:
+            (pubkey, account) pairs, empty on error (fail open — callers
+            that list pools want a clean "no pools" answer on RPC trouble,
+            not an exception).
+        """
+        try:
+            await self._rate_limiter.acquire()
+            client = await self.get_client()
+            response = await client.get_program_accounts(
+                program_id, commitment=commitment, filters=filters
+            )
+            return [(acc.pubkey, acc.account) for acc in response.value]
+        except Exception:
+            logger.exception("get_program_accounts failed")
+            return []
 
     async def get_token_account_balance(
         self, token_account: Pubkey, commitment: str = "confirmed"

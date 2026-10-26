@@ -420,7 +420,17 @@ def check_e_seller_floor() -> bool:
     )
     tokens, price = 1_000_000.0, 0.00000003
     asyncio.run(seller.execute(TOKEN, tokens, price))
-    expected = int(tokens * (1 - 0.01) * price * (1 - 0.0125) * (1 - 0.2) * 10**9)
+    # Floor = tokens * (1 - transfer_fee 1%) * price * (1 - curve fee 1.25%)
+    #        * (1 - slippage 20% - sell inflation 10bps)  [P2-EXIT-3,
+    #        inflation is additive to slippage in the seller]
+    expected = int(
+        tokens
+        * (1 - 0.01)
+        * price
+        * (1 - 0.0125)
+        * (1 - 0.2 - 10 / 10_000)
+        * 10**9
+    )
     ok = abs(captured.get("minimum_out", -10) - expected) <= 1
     if not ok:
         print(f"    floor {captured.get('minimum_out')} expected {expected}")
@@ -473,6 +483,9 @@ def check_f_single_token_mode_waits_past_refused_coins() -> bool:
         match_string=None,
         bro_address=None,
         blocked_creators=set(),
+        # P2-STRUC-2: disabled -> store attribute must still exist for
+        # _skip_reason (feature reads it unconditionally, fails open on None).
+        creator_pnl_store=None,
         max_market_cap_sol=None,
         min_curve_progress_sol=None,
         token_wait_timeout=5,

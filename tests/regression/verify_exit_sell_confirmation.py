@@ -216,6 +216,11 @@ def _make_trader(seller: StubSeller, client: StubClient) -> UniversalTrader:
     trader.persistent_exit_ttl = 600
     trader.persistent_exit_interval = 15
     trader.shadow_mode = False
+    trader.min_pool_depth_sol = 0.0  # P2-EXIT-1 off in verifiers
+    trader.rug_heuristics_enabled = False  # P2-EXIT-4 off
+    trader._rug_entry = {}  # noqa: SLF001
+    trader._rug_buyers = {}  # noqa: SLF001
+    trader.creator_pnl_store = None  # P2-STRUC-2 feature off
     trader.stuck_sweep_interval = 0
     trader.buy_priority_fee = None
     trader.sell_priority_fee = None

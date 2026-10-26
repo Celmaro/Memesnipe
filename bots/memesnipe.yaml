@@ -31,6 +31,19 @@ trade:
   buy_amount: 0.01
   buy_slippage: 0.10 # Phase 4: strict entry cap
   sell_slippage: 0.15 # Phase 4: exit floor that won't revert on a dump
+  sell_slippage_inflation_bps: 10 # P2-EXIT-3: extra sell-only bps so exits land
+  # P2-EXIT-1: absolute pool-depth floor (SOL). Exit immediately when depth
+  # drops below this (0 = off). A shallow pool may not absorb the sell later.
+  min_pool_depth_sol: 0.0
+  # P2-EXIT-2: cap single-sell price impact (bps of pool depth); 0 = off.
+  # Remaining balance drains on later monitor passes.
+  max_sell_impact_bps: 0
+  # P2-STRUC-1: background blockhash refresh cadence (seconds). Lower = fresher
+  # sends, more RPC pressure; 0.05 floor, public-RPC-friendly default 5.0.
+  blockhash_refresh_interval: 5.0
+  # P2-EXIT-5: close the user's token ATA in the same tx as a full-balance
+  # sell, reclaiming rent atomically (RPC-verified first; off = keep ATA).
+  close_ata_on_sell: false
 
   # Phase 2: extreme-fast stays OFF until the sizing model is corrected.
   # A fixed token count (20) bought dust that could not be sold (6024
@@ -58,19 +71,45 @@ trade:
   stuck_sweep_interval: 60 # seconds between wallet scans; 0 disables
   # Improvement #8: shadow/paper mode — record simulated decisions and
   # outcomes without sending transactions (backtest the gates risk-free).
-  shadow_mode: false
+  shadow_mode: true # SHADOW ON (log-only, no real sends) — user requested 2026-10-26
+  # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
+  # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
+  backfill:
+    enabled: false
+    fetch_concurrency: 5
+    page_size: 100
+    max_pages: 5 # safety cap on pages crawled
+    checkpoint: /home/agentuser/Memesnipe/state/backfill_cursor.txt
 
 # Priority fees: transaction speed vs cost (fixed = 0 extra RPC calls)
 priority_fees:
-  enable_dynamic: false # MUST be false: dynamic adds 60-250ms on the hot path
-  enable_fixed: true
-  fixed_amount: 100_000 # Phase 1: ~0.00001 SOL/tx at documented CU defaults
+  enable_dynamic: true # T1.4 auction: sample market fee via getRecentPrioritizationFees
+  enable_fixed: true # fallback when the dynamic sample is unavailable
+  fixed_amount: 100_000 # fallback CU price: ~0.00001 SOL/tx at documented CU defaults
   # Improvement #6: split buy/sell priority fees — urgent buys may pay more,
   # sells (already in position) can pay less. Omit to use fixed_amount.
   # buy_fixed_amount: 150_000
   # sell_fixed_amount: 50_000
   extra_percentage: 0.0
+  # T1.4 auction bid: pay this multiple of the sampled top fee (1.0 = match
+  # the market; 1.1 = 10% above it to win the race). Capped by hard_cap.
+  bid_multiplier: 1.1
+  # T1.4: how long the dynamic sampler reuses one RPC sample, so the auction
+  # re-prices without paying an RPC round-trip on the hot path.
+  fee_cache_ttl: 2.0
   hard_cap: 200_000 # ceiling on the CU price
+
+# T2.2: Jito bundle executor (disabled). When enabled, buys/sells go through
+# the block-engine bundle path with a tip, falling back to the direct RPC send
+# if the bundle is rejected. Tips cost real lamports per landed trade.
+jito:
+  enabled: false
+  tip_lamports: 10_000 # tip to the bundle validator (~0.00001 SOL)
+  # endpoints: optional; defaults to the 5 regional block-engine URLs
+  # P2-STRUC-4: base58 auth keypairs rotated per request (region rotation).
+  # Empty = unsigned. Keep these OUT of git: a committed Jito keypair is a
+  # live credential (see the RISKS section of the implementation plan).
+  auth_keypairs: []
 
 # Filters for token selection
 filters:
@@ -82,6 +121,20 @@ filters:
   max_transfer_fee_bps: 0 # reject Token-2022 transfer-tax coins outright
   # Quality gates
   blocked_creators: []
+  # P2-STRUC-2: creator-PnL persistent blacklist. When on, a creator whose
+  # realized net PnL stays <= max_net_sol over >= min_trades trades goes on a
+  # persistent skip list (state/creator_pnl.db).
+  creator_pnl_blacklist_enabled: false
+  creator_pnl_db_path: state/creator_pnl.db
+  creator_pnl_min_trades: 3
+  creator_pnl_max_net_sol: 0.0
+  # P2-EXIT-4: slot-delta rug heuristics (off). On: exits immediately when the
+  # pool drains below early_drain_ratio of its entry depth, or the coin has
+  # fewer than min_unique_buyers check_slots after our buy.
+  rug_heuristics_enabled: false
+  rug_min_unique_buyers: 2
+  rug_check_slots: 12
+  rug_early_drain_ratio: 0.5
   max_market_cap_sol: 40.0 # above pump.fun launch MC (~28 SOL): rejects already-pumped, passes normal launches
   min_curve_progress_sol: 0.25 # Phase 5 trial: skip dead launches
   # Improvement #4: buy-on-breakout — buy only after MC rises through this.
@@ -91,8 +144,25 @@ filters:
   # without limit (drop oldest beyond this).
   max_tracked_tokens: 500
   fail_closed_gates: true # RPC error in a gate = refuse the coin, not pass it
+  # T2.4 confirmation window: consecutive curve-gate passes before buying.
+  # 1 = single check. >1 guards against a transient RPC-blip false pass.
+  consecutive_match_count: 1
+  gate_recheck_interval: 0.5 # seconds between confirmation rechecks
+  # T2.5 honeypot gates (off by default; fail-open on read errors).
+  # Freeze-authority: reject mints whose account carries a freeze authority.
+  honeypot_freeze_authority: false
+  # Curve supply-hold: reject coins whose curve holds less than this fraction
+  # of total supply (0 disables). ~80% is the pump.fun launch norm.
+  min_curve_hold_fraction: 0.0
   marry_mode: false # MUST be false so the bot auto-sells
   yolo_mode: true # Phase 3: continuous sniping (freshness fix landed)
+
+  # T3.2: copy-trader engine (disabled by default; off = safe baseline).
+  # Mirrors leader buys only for wallets inserted into the targets DB.
+  copy_trader:
+    enabled: false
+    db: /home/agentuser/Memesnipe/state/copy_targets.db
+    min_buy_interval: 5.0 # seconds between mirrored buys (rate guard)
 
 # Retry and timeout settings
 retries:

@@ -4,6 +4,8 @@ import asyncio
 from time import monotonic
 
 from solders.pubkey import Pubkey
+from spl.token.instructions import close_account
+from spl.token.models import CloseAccountParams
 
 from core.client import SolanaClient
 from core.priority_fee.manager import PriorityFeeManager
@@ -17,6 +19,7 @@ from core.pubkeys import (
     quote_units_per_token,
 )
 from core.wallet import Wallet
+from execution.executor import TransactionExecutor
 from interfaces.core import (
     AddressProvider,
     ConfirmationStatus,
@@ -138,6 +141,7 @@ class PlatformAwareBuyer(Trader):
         curve_refresh_budget: float = 2.0,
         *,
         trust_create_event: bool = True,
+        executor: TransactionExecutor | None = None,
     ):
         """Initialize platform-aware token buyer.
 
@@ -162,6 +166,9 @@ class PlatformAwareBuyer(Trader):
                 state_from_event, so extreme_fast_mode makes zero RPC calls
                 between detection and submission. False forces the refresh for
                 every listener.
+            executor: Optional transaction executor (T2.2). When set, the send
+                goes through it (e.g. Jito bundle + fallback chain); when None,
+                the previous direct send path is used.
         """
         self.client = client
         self.wallet = wallet
@@ -174,6 +181,7 @@ class PlatformAwareBuyer(Trader):
         self.compute_units = compute_units or {}
         self.curve_refresh_budget = curve_refresh_budget
         self.trust_create_event = trust_create_event
+        self.executor = executor
         # SOL-paired coins always use `amount`; other quotes need an explicit
         # per-mint amount because 0.0001 USDC and 0.0001 SOL are not comparable.
         self.quote_amounts: dict[Pubkey, float] = {
@@ -321,23 +329,51 @@ class PlatformAwareBuyer(Trader):
                 f"(max: {max_quote_amount_raw / quote_unit:.6f} {quote_label})"
             )
 
-            tx_signature = await self.client.build_and_send_transaction(
-                instructions,
-                self.wallet.keypair,
-                skip_preflight=True,
-                max_retries=self.max_retries,
-                priority_fee=await self.priority_fee_manager.calculate_priority_fee(
-                    priority_accounts
-                ),
-                compute_unit_limit=instruction_builder.get_buy_compute_unit_limit(
-                    self._get_cu_override("buy", token_info.platform)
-                ),
-                account_data_size_limit=self._get_cu_override(
-                    "account_data_size", token_info.platform
-                ),
+            priority_fee = await self.priority_fee_manager.calculate_priority_fee(
+                priority_accounts
+            )
+            compute_unit_limit = instruction_builder.get_buy_compute_unit_limit(
+                self._get_cu_override("buy", token_info.platform)
+            )
+            account_data_size_limit = self._get_cu_override(
+                "account_data_size", token_info.platform
             )
 
-            success = await self.client.confirm_transaction(tx_signature)
+            if self.executor is not None:
+                exec_result = await self.executor.execute(
+                    instructions,
+                    self.wallet.keypair,
+                    priority_fee=priority_fee,
+                    compute_unit_limit=compute_unit_limit,
+                    account_data_size_limit=account_data_size_limit,
+                    skip_preflight=True,
+                )
+                if not exec_result.success:
+                    return TradeResult(
+                        success=False,
+                        platform=token_info.platform,
+                        error_message=exec_result.error_message,
+                    )
+                tx_signature = exec_result.signature
+                if tx_signature is None:
+                    return TradeResult(
+                        success=False,
+                        platform=token_info.platform,
+                        error_message="executor succeeded without a signature",
+                    )
+                success = True
+            else:
+                tx_signature = await self.client.build_and_send_transaction(
+                    instructions,
+                    self.wallet.keypair,
+                    skip_preflight=True,
+                    max_retries=self.max_retries,
+                    priority_fee=priority_fee,
+                    compute_unit_limit=compute_unit_limit,
+                    account_data_size_limit=account_data_size_limit,
+                )
+
+                success = await self.client.confirm_transaction(tx_signature)
 
             if success:
                 logger.info(f"Buy transaction confirmed: {tx_signature}")
@@ -637,14 +673,48 @@ class PlatformAwareSeller(Trader):
         slippage: float = 0.25,
         max_retries: int = 5,
         compute_units: dict | None = None,
+        executor: TransactionExecutor | None = None,
+        sell_slippage_inflation_bps: int = 10,
+        max_sell_impact_bps: int = 0,
+        close_ata_on_sell: bool = False,
     ):
-        """Initialize platform-aware token seller."""
+        """Initialize platform-aware token seller.
+
+        Args:
+            client: Solana RPC client
+            wallet: Trading wallet
+            priority_fee_manager: Priority fee strategy
+            slippage: Acceptable price deviation
+            max_retries: Transaction submission attempts
+            compute_units: Optional CU overrides
+            executor: Optional transaction executor (T2.2); same semantics as
+                the buyer's — when set, sends go through it (e.g. Jito bundle
+                + fallback chain) instead of the direct path.
+            sell_slippage_inflation_bps: Extra slippage applied to sells only
+                (P2-EXIT-3), so an exit lands even if the pool moved a little
+                between read and confirm.
+            max_sell_impact_bps: Caps the sell size so its price impact never
+                exceeds this many bps of the pool depth (P2-EXIT-2, reference
+                amm.rs:38-43: notional * 10_000 / max_impact_bps = max
+                absorbable size). 0 = off — the full balance sells in one tx.
+                When on, an oversized balance splits across later passes the
+                same way the P2-FEE-2 overflow clamp does.
+            close_ata_on_sell: When True, close the user's token ATA in the
+                same transaction as a full-balance sell (P2-EXIT-5), reclaiming
+                the rent atomically. Only appended when an RPC balance read
+                confirms the ATA holds exactly the amount being sold — a close
+                on an account with leftover tokens reverts the entire sell.
+        """
         self.client = client
         self.wallet = wallet
         self.priority_fee_manager = priority_fee_manager
         self.slippage = slippage
+        self.sell_slippage_inflation_bps = sell_slippage_inflation_bps
+        self.max_sell_impact_bps = max_sell_impact_bps
+        self.close_ata_on_sell = close_ata_on_sell
         self.max_retries = max_retries
         self.compute_units = compute_units or {}
+        self.executor = executor
 
     async def execute(
         self, token_info: TokenInfo, token_amount: float, token_price: float
@@ -699,6 +769,7 @@ class PlatformAwareSeller(Trader):
             sell_deductions = (0.0, 0)
             # Unknown when the refresh below fails; the curve is the default.
             graduated = False
+            pool_state: dict = {}
 
             # The sell account list is 16 (non-cashback) vs 17 (cashback) and
             # fee_recipient differs in mayhem mode; both can change between buy
@@ -795,6 +866,60 @@ class PlatformAwareSeller(Trader):
                     error_message="No tokens to sell",
                 )
 
+            # P2-FEE-2: clamp an oversized sell to the pump.fun on-chain safe
+            # bound. Selling the full balance of a near-completion or
+            # high-decimals coin overflows the u64 token amount / u128 curve
+            # math and reverts with AnchorError 6024; the exit watcher retries
+            # and drains the remainder on later passes instead.
+            if not graduated:
+                try:
+                    from platforms.pumpfun.curve_manager import (
+                        max_safe_sell_amount,
+                    )
+
+                    safe_balance = max_safe_sell_amount(
+                        token_balance,
+                        pool_state.get("virtual_quote_reserves", 0),
+                    )
+                    if safe_balance < token_balance:
+                        logger.warning(
+                            f"Clamping oversized sell {token_balance} -> "
+                            f"{safe_balance} raw tokens (u64/u128 overflow "
+                            f"guard); remainder drains on a later pass"
+                        )
+                        token_balance = safe_balance
+                        token_balance_decimal = safe_balance / 10**TOKEN_DECIMALS
+                except Exception:
+                    logger.exception("max_safe_sell_amount clamp failed")
+
+            # P2-EXIT-2: impact-bounded sell clamp. A sell whose price impact
+            # exceeds max_sell_impact_bps of the pool depth is throttled to
+            # the impact-capped amount; the remainder drains on later
+            # monitor passes (same shape as the overflow clamp above).
+            # Constant-product impact: selling Δ of T tokens moves price by
+            # Δ/(T+Δ) — invert for Δ ≤ T*b/(10000-b).
+            if self.max_sell_impact_bps > 0 and not graduated:
+                try:
+                    vtoken = pool_state.get("virtual_token_reserves", 0) or 0
+                    if vtoken > 0:
+                        b = self.max_sell_impact_bps
+                        impact_cap = (
+                            vtoken * b // (10_000 - b) if b < 10_000 else vtoken
+                        )
+                        if impact_cap < token_balance:
+                            logger.warning(
+                                f"Clamping high-impact sell "
+                                f"{token_balance} -> {impact_cap} raw tokens "
+                                f"(max_sell_impact_bps {b}); remainder drains "
+                                f"on a later pass"
+                            )
+                            token_balance = impact_cap
+                            token_balance_decimal = (
+                                impact_cap / 10**TOKEN_DECIMALS
+                            )
+                except Exception:
+                    logger.exception("max_sell_impact_bps clamp failed")
+
             # Calculate expected quote output with slippage protection, in the
             # quote mint's raw units.
             fee_fraction, transfer_fee_bps = sell_deductions
@@ -806,7 +931,17 @@ class PlatformAwareSeller(Trader):
             )
             min_quote_output = max(
                 1,
-                int((expected_quote_output * (1 - self.slippage)) * quote_unit),
+                int(
+                    (
+                        expected_quote_output
+                        * (
+                            1
+                            - self.slippage
+                            - self.sell_slippage_inflation_bps / 10_000
+                        )
+                    )
+                    * quote_unit
+                ),
             )
             logger.info(
                 f"Selling {token_balance_decimal} tokens on {token_info.platform.value}"
@@ -815,7 +950,10 @@ class PlatformAwareSeller(Trader):
                 f"Expected {quote_label} output: {expected_quote_output:.10f} {quote_label}"
             )
             logger.info(
-                f"Minimum {quote_label} output (with {self.slippage * 100:.1f}% slippage): "
+                f"Minimum {quote_label} output (with "
+                f"{self.slippage * 100:.1f}% + "
+                f"{self.sell_slippage_inflation_bps / 100:.1f}% inflation "
+                f"slippage): "
                 f"{min_quote_output / quote_unit:.10f} {quote_label} "
                 f"({min_quote_output} raw units)"
             )
@@ -829,35 +967,101 @@ class PlatformAwareSeller(Trader):
                 address_provider,
             )
 
+            # P2-EXIT-5: close the user's token ATA in the same tx as a
+            # full-balance sell, reclaiming its rent atomically. Only safe
+            # when the ATA balance read confirms it holds exactly the amount
+            # being sold — a close on an account with leftover tokens reverts
+            # the entire sell. Any clamped sell (P2-FEE-2 / P2-EXIT-2) leaves
+            # a remainder, so the equality check skips it automatically.
+            # Fail-open: an RPC error skips the close, never the sell.
+            if self.close_ata_on_sell:
+                try:
+                    token_program = getattr(
+                        token_info, "token_program_id", None
+                    ) or SystemAddresses.TOKEN_2022_PROGRAM
+                    if hasattr(address_provider, "derive_user_token_account"):
+                        ata = address_provider.derive_user_token_account(
+                            self.wallet.pubkey, token_info.mint
+                        )
+                    else:
+                        ata = None
+                    if ata is not None:
+                        actual_balance = await self.client.get_token_account_balance(
+                            ata
+                        )
+                        if actual_balance == token_balance:
+                            instructions.append(
+                                close_account(
+                                    CloseAccountParams(
+                                        program_id=token_program,
+                                        account=ata,
+                                        dest=self.wallet.pubkey,
+                                        owner=self.wallet.pubkey,
+                                    )
+                                )
+                            )
+                            logger.info(
+                                f"P2-EXIT-5: appended ATA close for {ata} "
+                                f"(balance {actual_balance} confirms "
+                                f"full drain); rent reclaimed in-tx"
+                            )
+                        elif actual_balance > 0:
+                            logger.warning(
+                                f"Skipping ATA close: balance {actual_balance} "
+                                f"!= sell amount {token_balance} "
+                                f"(leftover would revert the sell)"
+                            )
+                except Exception:
+                    logger.exception("ATA-close skipped (fail-open)")
+
             # Get accounts for priority fee calculation
             priority_accounts = seller.get_required_accounts_for_sell(
                 token_info, self.wallet.pubkey, address_provider
             )
 
-            tx_signature = await self.client.build_and_send_transaction(
-                instructions,
-                self.wallet.keypair,
-                skip_preflight=True,
-                max_retries=self.max_retries,
-                priority_fee=await self.priority_fee_manager.calculate_priority_fee(
-                    priority_accounts
-                ),
-                compute_unit_limit=seller.get_sell_compute_unit_limit(
-                    self._get_cu_override("sell", token_info.platform)
-                ),
-                account_data_size_limit=self._get_cu_override(
-                    "account_data_size", token_info.platform
-                ),
+            priority_fee = await self.priority_fee_manager.calculate_priority_fee(
+                priority_accounts
+            )
+            compute_unit_limit = seller.get_sell_compute_unit_limit(
+                self._get_cu_override("sell", token_info.platform)
+            )
+            account_data_size_limit = self._get_cu_override(
+                "account_data_size", token_info.platform
             )
 
-            status = await self.client.confirm_transaction_detailed(tx_signature)
+            if self.executor is not None:
+                exec_result = await self.executor.execute(
+                    instructions,
+                    self.wallet.keypair,
+                    priority_fee=priority_fee,
+                    compute_unit_limit=compute_unit_limit,
+                    account_data_size_limit=account_data_size_limit,
+                    skip_preflight=True,
+                )
+                tx_signature = exec_result.signature
+                status = (
+                    exec_result.confirmation_status
+                    if exec_result.confirmation_status is not None
+                    else ConfirmationStatus.UNCONFIRMED
+                )
+            else:
+                tx_signature = await self.client.build_and_send_transaction(
+                    instructions,
+                    self.wallet.keypair,
+                    skip_preflight=True,
+                    max_retries=self.max_retries,
+                    priority_fee=priority_fee,
+                    compute_unit_limit=compute_unit_limit,
+                    account_data_size_limit=account_data_size_limit,
+                )
+                status = await self.client.confirm_transaction_detailed(tx_signature)
 
             if status is ConfirmationStatus.SUCCESS:
                 logger.info(f"Sell transaction confirmed: {tx_signature}")
                 return TradeResult(
                     success=True,
                     platform=token_info.platform,
-                    tx_signature=tx_signature,
+                    tx_signature=str(tx_signature),
                     amount=token_balance_decimal,
                     price=token_price_sol,
                 )

@@ -14,6 +14,8 @@ class ExitReason(Enum):
     STOP_LOSS = "stop_loss"
     MAX_HOLD_TIME = "max_hold_time"
     MANUAL = "manual"
+    LIQUIDITY = "liquidity_depth"  # P2-EXIT-1: pool too shallow to exit later
+    RUG = "rug_heuristics"  # P2-EXIT-4: rug signals right after entry
 
 
 @dataclass

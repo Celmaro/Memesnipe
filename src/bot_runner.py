@@ -97,7 +97,29 @@ async def start_bot(config_path: str):
             # Trade parameters
             buy_amount=cfg["trade"]["buy_amount"],
             buy_slippage=cfg["trade"]["buy_slippage"],
-            sell_slippage=cfg["trade"]["sell_slippage"],
+            sell_slippage=cfg["trade"].get("sell_slippage", 0.15),
+            # P2-EXIT-3: extra sell-only slippage (bps) so exits land under
+            # pool movement between read and confirm.
+            sell_slippage_inflation_bps=cfg["trade"].get(
+                "sell_slippage_inflation_bps", 10
+            ),
+            # P2-EXIT-2: impact-bounded sell clamp (bps); 0 = off
+            max_sell_impact_bps=cfg["trade"].get("max_sell_impact_bps", 0),
+            # P2-EXIT-5: close user ATA in-tx on full-balance sell
+            close_ata_on_sell=cfg["trade"].get("close_ata_on_sell", False),
+            # P2-EXIT-1: absolute pool-depth floor (SOL); 0 = off
+            min_pool_depth_sol=cfg["trade"].get("min_pool_depth_sol", 0.0),
+            # P2-EXIT-4: slot-delta rug heuristics (off by default)
+            rug_heuristics_enabled=cfg["filters"].get(
+                "rug_heuristics_enabled", False
+            ),
+            rug_min_unique_buyers=cfg["filters"].get(
+                "rug_min_unique_buyers", 2
+            ),
+            rug_check_slots=cfg["filters"].get("rug_check_slots", 12),
+            rug_early_drain_ratio=cfg["filters"].get(
+                "rug_early_drain_ratio", 0.5
+            ),
             # Extreme fast mode settings
             extreme_fast_mode=cfg["trade"].get("extreme_fast_mode", False),
             extreme_fast_token_amount=cfg["trade"].get("extreme_fast_token_amount", 30),
@@ -138,6 +160,12 @@ async def start_bot(config_path: str):
                 "extra_percentage", 0.0
             ),
             hard_cap_prior_fee=cfg.get("priority_fees", {}).get("hard_cap", 500000),
+            priority_fee_bid_multiplier=cfg.get("priority_fees", {}).get(
+                "bid_multiplier", 1.0
+            ),
+            priority_fee_cache_ttl=cfg.get("priority_fees", {}).get(
+                "fee_cache_ttl", 2.0
+            ),
             # Retry and timeout settings
             max_retries=cfg.get("retries", {}).get("max_attempts", 10),
             wait_time_after_creation=cfg.get("retries", {}).get(
@@ -160,11 +188,46 @@ async def start_bot(config_path: str):
             # Trading filters
             match_string=cfg["filters"].get("match_string"),
             bro_address=cfg["filters"].get("bro_address"),
-            blocked_creators=cfg["filters"].get("blocked_creators"),
+            blocked_creators=cfg["filters"].get("blocked_creators") or [],
+            # P2-STRUC-2: persistent creator-PnL blacklist (off by default)
+            creator_pnl_blacklist_enabled=cfg["filters"].get(
+                "creator_pnl_blacklist_enabled", False
+            ),
+            creator_pnl_db_path=cfg["filters"].get(
+                "creator_pnl_db_path", "state/creator_pnl.db"
+            ),
+            creator_pnl_min_trades=cfg["filters"].get(
+                "creator_pnl_min_trades", 3
+            ),
+            creator_pnl_max_net_sol=cfg["filters"].get(
+                "creator_pnl_max_net_sol", 0.0
+            ),
             max_market_cap_sol=cfg["filters"].get("max_market_cap_sol"),
             min_curve_progress_sol=cfg["filters"].get("min_curve_progress_sol"),
             min_market_cap_sol=cfg["filters"].get("min_market_cap_sol"),
             max_tracked_tokens=cfg["filters"].get("max_tracked_tokens", 500),
+            consecutive_match_count=cfg["filters"].get("consecutive_match_count", 1),
+            gate_recheck_interval=cfg["filters"].get("gate_recheck_interval", 0.5),
+            honeypot_freeze_authority=cfg.get("filters", {}).get(
+                "honeypot_freeze_authority", False
+            ),
+            min_curve_hold_fraction=cfg.get("filters", {}).get(
+                "min_curve_hold_fraction", 0.0
+            ),
+            # T2.6: RPC catch-up backfill (off by default)
+            backfill_enabled=cfg.get("backfill", {}).get("enabled", False),
+            backfill_fetch_concurrency=cfg.get("backfill", {}).get(
+                "fetch_concurrency", 5
+            ),
+            backfill_page_size=cfg.get("backfill", {}).get("page_size", 100),
+            backfill_max_pages=cfg.get("backfill", {}).get("max_pages", 5),
+            backfill_checkpoint=cfg.get("backfill", {}).get("checkpoint"),
+            # T3.2: copy-trader engine (disabled by default)
+            copy_trader_enabled=cfg.get("copy_trader", {}).get("enabled", False),
+            copy_trader_db=cfg.get("copy_trader", {}).get("db"),
+            copy_trader_min_interval=cfg.get("copy_trader", {}).get(
+                "min_buy_interval", 5.0
+            ),
             buy_priority_fee=cfg.get("priority_fees", {}).get("buy_fixed_amount"),
             sell_priority_fee=cfg.get("priority_fees", {}).get("sell_fixed_amount"),
             stuck_sweep_interval=cfg.get("trade", {}).get("stuck_sweep_interval", 0),
@@ -176,6 +239,16 @@ async def start_bot(config_path: str):
             compute_units=cfg.get("compute_units", {}),
             # Node provider configuration
             max_rps=cfg.get("node", {}).get("max_rps", 25),
+            # P2-STRUC-1: background blockhash refresh cadence (s)
+            blockhash_refresh_interval=cfg["trade"].get(
+                "blockhash_refresh_interval", 5.0
+            ),
+            # T2.2 Jito bundle executor (disabled by default)
+            jito_enabled=cfg.get("jito", {}).get("enabled", False),
+            jito_tip_lamports=cfg.get("jito", {}).get("tip_lamports", 10_000),
+            jito_endpoints=cfg.get("jito", {}).get("endpoints"),
+            # P2-STRUC-4: per-request auth keypairs (region rotation)
+            jito_auth_keypairs=cfg.get("jito", {}).get("auth_keypairs") or [],
         )
 
         await trader.start()

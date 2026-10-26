@@ -7,9 +7,11 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from time import monotonic
+from typing import Any
 
 from solders.pubkey import Pubkey
 
+from backfill.transaction_crawler import TransactionCrawler
 from cleanup.modes import (
     handle_cleanup_after_failure,
     handle_cleanup_after_sell,
@@ -37,6 +39,7 @@ from interfaces.core import (
 from monitoring.listener_factory import ListenerFactory
 from monitoring.metrics import metrics
 from platforms import get_platform_implementations
+from screening.honeypot import honeypot_reason
 from trading.base import TradeResult
 from trading.platform_aware import PlatformAwareBuyer, PlatformAwareSeller
 from trading.position import ExitReason, Position
@@ -146,6 +149,27 @@ class UniversalTrader:
         buy_amount: float,
         buy_slippage: float,
         sell_slippage: float,
+        # P2-EXIT-3: extra bps added to the sell-only slippage floor.
+        sell_slippage_inflation_bps: int = 10,
+        # P2-EXIT-2: max bps of pool depth a single sell may move price
+        # (0 = off, sell whole balance in one tx).
+        max_sell_impact_bps: int = 0,
+        # P2-EXIT-5: close the user's token ATA in the same tx as a
+        # full-balance sell (off by default; balance is RPC-verified first).
+        close_ata_on_sell: bool = False,
+        # P2-EXIT-1: absolute pool-depth floor (SOL). When the pool's real
+        # quote reserves drop below this, force-exit immediately instead of
+        # waiting for TP/SL — a pool that shallow may not absorb the sell
+        # later. 0 = off.
+        min_pool_depth_sol: float = 0.0,
+        # P2-EXIT-4: slot-delta rug heuristics (off by default). After a buy,
+        # a pool drained below early_drain_ratio of its entry depth, or a
+        # coin with fewer than min_unique_buyers after check_slots, exits
+        # immediately as ExitReason.RUG.
+        rug_heuristics_enabled: bool = False,
+        rug_min_unique_buyers: int = 2,
+        rug_check_slots: int = 12,
+        rug_early_drain_ratio: float = 0.5,
         # Platform configuration
         platform: Platform | str = Platform.PUMP_FUN,
         # Listener configuration
@@ -180,6 +204,10 @@ class UniversalTrader:
         fixed_priority_fee: int = 200_000,
         extra_priority_fee: float = 0.0,
         hard_cap_prior_fee: int = 200_000,
+        # T1.4 auction: multiply the dynamic sample by this before extra_fee
+        # (1.0 = match the sample; >1.0 = bid above the observed top fee).
+        priority_fee_bid_multiplier: float = 1.0,
+        priority_fee_cache_ttl: float = 2.0,
         # Retry and timeout settings
         max_retries: int = 3,
         wait_time_after_creation: int = 15,
@@ -195,10 +223,32 @@ class UniversalTrader:
         match_string: str | None = None,
         bro_address: str | None = None,
         blocked_creators: list[str] | None = None,
+        # P2-STRUC-2: persistent creator-PnL blacklist (off by default).
+        creator_pnl_blacklist_enabled: bool = False,
+        creator_pnl_db_path: str = "state/creator_pnl.db",
+        creator_pnl_min_trades: int = 3,
+        creator_pnl_max_net_sol: float = 0.0,
         max_market_cap_sol: float | None = None,
         min_curve_progress_sol: float | None = None,
         min_market_cap_sol: float | None = None,
         max_tracked_tokens: int = 500,
+        # T2.4 confirmation window: require this many consecutive curve-gate
+        # passes (1 = single check, current behavior) before buying.
+        consecutive_match_count: int = 1,
+        gate_recheck_interval: float = 0.5,
+        # T2.5 honeypot gates (off by default; fail-open on read errors).
+        honeypot_freeze_authority: bool = False,
+        min_curve_hold_fraction: float = 0.0,
+        # T2.6: RPC catch-up backfill (disabled by default)
+        backfill_enabled: bool = False,
+        backfill_fetch_concurrency: int = 5,
+        backfill_page_size: int = 100,
+        backfill_max_pages: int = 5,
+        backfill_checkpoint: str | None = None,
+        # T3.2: copy-trader engine (disabled by default; off = safe baseline)
+        copy_trader_enabled: bool = False,
+        copy_trader_db: str | None = None,
+        copy_trader_min_interval: float = 5.0,
         # Split buy/sell priority fees: overrides for priority_fees.fixed_amount
         buy_priority_fee: int | None = None,
         sell_priority_fee: int | None = None,
@@ -215,12 +265,26 @@ class UniversalTrader:
         yolo_mode: bool = False,
         # Compute unit configuration
         compute_units: dict | None = None,
+        # T2.2 Jito bundle executor: when enabled, sends go through a
+        # JitoExecutor with the default path as fallback.
+        jito_enabled: bool = False,
+        jito_tip_lamports: int = 10_000,
+        jito_endpoints: list[str] | None = None,
+        # P2-STRUC-4: base58 auth keypairs rotated per request (region
+        # rotation); empty = unsigned (pre-existing behavior).
+        jito_auth_keypairs: list[str] | None = None,
         # Node provider configuration
         max_rps: float = 25.0,
+        # P2-STRUC-1: background blockhash refresh cadence (s); 0.05 min.
+        blockhash_refresh_interval: float = 5.0,
     ):
         """Initialize the universal trader."""
         # Core components
-        self.solana_client = SolanaClient(rpc_endpoint, max_rps=max_rps)
+        self.solana_client = SolanaClient(
+            rpc_endpoint,
+            max_rps=max_rps,
+            blockhash_refresh_interval=blockhash_refresh_interval,
+        )
         self.wallet = Wallet(private_key)
         self.priority_fee_manager = PriorityFeeManager(
             client=self.solana_client,
@@ -229,6 +293,8 @@ class UniversalTrader:
             fixed_fee=buy_priority_fee or fixed_priority_fee,
             extra_fee=extra_priority_fee,
             hard_cap=hard_cap_prior_fee,
+            bid_multiplier=priority_fee_bid_multiplier,
+            fee_cache_ttl=priority_fee_cache_ttl,
         )
         # Improvement #6: split buy/sell fees. The buyer keeps the manager
         # above (buy fee); the seller gets its own manager with the sell fee
@@ -240,6 +306,8 @@ class UniversalTrader:
             fixed_fee=sell_priority_fee or fixed_priority_fee,
             extra_fee=extra_priority_fee,
             hard_cap=hard_cap_prior_fee,
+            bid_multiplier=priority_fee_bid_multiplier,
+            fee_cache_ttl=priority_fee_cache_ttl,
         )
 
         # Platform setup
@@ -275,6 +343,44 @@ class UniversalTrader:
         self.max_transfer_fee_bps = max_transfer_fee_bps
 
         # Create platform-aware traders
+        # T2.2: executor chain. Jito first (bundle + tip), default path as
+        # fallback; dedupe by signature so a rejected bundle cannot double-send.
+        # Disabled (default): plain direct send, behavior unchanged.
+        from execution.executor import (
+            DefaultExecutor,
+            FallbackChainExecutor,
+            JitoExecutor,
+        )
+
+        if jito_enabled:
+            # P2-STRUC-4: optional per-request auth keypairs (region
+            # rotation); empty list = unsigned, pre-existing behavior.
+            auth_keypairs: list = []
+            if jito_auth_keypairs:
+                from solders.keypair import Keypair
+
+                for b58key in jito_auth_keypairs:
+                    try:
+                        auth_keypairs.append(Keypair.from_base58_string(b58key))
+                    except Exception:
+                        logger.exception(
+                            f"Ignoring invalid jito auth keypair "
+                            f"({b58key[:6]}...); rotating the valid ones only"
+                        )
+            self.executor = FallbackChainExecutor(
+                [
+                    JitoExecutor(
+                        self.solana_client,
+                        endpoints=jito_endpoints,
+                        tip_lamports=jito_tip_lamports,
+                        auth_keypairs=auth_keypairs or None,
+                    ),
+                    DefaultExecutor(self.solana_client, max_retries=max_retries),
+                ]
+            )
+        else:
+            self.executor = None
+
         self.buyer, self.seller = (
             PlatformAwareBuyer(
                 self.solana_client,
@@ -289,6 +395,7 @@ class UniversalTrader:
                 quote_amounts=self.quote_amounts,
                 curve_refresh_budget=curve_refresh_budget,
                 trust_create_event=trust_create_event,
+                executor=self.executor,
             ),
             PlatformAwareSeller(
                 self.solana_client,
@@ -297,6 +404,14 @@ class UniversalTrader:
                 sell_slippage,
                 max_retries,
                 compute_units=self.compute_units,
+                executor=self.executor,
+                # P2-EXIT-3: exit floor loosened by this many extra bps so a
+                # sell lands even if the pool moved after the read.
+                sell_slippage_inflation_bps=sell_slippage_inflation_bps,
+                # P2-EXIT-2: impact-bounded sell clamp (0 = off).
+                max_sell_impact_bps=max_sell_impact_bps,
+                # P2-EXIT-5: close ATA in-tx on full-balance sell.
+                close_ata_on_sell=close_ata_on_sell,
             ),
         )
 
@@ -314,6 +429,19 @@ class UniversalTrader:
         self.buy_amount = buy_amount
         self.buy_slippage = buy_slippage
         self.sell_slippage = sell_slippage
+        self.sell_slippage_inflation_bps = sell_slippage_inflation_bps
+        self.max_sell_impact_bps = max_sell_impact_bps
+        self.close_ata_on_sell = close_ata_on_sell
+        self.min_pool_depth_sol = min_pool_depth_sol
+        # P2-EXIT-4: rug-heuristic state (off by default).
+        self.rug_heuristics_enabled = rug_heuristics_enabled
+        self.rug_min_unique_buyers = rug_min_unique_buyers
+        self.rug_check_slots = rug_check_slots
+        self.rug_early_drain_ratio = rug_early_drain_ratio
+        # mint -> set of buyer wallet strings observed via trade events.
+        self._rug_buyers: dict[str, set[str]] = {}
+        # mint -> (entry_slot, entry_real_quote_lamports)
+        self._rug_entry: dict[str, tuple[int, float]] = {}
         self.max_retries = max_retries
         self.extreme_fast_mode = extreme_fast_mode
         self.extreme_fast_token_amount = extreme_fast_token_amount
@@ -328,6 +456,15 @@ class UniversalTrader:
             price_check_interval,
             max(1, max_exit_sell_attempts),
         )
+        # P2-STRUC-2: creator-PnL persistent blacklist (off by default).
+        self.creator_pnl_blacklist_enabled = creator_pnl_blacklist_enabled
+        self.creator_pnl_min_trades = creator_pnl_min_trades
+        self.creator_pnl_max_net_sol = creator_pnl_max_net_sol
+        self.creator_pnl_store: Any = None
+        if creator_pnl_blacklist_enabled and creator_pnl_db_path:
+            from screening.creator_pnl_store import CreatorPnlStore
+
+            self.creator_pnl_store = CreatorPnlStore(creator_pnl_db_path)
         self.persistent_exit_ttl = persistent_exit_ttl
         self.persistent_exit_interval = persistent_exit_interval
 
@@ -353,6 +490,19 @@ class UniversalTrader:
         self.min_curve_progress_sol = min_curve_progress_sol
         self.min_market_cap_sol = min_market_cap_sol
         self.max_tracked_tokens = max_tracked_tokens
+        self.consecutive_match_count = max(1, consecutive_match_count)
+        self.gate_recheck_interval = max(0.1, gate_recheck_interval)
+        self.honeypot_freeze_authority = honeypot_freeze_authority
+        self.min_curve_hold_fraction = max(0.0, min_curve_hold_fraction)
+        self.backfill_enabled = backfill_enabled
+        self.backfill_fetch_concurrency = backfill_fetch_concurrency
+        self.backfill_page_size = backfill_page_size
+        self.backfill_max_pages = backfill_max_pages
+        self.backfill_checkpoint = backfill_checkpoint
+        self.copy_trader_enabled = copy_trader_enabled
+        self.copy_trader_db = copy_trader_db
+        self.copy_trader_min_interval = copy_trader_min_interval
+        self.copy_trader_engine = None
         self.buy_priority_fee = buy_priority_fee
         self.sell_priority_fee = sell_priority_fee
         self.stuck_sweep_interval = stuck_sweep_interval
@@ -515,6 +665,21 @@ class UniversalTrader:
                     f"Stuck-token sweeper started (interval {self.stuck_sweep_interval}s)"
                 )
 
+            # T2.6: replay missed launches/events after a geyser gap. Best-effort:
+            # failures are logged, never fatal.
+            await self._backfill_gap()
+
+            # T3.2: optional copy-trader engine (disabled by default).
+            await self._init_copy_trader()
+
+            # P2-EXIT-4: rug-heuristic buyer tracking needs the listener's
+            # trade feed even when the copy engine is off.
+            if self.rug_heuristics_enabled and (
+                not hasattr(self.token_listener, "trade_callback")
+                or self.token_listener.trade_callback is None
+            ):
+                await self._init_rug_trade_feed()
+
             # Choose operating mode based on yolo_mode
             if not self.yolo_mode:
                 # Single token mode: process one token and exit
@@ -569,6 +734,170 @@ class UniversalTrader:
                 self._stuck_sweeper_task.cancel()
             await self._cleanup_without_interruption()
             logger.info("Universal Trader has shut down")
+
+    async def _init_copy_trader(self) -> None:
+        """T3.2: build the copy-trader engine and register its geyser hook.
+
+        Disabled by default (no targets, no mirror). When enabled, mirrors
+        leader buys through the shared buyer, subject to per-wallet limits.
+        """
+        if not self.copy_trader_enabled:
+            return
+        try:
+            from copy_trader.engine import CopyTraderEngine
+            from copy_trader.gmgn_profiler import WalletProfiler
+            from screening.copy_target_store import CopyTargetStore
+
+            db_path = self.copy_trader_db or "state/copy_targets.db"
+            store = CopyTargetStore(db_path)
+            engine = CopyTraderEngine(
+                self.solana_client,
+                store,
+                buy_mirror=self._mirror_buy,
+                min_buy_interval=self.copy_trader_min_interval,
+                profiler=WalletProfiler(),
+            )
+
+            async def on_trade_logs(logs: list[str]) -> None:
+                trade = self.platform_implementations.event_parser.parse_trade_event_from_logs(
+                    logs
+                )
+                if trade:
+                    # P2-EXIT-4: count unique buyers for the rug heuristic
+                    # (only buys; the trader itself is filtered out later —
+                    # the engine tracks its own mirrors separately).
+                    if self.rug_heuristics_enabled and trade.get("is_buy"):
+                        mint_key = str(trade.get("mint", ""))
+                        trader_key = str(trade.get("trader") or "")
+                        if mint_key and trader_key:
+                            self._rug_buyers.setdefault(mint_key, set()).add(
+                                trader_key
+                            )
+                    await engine.on_trade_event(trade)
+
+            if hasattr(self.token_listener, "trade_callback"):
+                self.token_listener.trade_callback = on_trade_logs
+            self.copy_trader_engine = engine
+            logger.info(
+                f"Copy-trader engine enabled (db={db_path}, "
+                f"min_interval={self.copy_trader_min_interval}s)"
+            )
+        except Exception:
+            logger.exception("Copy-trader init failed; disabled for this run")
+
+    async def _init_rug_trade_feed(self) -> None:
+        """P2-EXIT-4: wire listener trade events into the rug buyer counter.
+
+        Used when the copy engine is off (it registers its own callback
+        otherwise). Best-effort: listener without the hook just means the
+        unique-buyer test cannot run — the drain test still works.
+        """
+        try:
+            async def on_rug_trade_logs(logs: list[str]) -> None:
+                trade = (
+                    self.platform_implementations.event_parser.parse_trade_event_from_logs(
+                        logs
+                    )
+                )
+                if trade and trade.get("is_buy"):
+                    mint_key = str(trade.get("mint", ""))
+                    trader_key = str(trade.get("trader") or "")
+                    if mint_key and trader_key:
+                        self._rug_buyers.setdefault(mint_key, set()).add(
+                            trader_key
+                        )
+
+            if hasattr(self.token_listener, "trade_callback"):
+                self.token_listener.trade_callback = on_rug_trade_logs
+                logger.info("P2-EXIT-4: rug trade feed wired (buyer counting)")
+        except Exception:
+            logger.exception("Rug trade feed init failed; drain test only")
+
+    async def _mirror_buy(
+        self, token_info: TokenInfo, target: Any, size_sol: float
+    ) -> bool:
+        """Mirror a leader buy through a fresh buyer sized per target (T3.2)."""
+        try:
+            # The sniper's buyer is sized from config; a copy target carries
+            # its own size (fixed or percent-of-leader), so build a dedicated
+            # buyer for the mirror.
+            from trading.platform_aware import PlatformAwareBuyer
+
+            buyer = PlatformAwareBuyer(
+                self.solana_client,
+                self.wallet,
+                self.priority_fee_manager,
+                size_sol,
+                slippage=(target.slippage_bps or 500) / 10_000,
+                max_retries=self.max_retries,
+                trust_create_event=False,
+                executor=self.executor,
+            )
+            result = await buyer.execute(token_info)
+            return bool(result and result.success)
+        except Exception:
+            logger.exception("Copy-trader mirror buy raised")
+            return False
+
+    async def _backfill_gap(self) -> None:
+        """T2.6: replay missed transactions from RPC when enabled.
+
+        The crawler pages getSignaturesForAddress on the pump.fun program,
+        parses each replayed transaction's logs with the same parser the live
+        stream uses, and routes decoded creates through the normal token
+        pipeline (dedupe + freshness + gates) so a geyser gap cannot silently
+        drop launches or exit events.
+
+        Disabled by default; off is the safe baseline.
+        """
+        if not self.backfill_enabled:
+            return
+        try:
+            crawler = TransactionCrawler(
+                self.solana_client,
+                self.platform_implementations.event_parser.get_program_id(),
+                fetch_concurrency=self.backfill_fetch_concurrency,
+                page_size=self.backfill_page_size,
+                max_retries=3,
+                checkpoint_path=(
+                    Path(self.backfill_checkpoint)
+                    if self.backfill_checkpoint
+                    else None
+                ),
+            )
+
+            async def handle_replay(tx: dict, sig) -> None:  # noqa: ANN001
+                logs = (
+                    tx.get("meta", {})
+                    .get("logMessages", [])
+                    if isinstance(tx, dict)
+                    else []
+                )
+                parsed = self.platform_implementations.event_parser.parse_token_creation_from_logs(
+                    logs, str(sig)
+                )
+                if not parsed:
+                    return
+                token_info = parsed[0] if isinstance(parsed, list) else parsed
+                token_key = str(token_info.mint)
+                if token_key in self.processed_tokens:
+                    return
+                if self._skip_reason(token_info):
+                    return
+                self.processed_tokens.add(token_key)
+                self.token_timestamps[token_key] = monotonic()
+                await self.token_queue.put(token_info)
+                logger.info(
+                    f"Backfill: replayed {token_info.symbol} ({token_info.mint})"
+                )
+
+            await crawler.crawl(
+                parser=self.platform_implementations.event_parser,
+                handle_transaction=handle_replay,
+                max_pages=self.backfill_max_pages,
+            )
+        except Exception:
+            logger.exception("Backfill failed; continuing without catch-up")
 
     async def _wait_for_token(self) -> TokenInfo | None:
         """Wait for a single token to be detected."""
@@ -859,6 +1188,23 @@ class UniversalTrader:
             )
         ):
             return f"creator {token_info.creator or token_info.user} is blocked"
+        # P2-STRUC-2: creator whose realized net PnL is non-positive over
+        # enough trades goes on the persistent skip list. Only consulted when
+        # the feature is enabled (store exists); a missing store fails open.
+        if self.creator_pnl_store is not None:
+            creator = str(token_info.creator or "") or (
+                str(token_info.user) if token_info.user else ""
+            )
+            if creator and self.creator_pnl_store.is_blacklisted(
+                creator,
+                min_trades=self.creator_pnl_min_trades,
+                max_net_sol=self.creator_pnl_max_net_sol,
+            ):
+                trades, net = self.creator_pnl_store.get_stats(creator)
+                return (
+                    f"creator {creator} on PnL blacklist "
+                    f"({trades} trades, net {net:.4f} SOL)"
+                )
         if self.allowed_quote_mints is not None and quote_mint not in self.allowed_quote_mints:
             return f"quote mint {quote_mint} not in allowed_quote_mints"
         if quote_mint not in self.quote_amounts:
@@ -940,6 +1286,20 @@ class UniversalTrader:
                     f"curve progress {progress_sol:.6f} SOL below "
                     f"min_curve_progress_sol {self.min_curve_progress_sol}"
                 )
+
+            # T2.5 honeypot gates: freeze authority + curve supply-hold ratio.
+            # Uses the state already fetched above (no extra curve RPC); the
+            # mint read is the one additional call, only when enabled.
+            if self.honeypot_freeze_authority or self.min_curve_hold_fraction > 0:
+                honeypot_reason = await honeypot_reason(
+                    self.solana_client,
+                    token_info,
+                    state,
+                    check_freeze_authority=self.honeypot_freeze_authority,
+                    min_curve_hold_fraction=self.min_curve_hold_fraction,
+                )
+                if honeypot_reason:
+                    return honeypot_reason
         except Exception:
             logger.exception("Curve gate check failed")
             if getattr(self, "fail_closed_gates", True):
@@ -983,6 +1343,28 @@ class UniversalTrader:
                 if curve_gate_reason:
                     logger.info(f"Skipping {token_info.symbol} - {curve_gate_reason}")
                     return
+
+                # T2.4: confirmation window. A single gate pass can be a
+                # transient RPC blip; require consecutive_match_count
+                # consecutive passes (1 = current behavior) at
+                # gate_recheck_interval apart before committing the buy.
+                if self.consecutive_match_count > 1:
+                    for recheck in range(1, self.consecutive_match_count):
+                        await asyncio.sleep(self.gate_recheck_interval)
+                        curve_gate_reason = await self._curve_gate_reason(
+                            token_info
+                        )
+                        if curve_gate_reason:
+                            logger.info(
+                                f"Skipping {token_info.symbol} - "
+                                f"{curve_gate_reason} (confirmation recheck "
+                                f"{recheck}/{self.consecutive_match_count - 1})"
+                            )
+                            return
+                    logger.info(
+                        f"Gate confirmation ok for {token_info.symbol} "
+                        f"({self.consecutive_match_count} consecutive passes)"
+                    )
 
             # Buy token
             logger.info(
@@ -1054,6 +1436,49 @@ class UniversalTrader:
             ),
         )
         self.traded_mints.add(token_info.mint)
+        # P2-EXIT-4: capture entry slot + pool depth right after the buy so
+        # the rug heuristic has a baseline. Only when enabled (feature off =
+        # zero extra RPC).
+        if self.rug_heuristics_enabled:
+            try:
+                entry_slot = await self.solana_client.get_slot()
+                if entry_slot is None:
+                    logger.warning(
+                        "Rug heuristics: entry slot unavailable; "
+                        "drain/buyer tests cannot baseline"
+                    )
+                depth_lamports = 0.0
+                implementations = get_platform_implementations(
+                    token_info.platform, self.solana_client
+                )
+                pool_address = (
+                    token_info.bonding_curve
+                    or token_info.pool_state
+                    or (
+                        implementations.address_provider.derive_pool_address(
+                            token_info.mint
+                        )
+                    )
+                )
+                try:
+                    state = await implementations.curve_manager.get_pool_state(
+                        pool_address
+                    )
+                    depth_lamports = max(
+                        state.get("real_quote_reserves", 0) or 0,
+                        state.get("virtual_quote_reserves", 0) or 0,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Rug heuristics: entry depth unavailable"
+                    )
+                if entry_slot is not None:
+                    self._rug_entry[str(token_info.mint)] = (
+                        entry_slot,
+                        depth_lamports,
+                    )
+            except Exception:
+                logger.exception("Rug heuristics entry capture failed")
         # Track token program for cleanup
         mint_str = str(token_info.mint)
         if token_info.token_program_id:
@@ -1313,6 +1738,39 @@ class UniversalTrader:
         )
         return ExitSellVerdict.STOP
 
+    async def _check_depth_floor(self, token_info: TokenInfo) -> str | None:
+        """P2-EXIT-1: reason to force-exit for shallow pool depth, or None.
+
+        Reads the pool's real quote reserves (already TTL-cached by the
+        price read moments earlier) and compares against
+        ``min_pool_depth_sol``. None when the pool is deep enough, when the
+        depth is unknown (fail-open), or when the feature is off.
+        """
+        if self.min_pool_depth_sol <= 0:
+            return None
+        try:
+            implementations = self.platform_implementations
+            state = await implementations.curve_manager.get_pool_state(
+                self._get_pool_address(token_info)
+            )
+            real_quote = state.get("real_quote_reserves", 0) or 0
+            virtual_quote = state.get("virtual_quote_reserves", 0) or 0
+            depth_lamports = max(real_quote, virtual_quote)
+            if depth_lamports <= 0:
+                # Graduated or unmappable pool: not a curve-depth case. The
+                # AMM pool has its own liquidity; don't force-exit on this.
+                return None
+            depth_sol = depth_lamports / 1e9
+            if depth_sol < self.min_pool_depth_sol:
+                return (
+                    f"pool depth {depth_sol:.6f} SOL < "
+                    f"min_pool_depth_sol {self.min_pool_depth_sol}"
+                )
+        except Exception:
+            logger.exception("Depth-floor check failed (fail-open)")
+            return None
+        return None
+
     async def _read_price(self, token_info: TokenInfo) -> float:
         """The coin's price where it trades now: its curve, or after graduation its AMM pool.
 
@@ -1366,6 +1824,59 @@ class UniversalTrader:
         )
         return fallback
 
+    async def _check_rug_signal(self, token_info: TokenInfo) -> str | None:
+        """P2-EXIT-4: rug-heuristic reason to force-exit, or None.
+
+        Compares the current slot + pool depth against the entry baseline
+        captured at buy time. The unique-buyer half uses the trade-feed
+        counter (may be empty if the listener has no trade feed — then only
+        the drain half can fire). Fails open on any missing data.
+        """
+        if not self.rug_heuristics_enabled:
+            return None
+        mint_key = str(token_info.mint)
+        entry = self._rug_entry.get(mint_key)
+        if entry is None:
+            return None  # no baseline (entry capture failed) -> fail open
+        entry_slot, entry_depth = entry
+        try:
+            from screening.rug_heuristics import RugContext, rug_exit_reason
+
+            current_slot = await self.solana_client.get_slot()
+            implementations = get_platform_implementations(
+                token_info.platform, self.solana_client
+            )
+            pool_address = (
+                token_info.bonding_curve
+                or token_info.pool_state
+                or implementations.address_provider.derive_pool_address(
+                    token_info.mint
+                )
+            )
+            state = await implementations.curve_manager.get_pool_state(
+                pool_address
+            )
+            current_depth = max(
+                state.get("real_quote_reserves", 0) or 0,
+                state.get("virtual_quote_reserves", 0) or 0,
+            )
+            ctx = RugContext(
+                entry_slot=entry_slot,
+                unique_buyers=len(self._rug_buyers.get(mint_key, set())),
+                entry_real_quote_lamports=entry_depth,
+            )
+            return rug_exit_reason(
+                ctx,
+                current_slot,
+                current_depth,
+                min_unique_buyers=self.rug_min_unique_buyers,
+                check_slots=self.rug_check_slots,
+                early_drain_ratio=self.rug_early_drain_ratio,
+            )
+        except Exception:
+            logger.exception("Rug-heuristic check failed (fail-open)")
+            return None
+
     async def _monitor_position_until_exit(
         self, token_info: TokenInfo, position: Position
     ) -> None:
@@ -1394,8 +1905,58 @@ class UniversalTrader:
                 if current_price > 0:
                     last_known_price = current_price
 
+                # P2-EXIT-1: absolute depth-floor forced exit. When the pool
+                # can no longer absorb a full unwind within the slippage
+                # budget, waiting for TP/SL is worse than exiting now — the
+                # depth only shrinks from here. Off by default.
+                if self.min_pool_depth_sol > 0:
+                    depth_exit = await self._check_depth_floor(token_info)
+                    if depth_exit:
+                        logger.warning(
+                            f"Liquidity exit for {token_info.symbol}: "
+                            f"{depth_exit} (min_pool_depth_sol "
+                            f"{self.min_pool_depth_sol})"
+                        )
+                        exit_reason = ExitReason.LIQUIDITY
+                        exit_price = (
+                            current_price if current_price > 0 else last_known_price
+                        )
+                        exit_sell_attempts += 1
+                        if await self._run_exit_attempt(
+                            token_info,
+                            position,
+                            exit_reason,
+                            exit_price,
+                            exit_sell_attempts,
+                        ):
+                            break
+                        continue
+
                 # Check if position should be exited
                 should_exit, exit_reason = position.should_exit(current_price)
+
+                if self.rug_heuristics_enabled:
+                    rug_reason = await self._check_rug_signal(token_info)
+                    if rug_reason:
+                        logger.warning(
+                            f"Rug exit for {token_info.symbol}: {rug_reason}"
+                        )
+                        exit_reason = ExitReason.RUG
+                        exit_price = (
+                            current_price
+                            if current_price > 0
+                            else last_known_price
+                        )
+                        exit_sell_attempts += 1
+                        if await self._run_exit_attempt(
+                            token_info,
+                            position,
+                            exit_reason,
+                            exit_price,
+                            exit_sell_attempts,
+                        ):
+                            break
+                        continue
 
                 if should_exit and exit_reason:
                     logger.info(f"Exit condition met: {exit_reason.value}")
@@ -1687,6 +2248,25 @@ class UniversalTrader:
                 f"({final_pnl['unrealized_pnl_quote']:.6f} "
                 f"{quote_symbol(normalize_quote_mint(token_info.quote_mint))})"
             )
+
+            # P2-STRUC-2: feed the creator-PnL ledger. Recorded only for
+            # SOL-paired coins (the ledger's PnL is SOL-denominated) and only
+            # when the store exists (feature enabled). A missing creator
+            # (fails the trade ledger too) is skipped, never fatal.
+            if self.creator_pnl_store is not None:
+                creator = str(token_info.creator or "") or (
+                    str(token_info.user) if token_info.user else ""
+                )
+                if creator and normalize_quote_mint(
+                    token_info.quote_mint
+                ) == WSOL_MINT:
+                    try:
+                        self.creator_pnl_store.record_trade(
+                            creator,
+                            float(final_pnl.get("unrealized_pnl_quote", 0.0)),
+                        )
+                    except Exception:
+                        logger.exception("creator PnL record failed")
             await self._cleanup_after_exit(token_info)
             return ExitSellVerdict.SOLD
 

@@ -171,6 +171,11 @@ def _make_trader(
     trader.price_check_interval = price_check_interval
     trader.max_exit_sell_attempts = MAX_EXIT_SELL_ATTEMPTS
     trader.shadow_mode = False
+    trader.min_pool_depth_sol = 0.0  # P2-EXIT-1 off in verifiers
+    trader.rug_heuristics_enabled = False  # P2-EXIT-4 off
+    trader._rug_entry = {}  # noqa: SLF001
+    trader._rug_buyers = {}  # noqa: SLF001
+    trader.creator_pnl_store = None  # P2-STRUC-2 feature off
     trader.platform_implementations = SimpleNamespace(
         curve_manager=curve_manager, address_provider=None
     )

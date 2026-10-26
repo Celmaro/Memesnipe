@@ -375,7 +375,16 @@ def check_e_seller_routes_to_market() -> bool:
     """E: graduated -> market sell with fee- and tax-net floor; not ready -> nothing sent."""
     ready = _Market(ready=True)
     _, client = _sell(ready)
-    expected = int(1_000_000 * (1 - 0.01) * 0.00000005 * (1 - 0.0125) * (1 - 0.2) * 1e9)
+    # Floor = tokens * (1 - transfer 1%) * price * (1 - curve 1.25%)
+    #        * (1 - slippage 20%) * (1 - sell inflation 10bps)  [P2-EXIT-3]
+    expected = int(
+        1_000_000
+        * (1 - 0.01)
+        * 0.00000005
+        * (1 - 0.0125)
+        * (1 - 0.2 - 10 / 10_000)  # P2-EXIT-3 additive sell inflation 10bps
+        * 1e9
+    )
     routed = (
         client.sent == [["market-sell"]]
         and abs((ready.minimum_out or 0) - expected) <= 1

@@ -117,6 +117,20 @@ class PumpFunEventParser(EventParser):
             "MigrateBondingCurveCreatorEvent"
         )
 
+        # T3.2: TradeEvent discriminator for leader-buy detection.
+        self._trade_event_discriminator_bytes = event_discriminators.get(
+            "TradeEvent"
+        )
+        self._trade_event_discriminator = (
+            struct.unpack("<Q", self._trade_event_discriminator_bytes)[0]
+            if self._trade_event_discriminator_bytes
+            else None
+        )
+        logger.info(
+            f"TradeEvent discriminator: "
+            f"{self._trade_event_discriminator_bytes.hex() if self._trade_event_discriminator_bytes else 'missing'}"
+        )
+
         instruction_discriminators = self._idl_parser.get_instruction_discriminators()
         self._create_instruction_discriminator_bytes = instruction_discriminators[
             "create"
@@ -148,6 +162,83 @@ class PumpFunEventParser(EventParser):
             logger.info(
                 f"create_v2 instruction discriminator: {self._create_v2_instruction_discriminator_bytes.hex()}"
             )
+
+    def parse_trade_event_from_logs(
+        self, logs: list[str]
+    ) -> dict[str, Any] | None:
+        """Decode a pump.fun TradeEvent from transaction logs (T3.2).
+
+        Finds the first ``Program data:`` log whose discriminator matches the
+        IDL's TradeEvent, then decodes the fields via the IDL parser.
+
+        Args:
+            logs: List of log strings from a transaction
+
+        Returns:
+            Dict with ``trader`` (Pubkey str), ``mint`` (Pubkey str),
+            ``is_buy`` (bool), ``amount`` (raw token units str),
+            ``sol_amount``, ``quote_amount``, ``fee_basis_points``,
+            ``creator``, ``mayhem_mode``, ``quote_mint``, ``timestamp`` and
+            ``event_name``, or None when absent/unreadable.
+        """
+        if self._trade_event_discriminator is None:
+            return None
+        from_program = self._emitted_by_program(logs)
+        for i, log in enumerate(logs):
+            if "Program data:" not in log:
+                continue
+            if from_program is not None and not from_program[i]:
+                continue
+            try:
+                encoded = log.split("Program data: ", 1)[1].strip()
+                decoded = base64.b64decode(encoded)
+                if len(decoded) < 8:
+                    continue
+                discriminator = struct.unpack("<Q", decoded[:8])[0]
+                if discriminator != self._trade_event_discriminator:
+                    continue
+                event = self._idl_parser.decode_event_data(decoded, "TradeEvent")
+                if not event:
+                    continue
+                fields = event.get("fields", {})
+                if not fields:
+                    continue
+                return self._trade_event_to_dict(fields, event)
+            except Exception:
+                logger.debug(
+                    f"TradeEvent decode failed at log {i}: {log[:80]}",
+                    exc_info=True,
+                )
+        return None
+
+    @staticmethod
+    def _trade_event_to_dict(fields: dict, event: dict) -> dict:
+        """Map a decoded TradeEvent's fields to the stable copy-engine shape.
+
+        The IDL names the trader wallet ``user``; older code and the copy
+        engine use ``trader``, so both are emitted. Fees and quote data are
+        surfaced raw (bps and raw units) for the engine's sizing gates.
+        """
+        return {
+            "event_name": event.get("event_name", "TradeEvent"),
+            "trader": str(fields.get("user", "")),
+            "user": str(fields.get("user", "")),
+            "mint": str(fields.get("mint", "")),
+            "is_buy": bool(fields.get("is_buy", False)),
+            "amount": str(fields.get("token_amount", "0")),
+            "sol_amount": str(fields.get("sol_amount", "0")),
+            "quote_amount": str(fields.get("quote_amount", "0")),
+            "token_amount": str(fields.get("token_amount", "0")),
+            "fee_basis_points": fields.get("fee_basis_points", 0),
+            "fee": str(fields.get("fee", "0")),
+            "creator": str(fields.get("creator", "")),
+            "creator_fee_basis_points": fields.get(
+                "creator_fee_basis_points", 0
+            ),
+            "mayhem_mode": bool(fields.get("mayhem_mode", False)),
+            "quote_mint": str(fields.get("quote_mint", "")),
+            "timestamp": fields.get("timestamp"),
+        }
 
     @property
     def platform(self) -> Platform:
@@ -683,21 +774,41 @@ class PumpFunEventParser(EventParser):
             if msg is None:
                 return None
 
+            account_keys = msg.account_keys
+
             for ix in msg.instructions:
                 # Skip non-pump.fun program instructions
                 program_idx = ix.program_id_index
-                if program_idx >= len(msg.account_keys):
+                if program_idx >= len(account_keys):
                     continue
 
-                program_id = msg.account_keys[program_idx]
+                program_id = account_keys[program_idx]
                 if bytes(program_id) != bytes(self.get_program_id()):
                     continue
 
                 token_info = self.parse_token_creation_from_instruction(
-                    ix.data, ix.accounts, msg.account_keys
+                    ix.data, ix.accounts, account_keys
                 )
                 if token_info:
                     return token_info
+
+            # T2.3: a coin created through a router reaches pump.fun as a CPI,
+            # absent from top-level instructions. Walk inner instructions
+            # (same account-key table) before giving up.
+            inner_instructions = getattr(meta, "inner_instructions", None) or []
+            for inner_set in inner_instructions:
+                for ix in getattr(inner_set, "instructions", []) or []:
+                    program_idx = ix.program_id_index
+                    if program_idx >= len(account_keys):
+                        continue
+                    program_id = account_keys[program_idx]
+                    if bytes(program_id) != bytes(self.get_program_id()):
+                        continue
+                    token_info = self.parse_token_creation_from_instruction(
+                        ix.data, ix.accounts, account_keys
+                    )
+                    if token_info:
+                        return token_info
 
             return None
 

@@ -1,4 +1,5 @@
 import statistics
+import time
 
 from solders.pubkey import Pubkey
 
@@ -10,15 +11,24 @@ logger = get_logger(__name__)
 
 
 class DynamicPriorityFee(PriorityFeePlugin):
-    """Dynamic priority fee plugin using getRecentPrioritizationFees."""
+    """Dynamic priority fee plugin using getRecentPrioritizationFees.
 
-    def __init__(self, client: SolanaClient):
+    The RPC call is cached for `cache_ttl` seconds, keyed on the accounts
+    list, so an in-place auction (T1.4) can re-price inside the race window
+    without paying a 60-250ms RPC round-trip per buy: the first buy samples,
+    subsequent buys within the TTL reuse the sample.
+    """
+
+    def __init__(self, client: SolanaClient, cache_ttl: float = 2.0):
         """Initialize the dynamic fee plugin.
 
         Args:
             client: Solana RPC client for network requests.
+            cache_ttl: Seconds to reuse a sampled fee before re-sampling.
         """
         self.client = client
+        self.cache_ttl = cache_ttl
+        self._cache: tuple[float, tuple[str, ...], int | None] | None = None
 
     async def get_priority_fee(
         self, accounts: list[Pubkey] | None = None
@@ -32,6 +42,21 @@ class DynamicPriorityFee(PriorityFeePlugin):
         Returns:
             Optional[int]: Median priority fee in microlamports, or None if the request fails.
         """
+        key: tuple[str, ...] = tuple(
+            str(account) for account in accounts
+        ) if accounts else ()
+        now = time.monotonic()
+
+        if self._cache is not None:
+            cached_at, cache_key, cached_fee = self._cache
+            if key == cache_key and (now - cached_at) < self.cache_ttl:
+                return cached_fee
+
+        fee = await self._fetch_fee(accounts)
+        self._cache = (now, key, fee)
+        return fee
+
+    async def _fetch_fee(self, accounts: list[Pubkey] | None = None) -> int | None:
         try:
             body = {
                 "jsonrpc": "2.0",
