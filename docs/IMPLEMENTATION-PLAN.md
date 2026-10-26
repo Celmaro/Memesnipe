@@ -328,3 +328,69 @@ CONSECUTIVE_FILTER_MATCHES and the Jito executor already does endpoint fan-out
 1. Commit Phase 0 local fixes (gate guard, x-token, retry keys, config) + push.
 2. Pick Phase 1 position size: **0.01 SOL (audit)**, 0.005 SOL (conservative), or keep 0.0001 temporarily.
 3. Pick exit strategy for the default config: `tp_sl` (audit trial) vs hardened `time_based`.
+
+---
+
+## Round-3 FULL RE-AUDIT (2026-10-26) — everything re-checked, don't-just-assume edition
+
+Method (evidence-based, per user "recheck ALL the repos / the TWO audits / ALL the articles. Research internet. DOnt just assume."):
+
+- **Repos re-examined: all 20** (round-1 12 + round-2 8). 9 parallel subagents + local deep-dives on the rate-limited repos (pump-fun-sdk, sol-trade-sdk, solana-trading-bot, solana-defi/alpamayo, open-sol-bot). 2 confirmed README-only scam (Free-Solana-Sniper-Memecoins-Bot-2026 funnels to meme-snipe.com phishing; Trpjan-solana-trading-toolkit = zero code). 18 substantive.
+- **The two audits re-read from the original attachments** and re-verified claim-by-claim against current code (most P0/P1 items are DONE; the remaining gaps are listed below).
+- **Articles re-pulled** (orbitalflare, bolttx, allenhark, yavorovych medium) + arxiv 2608.20271 + bitquery investigations.
+- **Internet research** on Mayhem Mode, sandwich/MEV (DontFront), holder-concentration rules of thumb.
+- **Full local audit** of the bot: module tree, dead-code, config, exit/monitor paths, copy engine, capture ledger.
+
+Classification: **[NEW]** = not in Memesnipe at all · **[PARTIAL]** = exists in some form but the reference is sharper · **[VERIFY]** = Memesnipe claims it, must be proven against v3 docs.
+
+### Priority-0 (live-money safety / correctness)
+
+| # | Item | Source (file:line) | Type | Plan |
+|---|---|---|---|---|
+| R3-P0-1 | **Dynamic fee tiers are market-cap-scaled, not flat** | pump-fun-sdk `docs/pump-official/FEE_PROGRAM_README.md`: `computeFeesBps` → `calculateFeeTier(feeTiers, bondingCurveMarketCap)` where MC = `virtualSol·mintSupply/virtualToken`. Post-2026-09-01 fee program | VERIFY | Re-verify `curve_manager` reads the **live `fee_config` account** and applies tiered bps by MC on every quote (not cached flat). P2-FEE-1 landed; this is the "is it actually current" check. Add a verifier that feeds a tiered `fee_config` and asserts the quoted fees match the tier table by MC band. |
+| R3-P0-2 | **Mayhem Mode coins are a distinct asset class** | bitquery investigation (`pump-fun-mayhem-mode`): agent mints +1B supply (2B total), trades randomly 24h; **1 in 50 graduations fills the pool**; traders as a group lose. Memesnipe surfaces `is_mayhem_mode` (`event_parser`, `TokenInfo.is_mayhem_mode`) but has **no strategy handling** | NEW | Add `filters.mayhem_mode: trade|skip` (default `trade` = current behavior unchanged). When `skip`, `_skip_reason` rejects mayhem coins with a clear skip_reason for the research ledger. When trading, apply a tighter `max_market_cap_sol` cap and a 15s hold TTL (mayhem coins swing hard on the randomized agent). Verifier proves the skip path and that the fee-recipient difference is preserved. |
+| R3-P0-3 | **Holder-rewards coins change dev incentives** | pump-fun-sdk `docs/pump-official/HOLDER_REWARDS_README.md`: `create_v2` trailing `is_holder_reward`; creator fee goes to holders; `is_cashback_enabled` must be false (cashback **deprecated**, `create_v2` rejects it). `BondingCurve.creator` still routes fee, `creator_vault` unchanged | PARTIAL (parse) | Memesnipe parses `is_holder_reward` on events but has no policy. Add `filters.holder_reward_mode: trade|skip` (default trade) + log/ledger field. Document that the old cashback claim cookbook is legacy-only (grandfathered coins). |
+
+### Priority-1 (strategy correctness / edge)
+
+| # | Item | Source | Type | Plan |
+|---|---|---|---|---|
+| R3-P1-1 | **Execution-ledger net-metrics module** | Audit #1 §6 (build execution ledger: PnL/trade, profit factor, drawdown, fill rate, median hold, % unsellable); audit #2 diagnostic scripts; confirmed ABSENT from Memesnipe (no profit_factor/drawdown/fill_rate anywhere) | NEW | `src/research/net_metrics.py` — read `shadow_data/*.jsonl` (and real `trades/` when armed), compute the audit's metric set, emit a report after each session. Verifier: feed a small captured ledger, assert computed PnL/PP/drawdown. |
+| R3-P1-2 | **Staged TP/SL (range-based partial exits)** | allenhark MC-breakout docs: `sell_strategy.tp_ranges` / `sl_ranges` — sell a share per step up (TP) / per step down (protect-gains), everything at band bottom; a range start==end is a single sell and still fires if price jumps past | NEW | `trade.tp_ranges: [{from_pct, to_pct, step, share}]` + `sl_ranges` (0 = current single TP/SL unchanged). Monitor loop computes partial-sell sizes; engine mirrors via existing sell path. Disabled-first (0 = off). Verifier: range math + jump-past behavior. |
+| R3-P1-3 | **Aggregator sell fallback (Jupiter) when the pool is gone / won't take the sell** | allenhark docs `exits.aggregator_fallback` + `aggregator_slippage_bps` (500 = 5%) + `aggregator_max_price_impact_pct`; bolttx "no-fill / pool gone" failure mode | NEW | `trade.aggregator_fallback: false` (default off). When the platform sell path returns pool-gone/liquidity error and the flag is on, route through Jupiter `swap` with quoted slippage cap. Needs a Jupiter quote/send client (`src/execution/jupiter_client.py`). Verifier: mock Jupiter quote + failure-path selection. |
+| R3-P1-4 | **Sell-when-creator-sells exit** | allenhark docs `exit_on_creator_sell` (not set by default) | NEW | `filters.exit_on_creator_sell: false`. Monitor loop watches listener trade feed for a sell from `token_info.creator` (pump.fun creator vault / creator wallet); force-exit on trigger. Reuses `_init_rug_trade_feed` buyer/seller counting. Verifier: feed creator sell event → exit_reason fires. |
+| R3-P1-5 | **Holder-concentration gate (top-N share + unique-holder floor)** | solanatools 2026 playbook: <300 holders in 5 min = sniper-only; top-10 >50% supply = distribution risk. arxiv 2608.20271: early trades (unique traders, buy/sell ratio, big buys ≥1 SOL, dev trades) from first 5 min predict rugs; XGBoost + multi-source fusion best | NEW | `filters.min_unique_holders`, `filters.max_top10_concentration` (0 = off). Background holder-snapshot refresher (mirrors sol-trade-sdk pre-buy risk gate pattern — see R3-P2-1): a periodic `getTokenLargestAccounts` pull publishing an immutable snapshot; `_skip_reason` does a local hash lookup, never RPC on the hot path. Verifier: concentration math + fail-open on stale snapshot. |
+| R3-P1-6 | **Anti-bundler extreme-fast calibration** | Audit #2 §2.1 table: at block-0, 0.1 SOL buys 3.56M tokens (clean) vs 2.62M (5 SOL dev bundle). Set `extreme_fast_token_amount` + slippage so a >2.5 SOL dev bundle reverts on-chain | PARTIAL | When/if `extreme_fast_mode` is ever enabled, ship the calibrated pairs table in `bots/README` + a config validator asserting the pair is internally consistent (amount × price ≤ max MC). No code change needed now; document + verifier. |
+
+### Priority-2 (structural / infra / edge)
+
+| # | Item | Source | Type | Plan |
+|---|---|---|---|---|
+| R3-P2-1 | **Pre-buy risk gate (synchronous local-snapshot, background-refreshed)** | sol-trade-sdk `docs/PRE_BUY_RISK_GATE.md` + `LOW_LATENCY_BOTS.md`: gate runs after validation, before build/sign; risk data fetched in background into an immutable snapshot (arc-swap); **never RPC from the gate** | PARTIAL | Refactor `_skip_reason`/`_curve_gate_reason` toward snapshot-backed lookups (creator-PnL store, holder concentration, honeypot cache) where the data refreshes off the hot path. Keep async curve reads for live state. Disabled-first; verifier proves the gate is sync-lookup with no RPC when snapshots are warm. |
+| R3-P2-2 | **Durable nonce pool** | sol-trade-sdk `docs/NONCE_CACHE.md`: replay protection, extended validity, offline pre-signed txs | NEW | `trade.use_durable_nonce: false`. Optional nonce account pair (advance authorized + nonce) used when set; extends the blockhash window beyond 150 blocks and prevents signature replay. Verifier: nonce-account tx layout. |
+| R3-P2-3 | **Address Lookup Tables (ALTs)** | sol-trade-sdk `docs/ADDRESS_LOOKUP_TABLE.md`: smaller txs, lower fees, faster validation | NEW | Optional `trade.alt_addresses: []`. When set, compress static keys into a versioned tx with ALTs (used on the buy path). Verifier: tx builds with ALT and identical instruction data. |
+| R3-P2-4 | **SWQoS / multi-provider tip capture + fee ground truth** | sol-parser-sdk `src/transaction_cost.rs:255-279,402-451`: confirmation-gated cost parse across 17 tip-account providers; carbon pump-fees decoder | NEW (research) | Port the tip-account registry into research capture (`shadow_capture.sim_close` gains paid_fee_sol from parsed cost when available) to feed the dynamic fee auction with observed ground truth. Disabled-first; verifier on the cost parser. |
+| R3-P2-5 | **PumpSwap graduation watcher (migrate instruction)** | audit #1 copy-trader gap ("cookbook watcher explicitly excludes PumpSwap"); solana-defi `Shredstream/Pumpfun/stream_pumpfun_to_pump_swap_amm_migration_transactions` detects `migrate` real-time; bolttx "graduation events" as a signal | PARTIAL | Copy-trader engine already tracks graduated sells (`pumpswap_market`), but the wallet-trades watcher misses post-graduation. Add a `migrate`-event flag on the watcher + copy feed so a leader's post-graduation exit is seen. Verifier: migration event → watcher state. |
+| R3-P2-6 | **Sandwich/MEV protection (DontFront) on real mode** | solana.com MEV docs; bitquery sandwich investigation ($29.7M taken; 1-3% slippage is the room bots use; 39% of take from bot wallets); Memesnipe present: jito + tight slippage; absent: DontFront/DCA shield | NEW (real-mode) | `jito.dontfront: false`. When real mode is armed, optionally route through Jito DontFront RPC (`mainnet.block-engine.jito.wtf` DontFront variant) for buy/sell. Shadow-mode unaffected. Verifier: executor selection with flag. |
+| R3-P2-7 | **Cross-window (24h/7d/30d) leaderboard qualification** | audit #1 §5 qualification table ("simultaneous presence in 24h/7d/30d leaderboards as a candidate filter") | PARTIAL | `gmgn_profiler` currently reads single-window profile payload. Add 7d/30d window fetch + keep-all-windows-positive qualification in `copy_trader/qualification.py` `qualify_leader` (already has drift + min-trades). Verifier: 7d-negative rejects. |
+| R3-P2-8 | **Metadata socials gate (≥1 non-empty metadata extensions entry)** | solana-trading-bot-v3 `filters/mutable.filter.ts:61-65` (task-1 subagent verified absent in Memesnipe); honeypot.py already notes the mutable-metadata check "needs its own decoder" | NEW | `filters.min_metadata_extensions: 0`. When >0, `_skip_reason` requires ≥1 non-empty metadata `extensions` entry (metadata account read off hot path via background refresher). Verifier: metadata with zero extensions rejected when enabled. |
+| R3-P2-9 | **Consensus-reset filter semantics** | solana-trading-bot-v3 `bot.ts:357-391` + README:100-101: on any failed check `matchCount` resets to 0; only N **consecutive** passes allow the buy (stale-filter guard) | VERIFY | Check `consecutive_match_count` implementation resets on failure. If it does not (or if a failed gate is sticky), port the reset-on-failure semantics. Verifier: fail-then-pass sequence requires N fresh passes. |
+| R3-P2-10 | **Daily-loss / budget / max-concurrent guards** | allenhark docs: `global.daily_loss_limit_sol`, `global.budget_sol`, `global.max_concurrent_tokens` | NEW | `risk.max_concurrent_positions: 1`, `risk.daily_loss_limit_sol: 0` (0 = off), `risk.budget_sol: 0` (0 = off). Tracker + gate in `_handle_token`/monitor. Disabled-first. Verifier: loss-limit blocks new buys, sells continue. |
+
+### Round-3 RISKS — explicitly NOT to copy (evidence)
+
+- **Free-Solana-Sniper-Memecoins-Bot-2026 / meme-snipe.com** — README-only bait; third-party phishing verdict; funnel asks users to send SOL. Nothing to adopt. (task-8 verified)
+- **Trpjan-solana-trading-toolkit** — zero code, marketing pitch. Nothing to adopt.
+- **Solana_Memecoin_Sniper_Bot FE** — sends `privateKey` to a backend `/wallet/privatekey` endpoint = key-custody honeypot (task-1 verified). Memesnipe `.env`-only is correct.
+- **carbon (7Labs)** — real indexer framework but Rust/tokio/mpsc/Postgres/GraphQL is overkill for an asyncio sniper; port ideas (fee decoder, pipeline metrics), not code.
+- **warp-id "snipe-list" / hosted relay** — third-party unsigned-tx relay (trust/MEV-leak vector), keep out.
+- **alpamayo self-hosted RPC stack** — heavy infra; only the frozen-data backfill angle transfers, and Memesnipe's `transaction_crawler` already covers it.
+- **Pre-send simulation on the hot path** — pump-fun-sdk FAQ explicitly says static CU 100k beats per-tx simulation because simulation adds slippage risk on snipes; Memesnipe's static CU default is correct.
+- **Mayhem "free volume" selling** — a mayhem coin's 24h AI agent is randomized and the pump bot is *not* a directional edge; do not build a "trade the agent" strategy.
+
+### Verification protocol (unchanged, updated count)
+1. `uv run tests/regression/run_all.py` → 51/51 today; each R3 item adds a verifier; target stays green before any merge.
+2. Config dry-run (`load_bot_config` + `resolve_env_vars` + `validate_config`) every change.
+3. Live test only with explicit user approval + stated expected cost + burner wallet + `enabled: true` for one session, then back to `enabled: false`.
+4. Shadow mode stays ON for all of R3 implementation; real-mode-only items (DontFront, ALTs, durable nonce) ship disabled and are only ever enabled by explicit user approval.
+5. Commit + push per item; never push secrets (`.env` ignored, `state/` ignored, `shadow_data/` ignored).
