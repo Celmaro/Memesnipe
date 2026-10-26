@@ -47,6 +47,18 @@ class RiskTracker:
         self.realized_pnl_sol += realized_pnl_sol
         self.history.append(f"close {realized_pnl_sol:+.6f}")
 
+    def record_spend(self, quote_spent_sol: float) -> None:
+        """Register quote spent WITHOUT opening a tracked position.
+
+        Bumped for mirror (copy-trader) buys: they spend the wallet's SOL so
+        they must count toward ``budget_sol``, but the exit machinery never
+        closes them, so they must not inflate ``open_positions`` (that would
+        wedge ``max_concurrent_positions`` forever). Mirrors are still gated
+        by ``buy_allowed`` first — the loss limit and budget apply to copies.
+        """
+        self.session_spend_sol += quote_spent_sol
+        self.history.append(f"mirror-spend {quote_spent_sol:.6f}")
+
     def _block_reason(self) -> str | None:
         if self.max_concurrent_positions > 0 and (
             self.open_positions >= self.max_concurrent_positions

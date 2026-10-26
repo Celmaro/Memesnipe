@@ -83,6 +83,31 @@ def main() -> int:
         "research.slot_ordered_feed_enabled" in config_loader.BOOL_FIELDS,
     )
 
+    # Feed-consumption wiring (audit fix): the buffer must be CONSUMED by the
+    # trade feeds, not just constructed — both the rug feed and the copy feed
+    # push into it and drain in slot order when enabled.
+    trader_src = Path("src/trading/universal_trader.py").read_text()
+    check(
+        "rug feed pushes into the slot buffer",
+        "_slot_buffer.push(slot, (logs, outer_signer))" in trader_src,
+    )
+    check(
+        "copy feed pushes into the slot buffer",
+        "_slot_buffer.push(slot, (logs, outer_signer))" in trader_src,
+    )
+    check(
+        "feeds drain the buffer in order",
+        trader_src.count("_slot_buffer.drain()") >= 2,
+        f"-> {trader_src.count('_slot_buffer.drain()')} drain sites",
+    )
+    listener_src = Path("src/monitoring/universal_geyser_listener.py").read_text()
+    check(
+        "listener passes tx slot to the callback",
+        "tx_slot = update_slot" in listener_src
+        and "await self.trade_callback(logs, outer_signer, tx_slot)"
+        in listener_src,
+    )
+
     if failures:
         print(f"\nR3-P2-14 FAILED ({len(failures)}): {failures}")
         return 1

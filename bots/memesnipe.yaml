@@ -164,6 +164,14 @@ jito:
   # variant (sandwich protection). Shadow mode unaffected.
   dontfront: false
 
+# R3-P2-10: session risk guards (0 = off). The loss limit blocks NEW buys
+# while sells still run — it never traps money in a falling position.
+risk:
+  max_concurrent_positions: 1 # cap open positions (default 1 keeps the
+    # single-token run shape; raise for yolo/copy concurrency)
+  daily_loss_limit_sol: 0 # realized-loss floor for the session; 0 = off
+  budget_sol: 0 # cap on total quote spent on buys this session; 0 = off
+
 # Filters for token selection
 filters:
   match_string: null
@@ -177,7 +185,7 @@ filters:
   # P2-STRUC-2: creator-PnL persistent blacklist. When on, a creator whose
   # realized net PnL stays <= max_net_sol over >= min_trades trades goes on a
   # persistent skip list (state/creator_pnl.db).
-  creator_pnl_blacklist_enabled: false
+  creator_pnl_blacklist_enabled: true # Enabled 2026-10-27: ledger fed by tools/rug_memory.py (shadow closes + grad rugs)
   creator_pnl_db_path: state/creator_pnl.db
   creator_pnl_min_trades: 3
   creator_pnl_max_net_sol: 0.0

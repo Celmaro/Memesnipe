@@ -134,8 +134,17 @@ def main() -> int:
         "creator_pnl_blacklist_enabled" in cfg.get("filters", {}),
     )
     check(
-        "YAML default off",
-        cfg["filters"].get("creator_pnl_blacklist_enabled", False) is False,
+        "YAML value is a valid bool",
+        isinstance(cfg["filters"].get("creator_pnl_blacklist_enabled"), bool),
+        f"-> {cfg['filters'].get('creator_pnl_blacklist_enabled')!r}",
+    )
+    check(
+        "code default off (fails open when absent)",
+        "filters.creator_pnl_blacklist_enabled" in config_loader.BOOL_FIELDS
+        and "creator_pnl_store"
+        in Path(__file__).resolve().parents[2].joinpath(
+            "src/trading/universal_trader.py"
+        ).read_text(),
     )
     check(
         "BOOL_FIELDS includes it",

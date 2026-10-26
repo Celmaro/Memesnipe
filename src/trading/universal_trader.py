@@ -642,6 +642,7 @@ class UniversalTrader:
         self.min_unique_holders = min_unique_holders
         self.max_top10_concentration = max_top10_concentration
         self._holder_refresh_task = None
+        self._metadata_refresh_task = None
         # R3-P2-8: metadata socials gate (0 = off) + snapshot store.
         self.min_metadata_extensions = min_metadata_extensions
         from screening.metadata_socials import MetadataStore
@@ -869,9 +870,16 @@ class UniversalTrader:
             # T3.2: optional copy-trader engine (disabled by default).
             await self._init_copy_trader()
 
-            # P2-EXIT-4: rug-heuristic buyer tracking needs the listener's
-            # trade feed even when the copy engine is off.
-            if self.rug_heuristics_enabled and (
+            # P2-EXIT-4 / R3-P1-4 / R3-P2-12: rug-buyer tracking, creator-sell
+            # exits, and event-driven exits all consume the listener's trade
+            # feed — wire it whenever ANY of them is on (and the copy engine
+            # hasn't claimed the callback first).
+            feed_dependents = (
+                self.rug_heuristics_enabled
+                or self.exit_on_creator_sell
+                or self.event_driven_exits_enabled
+            )
+            if feed_dependents and (
                 not hasattr(self.token_listener, "trade_callback")
                 or self.token_listener.trade_callback is None
             ):
@@ -887,6 +895,11 @@ class UniversalTrader:
                 if self._holder_gates_on():
                     self._holder_refresh_task = asyncio.create_task(
                         self._holder_refresh_loop()
+                    )
+                # R3-P2-8: metadata-extension refresher (only when gate on).
+                if self.min_metadata_extensions > 0:
+                    self._metadata_refresh_task = asyncio.create_task(
+                        self._metadata_refresh_loop()
                     )
                 token_info = await self._wait_for_token()
                 if token_info:
@@ -907,6 +920,11 @@ class UniversalTrader:
                 if self._holder_gates_on():
                     self._holder_refresh_task = asyncio.create_task(
                         self._holder_refresh_loop()
+                    )
+                # R3-P2-8: metadata-extension refresher (only when gate on).
+                if self.min_metadata_extensions > 0:
+                    self._metadata_refresh_task = asyncio.create_task(
+                        self._metadata_refresh_loop()
                     )
 
                 try:
@@ -944,6 +962,14 @@ class UniversalTrader:
                 self._holder_refresh_task.cancel()
                 try:
                     await self._holder_refresh_task
+                except asyncio.CancelledError:
+                    pass
+            # R3-P2-8: cancel the metadata-extension refresher if running.
+            meta_task = getattr(self, "_metadata_refresh_task", None)
+            if meta_task is not None:
+                meta_task.cancel()
+                try:
+                    await meta_task
                 except asyncio.CancelledError:
                     pass
             await self._cleanup_without_interruption()
@@ -1001,30 +1027,23 @@ class UniversalTrader:
             )
 
             async def on_trade_logs(
-                logs: list[str], outer_signer: str | None = None
+                logs: list[str],
+                outer_signer: str | None = None,
+                slot: int | None = None,
             ) -> None:
-                # R3-P2-5: scan the same logs for the PumpSwap migration
-                # event so post-graduation leader sells are seen.
-                if self.migrate_watcher is not None:
-                    migrated_mint = self.migrate_watcher.on_logs(logs)
-                    if migrated_mint:
-                        logger.info(
-                            f"R3-P2-5: copy feed mint {migrated_mint} "
-                            f"migrated to PumpSwap"
-                        )
-                trade = self.platform_implementations.event_parser.parse_trade_event_from_logs(
-                    logs, outer_signer=outer_signer
-                )
-                if trade:
-                    # P2-EXIT-4: count unique buyers for the rug heuristic
-                    # (only buys; the trader itself is filtered out later —
-                    # the engine tracks its own mirrors separately).
-                    if self.rug_heuristics_enabled and trade.get("is_buy"):
-                        mint_key = str(trade.get("mint", ""))
-                        trader_key = str(trade.get("trader") or "")
-                        if mint_key and trader_key:
-                            self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
-                    await engine.on_trade_event(trade)
+                # R3-P2-14: when slot ordering is enabled, buffer the copy
+                # feed by slot and release in ascending order — an
+                # out-of-order geyser delivery must not mirror a leader buy
+                # before the fill it depends on.
+                if self.slot_ordered_feed_enabled and self._slot_buffer is not None:
+                    if slot is not None and self._slot_buffer.push(slot, (logs, outer_signer)):
+                        for buffered_logs, buffered_signer in self._slot_buffer.drain():
+                            await self._consume_copy_logs(
+                                engine, buffered_logs, buffered_signer
+                            )
+                        return
+                    # Slot missing (non-geyser listener): process immediately.
+                await self._consume_copy_logs(engine, logs, outer_signer)
 
             if hasattr(self.token_listener, "trade_callback"):
                 self.token_listener.trade_callback = on_trade_logs
@@ -1036,6 +1055,22 @@ class UniversalTrader:
         except Exception:
             logger.exception("Copy-trader init failed; disabled for this run")
 
+    async def _consume_copy_logs(
+        self, engine: Any, logs: list[str], outer_signer: str | None = None
+    ) -> None:
+        """Parse one trade-log batch and dispatch to the copy engine.
+
+        Shared by the copy feed and the slot-ordered buffer drain so both
+        paths parse identically. Applies the SAME feed consumers as the rug
+        feed (creator-sell exit, own-wallet prompt, migration watcher, rug
+        buyer counting) before dispatching the trade to the mirror engine —
+        otherwise enabling copy-trading would silently disable those R3
+        exit triggers.
+        """
+        trade = await self._consume_trade_logs(logs, outer_signer)
+        if trade is not None:
+            await engine.on_trade_event(trade)
+
     async def _init_rug_trade_feed(self) -> None:
         """P2-EXIT-4: wire listener trade events into the rug buyer counter.
 
@@ -1046,44 +1081,74 @@ class UniversalTrader:
         try:
 
             async def on_rug_trade_logs(
-                logs: list[str], outer_signer: str | None = None
+                logs: list[str],
+                outer_signer: str | None = None,
+                slot: int | None = None,
             ) -> None:
-                # R3-P2-5: scan logs for the PumpSwap migration event first
-                # (the same logs carry both events).
-                if self.migrate_watcher is not None:
-                    migrated_mint = self.migrate_watcher.on_logs(logs)
-                    if migrated_mint:
-                        logger.info(
-                            f"R3-P2-5: mint {migrated_mint} migrated to "
-                            f"PumpSwap (watcher armed)"
-                        )
-                trade = self.platform_implementations.event_parser.parse_trade_event_from_logs(
-                    logs, outer_signer=outer_signer
-                )
-                if not trade:
-                    return
-                mint_key = str(trade.get("mint", ""))
-                trader_key = str(trade.get("trader") or "")
-                # R3-P1-4: creator-sell trigger — a sell whose trader matches
-                # a registered creator for this mint marks it for exit.
-                if self.exit_on_creator_sell and not trade.get("is_buy"):
-                    creators = self._creator_sellers.get(mint_key, set())
-                    if creators and trader_key in creators:
-                        self._creator_sold_for_exit.add(mint_key)
-                if trade.get("is_buy") and mint_key and trader_key:
-                    self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
-                # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
-                # is the bot's wallet prompts the monitor for an immediate
-                # exit evaluation (off by default = current polling).
-                if self.event_driven_exits_enabled and self.wallet is not None:
-                    if str(trade.get("trader") or "") == str(self.wallet.public_key):
-                        self._own_trade_prompt.add(mint_key)
+                # R3-P2-14: when slot ordering is enabled, buffer the feed by
+                # slot and release in ascending order — an out-of-order geyser
+                # delivery must not let a later fill count a buyer/creator
+                # before the earlier one (position state stays consistent).
+                if self.slot_ordered_feed_enabled and self._slot_buffer is not None:
+                    if slot is not None and self._slot_buffer.push(slot, (logs, outer_signer)):
+                        for buffered_logs, buffered_signer in self._slot_buffer.drain():
+                            await self._consume_trade_logs(
+                                buffered_logs, buffered_signer
+                            )
+                        return
+                    # Slot missing (non-geyser listener): process immediately.
+                await self._consume_trade_logs(logs, outer_signer)
 
             if hasattr(self.token_listener, "trade_callback"):
                 self.token_listener.trade_callback = on_rug_trade_logs
                 logger.info("P2-EXIT-4: rug trade feed wired (buyer counting)")
         except Exception:
             logger.exception("Rug trade feed init failed; drain test only")
+
+    async def _consume_trade_logs(
+        self, logs: list[str], outer_signer: str | None = None
+    ) -> dict | None:
+        """Parse one trade-log batch and apply feed consumers (rug feed).
+
+        Shared by the rug feed and the slot-ordered buffer drain: scan the
+        PumpSwap migration event, count unique buyers for the rug heuristic,
+        flag a creator-sell exit, and prompt an event-driven exit on the
+        bot's own wallet. Kept as one method so both the immediate and the
+        buffered paths use identical logic. Returns the parsed trade dict
+        (None when the logs carry no TradeEvent) so the copy feed can
+        dispatch it to the mirror engine after the flags are applied.
+        """
+        # R3-P2-5: scan logs for the PumpSwap migration event first
+        # (the same logs carry both events).
+        if self.migrate_watcher is not None:
+            migrated_mint = self.migrate_watcher.on_logs(logs)
+            if migrated_mint:
+                logger.info(
+                    f"R3-P2-5: mint {migrated_mint} migrated to "
+                    f"PumpSwap (watcher armed)"
+                )
+        trade = self.platform_implementations.event_parser.parse_trade_event_from_logs(
+            logs, outer_signer=outer_signer
+        )
+        if not trade:
+            return None
+        mint_key = str(trade.get("mint", ""))
+        trader_key = str(trade.get("trader") or "")
+        # R3-P1-4: creator-sell trigger — a sell whose trader matches
+        # a registered creator for this mint marks it for exit.
+        if self.exit_on_creator_sell and not trade.get("is_buy"):
+            creators = self._creator_sellers.get(mint_key, set())
+            if creators and trader_key in creators:
+                self._creator_sold_for_exit.add(mint_key)
+        if trade.get("is_buy") and mint_key and trader_key:
+            self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
+        # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
+        # is the bot's wallet prompts the monitor for an immediate
+        # exit evaluation (off by default = current polling).
+        if self.event_driven_exits_enabled and self.wallet is not None:
+            if str(trade.get("trader") or "") == str(self.wallet.public_key):
+                self._own_trade_prompt.add(mint_key)
+        return trade
 
     def _holder_gates_on(self) -> bool:
         """R3-P1-5: whether either holder-concentration gate is configured."""
@@ -1148,6 +1213,118 @@ class UniversalTrader:
             # Fail-open: keep whatever snapshot exists (or none) for this mint.
             logger.debug("Holder snapshot pull failed for %s", mint)
 
+    async def _metadata_refresh_loop(self, interval: float = 30.0) -> None:
+        """R3-P2-8: background metadata-extension refresher.
+
+        Reads each tracked mint's SPL metadata account (Metaplex Token
+        Metadata PDA), extracts the off-chain URI, fetches the JSON, and
+        stores a MetadataSnapshot. `_skip_reason` reads only the store — this
+        loop owns the RPC + HTTP. Fail-open: a mint with no snapshot (RPC
+        down / non-standard metadata program / fetch failure) is allowed.
+        """
+        try:
+            while True:
+                mints = set()
+                for key in list(getattr(self, "processed_tokens", set()) or set()) + [
+                    str(m) for m in getattr(self, "traded_mints", set())
+                ]:
+                    if key:
+                        mints.add(key)
+                try:
+                    q = getattr(self, "token_queue", None)
+                    if q is not None and hasattr(q, "_queue"):
+                        for item in list(q._queue):  # noqa: SLF001
+                            mint = getattr(item, "mint", None)
+                            if mint:
+                                mints.add(str(mint))
+                except Exception:
+                    pass
+                for mint in list(mints)[: self.max_tracked_tokens]:
+                    await self._refresh_one_metadata_snapshot(mint)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Metadata refresher stopped")
+            raise
+
+    async def _refresh_one_metadata_snapshot(self, mint: str) -> None:
+        """Read the metadata account + URI JSON for one mint (fail-open)."""
+        try:
+            # Reuse the holder gate's stored snapshot when already fresh — the
+            # metadata account also changes rarely, but the store key is the
+            # same mint, so only pull when we have nothing for it yet.
+            existing = self._metadata_store.get(mint)
+            if existing is not None and existing.extensions:
+                return
+            mint_pk = Pubkey.from_string(mint)
+            from screening.metadata_socials import (
+                METADATA_PROGRAM,
+                MetadataSnapshot,
+                parse_metadata_json,
+            )
+
+            meta_pda, _ = Pubkey.find_program_address(
+                [b"metadata", Pubkey.from_string(METADATA_PROGRAM).__bytes__(), mint_pk.__bytes__()],
+                Pubkey.from_string(METADATA_PROGRAM),
+            )
+            try:
+                account = await self.solana_client.get_account_info(meta_pda)
+            except ValueError:
+                return  # no metadata account -> fail-open (no snapshot)
+            data = bytes(getattr(account, "data", b""))
+            if not data or len(data) < 1:
+                return
+            uri = self._extract_metadata_uri(data)
+            if not uri:
+                return
+            raw = await self._fetch_metadata_json(uri)
+            snapshot = parse_metadata_json(raw, mint)
+            if not snapshot.extensions and not (snapshot.symbol or snapshot.name):
+                # Non-standard/empty metadata: store an empty snapshot so the
+                # gate can refuse it when enabled (positive evidence of empty).
+                self._metadata_store.put(MetadataSnapshot(mint=mint))
+                return
+            self._metadata_store.put(snapshot)
+        except Exception:
+            logger.debug("Metadata snapshot pull failed for %s", mint)
+
+    @staticmethod
+    def _extract_metadata_uri(data: bytes) -> str:
+        """Pull the URI out of a Token Metadata account body (borsh strings).
+
+        Layout: key(1) + update_authority(32) + mint(32), then three borsh
+        length-prefixed utf8 strings: name, symbol, uri.
+        """
+        try:
+            off = 1 + 32 + 32
+            for _ in range(3):
+                if off + 4 > len(data):
+                    return ""
+                (ln,) = __import__("struct").unpack_from("<I", data, off)
+                off += 4
+                if ln > 200 or off + ln > len(data):
+                    return ""
+                s = data[off : off + ln].decode("utf-8", errors="replace")
+                off += ln
+                if _ == 2:
+                    return s
+            return ""
+        except Exception:
+            return ""
+
+    async def _fetch_metadata_json(self, uri: str) -> str:
+        """GET the metadata URI (off hot path, short timeout, fail-open)."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=4.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(uri, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                    if resp.status != 200:
+                        return ""
+                    return (await resp.text())[:65_536]
+        except Exception:
+            return ""
+
     async def _mirror_buy(
         self, token_info: TokenInfo, target: Any, size_sol: float
     ) -> bool:
@@ -1156,7 +1333,18 @@ class UniversalTrader:
         Shadow-aware: when shadow_mode is on, the mirror is simulated at the
         current price and recorded in the research ledger (no transaction is
         sent). Real mode keeps the dedicated-buyer path.
+
+        R3-P2-10: mirrors respect the session risk guards (loss limit and
+        budget gate new buys) and record their spend toward the budget
+        without opening a tracked position (the exit machinery never closes
+        a mirror). R3-P2-13: a mirror buy never overlaps an in-flight sell.
         """
+        # R3-P2-10: risk gate — a copy buy spends the wallet just like a
+        # snipe buy; the loss limit and budget apply to mirrors too.
+        if not self.risk_tracker.buy_allowed:
+            reason = self.risk_tracker.blocked_reason or "risk guard blocked"
+            logger.warning(f"Copy-trader: skipping mirror on {token_info.symbol} - {reason}")
+            return False
         try:
             if self.shadow_capture is not None:
                 price = await self._read_price(token_info)
@@ -1175,6 +1363,7 @@ class UniversalTrader:
                     pool_snapshot=await self._pool_snapshot(token_info),
                     mirror_of=(target.alias or str(target.wallet)[:8]),
                 )
+                self.risk_tracker.record_spend(size_sol)
                 return True
 
             # The sniper's buyer is sized from config; a copy target carries
@@ -1192,7 +1381,12 @@ class UniversalTrader:
                 trust_create_event=False,
                 executor=self.executor,
             )
-            result = await buyer.execute(token_info)
+            # R3-P2-13: a mirror buy never overlaps an in-flight sell (WSOL
+            # wrap/unwrap balance race). No-op without contention.
+            async with self._trade_serialization_lock:
+                result = await buyer.execute(token_info)
+            if result and result.success:
+                self.risk_tracker.record_spend(size_sol)
             return bool(result and result.success)
         except Exception:
             logger.exception("Copy-trader mirror buy raised")

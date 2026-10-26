@@ -139,7 +139,9 @@ class UniversalGeyserListener(BaseTokenListener):
         # T3.2: optional copy-trader callback. When set, every transaction
         # update's logs are forwarded after the token-creation check so a
         # leader-buy TradeEvent can be mirrored without extra RPC.
-        self.trade_callback: Callable[[list[str], str | None], Awaitable[None]] | None = None
+        self.trade_callback: Callable[
+            [list[str], str | None, int | None], Awaitable[None]
+        ] | None = None
 
         for platform in self.platforms:
             try:
@@ -516,7 +518,11 @@ class UniversalGeyserListener(BaseTokenListener):
                             outer_signer = str(keys[0])
                     except Exception:
                         outer_signer = None
-                    await self.trade_callback(logs, outer_signer)
+                    # R3-P2-14: pass the transaction slot so the consumer's
+                    # ordering buffer can release fills in ascending slot
+                    # order (geyser can deliver fills out of order).
+                    tx_slot = update_slot
+                    await self.trade_callback(logs, outer_signer, tx_slot)
 
             return None
 

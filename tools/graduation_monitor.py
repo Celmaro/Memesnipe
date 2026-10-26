@@ -74,6 +74,7 @@ class GraduationMonitor:
                 "quote_in_pool": e.get("quoteInPool"),
                 "tokens_in_pool": e.get("tokensInPool"),
                 "grad_price": price,
+                "creator": e.get("txSigner"),  # deployer wallet (platform is poolCreatedBy)
             }
             self.grads[mint] = rec
             self.log(rec)
@@ -110,6 +111,7 @@ class GraduationMonitor:
             "mint": mint,
             "symbol": rec["symbol"],
             "pool": rec["pool"],
+            "creator": rec.get("creator"),
             "mc_at_grad": rec["mc_at_grad"],
             "quote_in_pool": rec["quote_in_pool"],
             "grad_price": grad_price,
