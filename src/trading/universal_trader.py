@@ -1303,6 +1303,13 @@ class UniversalTrader:
                     f"R3-P2-5: mint {migrated_mint} migrated to "
                     f"PumpSwap (watcher armed)"
                 )
+                # R4-P3-2: verify the label against a DIRECT pool-state read
+                # before it is trusted. Fire-and-forget: the log line alone
+                # (legacy behavior) already set migrated=True; the confirm
+                # read either upgrades the label to verified or refutes it.
+                asyncio.create_task(
+                    self._confirm_migration(migrated_mint)
+                )
         trade = self.platform_implementations.event_parser.parse_trade_event_from_logs(
             logs, outer_signer=outer_signer
         )
@@ -3171,6 +3178,47 @@ class UniversalTrader:
             f"this signature before acting on {token_info.symbol}."
         )
         return ExitSellVerdict.STOP
+
+    async def _confirm_migration(self, mint_str: str) -> None:
+        """R4-P3-2: verify a log-line migration label against pool state.
+
+        Runs off the hot path (fire-and-forget task): derives the mint's
+        PumpSwap pool address and reads its state. pool_exists=True upgrades
+        the watcher's label to VERIFIED; False refutes it. Every failure
+        mode leaves the label unconfirmed (fail-closed for
+        require_confirmed consumers) and never raises into the trade path.
+        """
+        watcher = self.migrate_watcher
+        if watcher is None:
+            return
+        try:
+            from interfaces.core import Pubkey
+
+            mint = Pubkey.from_string(mint_str)
+            implementations = self.platform_implementations
+            pool = implementations.address_provider.derive_pool_address(mint)
+            pool_exists = False
+            if pool is not None:
+                try:
+                    state = await implementations.curve_manager.get_pool_state(
+                        pool
+                    )
+                    pool_exists = bool(state)
+                except Exception:
+                    # Curve manager may not serve AMM pools; fall back to an
+                    # account existence read through the client.
+                    info = await self.solana_client.get_account_info(pool)
+                    pool_exists = info is not None
+            watcher.confirm(mint_str, pool_exists)
+            logger.info(
+                f"R4-P3-2: migration label for {mint_str} "
+                f"{'VERIFIED' if pool_exists else 'REFUTED'} (pool-state read)"
+            )
+        except Exception:
+            logger.exception(
+                f"R4-P3-2: migration confirm read failed for {mint_str} "
+                f"(label left unconfirmed)"
+            )
 
     async def _check_depth_floor(self, token_info: TokenInfo) -> str | None:
         """P2-EXIT-1: reason to force-exit for shallow pool depth, or None.

@@ -100,6 +100,21 @@ def main() -> int:
         w.migrated == {} and w.confirmed == {},
     )
 
+    # R4-P3-2 wiring: the trader actually calls confirm() when the watcher
+    # flags a migration (the audit found confirm() with zero callers —
+    # dead wiring; _confirm_migration is the fix, spawned fire-and-forget
+    # from the migration-detect site).
+    src = (Path(__file__).resolve().parents[2] / "src/trading/universal_trader.py").read_text()
+    check("_confirm_migration method exists", "async def _confirm_migration" in src)
+    check(
+        "migration-detect site spawns confirm task",
+        "self._confirm_migration(migrated_mint)" in src,
+    )
+    check(
+        "confirm feeds the watcher",
+        "watcher.confirm(mint_str, pool_exists)" in src,
+    )
+
     if failures:
         print(f"\nR4-P3-2 FAILED ({len(failures)}): {failures}")
         return 1
