@@ -317,6 +317,7 @@ BOOL_FIELDS = [
     "filters.allow_mayhem_mode",  # R3-P0-2
     "filters.exit_on_creator_sell",  # R3-P1-4
     "trade.event_driven_exits_enabled",  # R3-P2-12
+    "node.startup_latency_test",  # R4-P4-3
     "copy_trader.enabled",
     "jito.dontfront",  # R3-P2-6
 ]

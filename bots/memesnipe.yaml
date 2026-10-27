@@ -50,6 +50,17 @@ research:
   # exit strategy (default tp_sl + staged_trail) so one price path yields a
   # per-strategy outcome row under shadow_data/strategies/.
   strategies_ledger_enabled: true
+  # Parallel exit-strategy grid — every open shadow position is evaluated
+  # against each spec (kind: tp_sl | staged_trail | hold). "hold" is the
+  # no-exit baseline. tp_sl variants probe tighter/looser stops; trail
+  # variants come from the hour-11 backtest (trail10 was the leader).
+  strategies:
+    - {name: tp_sl, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.20}}
+    - {name: tp20_sl10, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.10}}
+    - {name: tp30_sl20, kind: tp_sl, config: {take_profit_pct: 0.30, stop_loss_pct: 0.20}}
+    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.25, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
+    - {name: trail10, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
+    - {name: hold, kind: hold, config: {}}
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
@@ -153,9 +164,13 @@ priority_fees:
   enable_fixed: true # fallback when the dynamic sample is unavailable
   fixed_amount: 100_000 # fallback CU price: ~0.00001 SOL/tx at documented CU defaults
   # Improvement #6: split buy/sell priority fees — urgent buys may pay more,
-  # sells (already in position) can pay less. Omit to use fixed_amount.
-  # buy_fixed_amount: 150_000
-  # sell_fixed_amount: 50_000
+  # sells (already in position) can pay less.
+  # R4-P0-2: uncommented per the code-ground-truth audit — the executor
+  # already wires these overrides (bot_runner passes buy_priority_fee/
+  # sell_priority_fee, config_loader validates both); the YAML keys were the
+  # only missing piece. Buys keep the race budget, sells use the cheaper tier.
+  buy_fixed_amount: 150_000
+  sell_fixed_amount: 50_000
   extra_percentage: 0.0
   # T1.4 auction bid: pay this multiple of the sampled top fee (1.0 = match
   # the market; 1.1 = 10% above it to win the race). Capped by hard_cap.
@@ -286,3 +301,7 @@ cleanup:
 # Node provider configuration
 node:
   max_rps: 25 # match your provider's RPS limit
+  # R4-P4-3: startup RPC latency self-test (off by default). Three get_slot
+  # round trips at boot; warns when avg > 200 ms (snipe races are lost on
+  # latency before fees ever matter).
+  startup_latency_test: false

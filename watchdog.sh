@@ -3,6 +3,7 @@
 # 2026-10-27: two duplicate watchdog instances ran simultaneously (each spawned a
 # full bot) and bot logs grew to ~1GB each; log caps + size guards added.
 cd /home/agentuser/Memesnipe
+export PATH="/home/agentuser/.local/bin:$PATH"  # systemd user units have a minimal PATH; uv lives here
 
 LOG_MAX_BYTES=$((512*1024*1024))  # 512MB per bot log
 

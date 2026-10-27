@@ -497,6 +497,10 @@ class UniversalGeyserListener(BaseTokenListener):
             for parser in self.platform_parsers.values():
                 token_info = parser.parse_token_creation_from_geyser(update)
                 if token_info:
+                    # R4-P0-4: the create frame's transaction slot is the
+                    # KPI baseline for the landed-slot race metric (decision
+                    # slot minus create slot). None when a frame lacks it.
+                    token_info.create_slot = update_slot
                     return token_info
 
             # T3.2: no token creation here, but a leader may have traded an

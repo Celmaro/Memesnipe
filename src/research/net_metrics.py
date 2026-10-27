@@ -46,6 +46,9 @@ class TradeMetrics:
     losing_trades: int = 0
     equity_curve: list[float] = field(default_factory=list)
     hold_seconds: list[float] = field(default_factory=list)
+    # R4-P0-4/1: race KPIs collected from the shadow ledger.
+    landed_slot_offsets: list[int] = field(default_factory=list)
+    reordering_bps_values: list[float] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -89,6 +92,20 @@ class TradeMetrics:
             return None
         return self.winning_trades / self.closed
 
+    @property
+    def median_landed_slot_offset(self) -> int | None:
+        """Median decision-lag in slots (0-2 = winning the race)."""
+        if not self.landed_slot_offsets:
+            return None
+        return int(median(self.landed_slot_offsets))
+
+    @property
+    def avg_reordering_bps(self) -> float | None:
+        """Mean reordering-slippage over closed fills (bps)."""
+        if not self.reordering_bps_values:
+            return None
+        return sum(self.reordering_bps_values) / len(self.reordering_bps_values)
+
     def to_report(self) -> str:
         lines = [f"Execution metrics: {self.source}"]
         lines.append(f"  opened {self.opened}, closed {self.closed}, unsellable {self.unsellable}")
@@ -116,6 +133,16 @@ class TradeMetrics:
                 if self.median_hold_seconds is not None
                 else "  median hold n/a"
             )
+        lines.append(
+            f"  median landed-slot offset {self.median_landed_slot_offset}"
+            if self.median_landed_slot_offset is not None
+            else "  median landed-slot offset n/a"
+        )
+        lines.append(
+            f"  avg reordering slippage {self.avg_reordering_bps:.1f} bps"
+            if self.avg_reordering_bps is not None
+            else "  avg reordering slippage n/a"
+        )
         if self.unparseable_rows:
             lines.append(f"  {self.unparseable_rows} unparseable rows skipped")
         for err in self.errors:
@@ -180,6 +207,11 @@ def compute_metrics(
                 m.opened += 1
                 opened[mint] = float(row.get("quote_spent", 0.0) or 0.0)
                 ts = row.get("ts", 0.0) or 0.0
+                # R4-P0-4: landed-slot offset on the open row (None for
+                # non-geyser listeners / live rows without the field).
+                lso = row.get("landed_slot_offset")
+                if isinstance(lso, (int, float)):
+                    m.landed_slot_offsets.append(int(lso))
                 try:
                     hold_start[mint] = float(ts)
                 except (TypeError, ValueError):
@@ -189,6 +221,10 @@ def compute_metrics(
                     hold_start[mint] = 0.0
             elif etype == "sim_close" or etype == "close":
                 m.closed += 1
+                # R4-P0-1: reordering-slippage basis on the close row.
+                rb = row.get("reordering_bps")
+                if isinstance(rb, (int, float)):
+                    m.reordering_bps_values.append(float(rb))
                 pnl = float(row.get("pnl_quote", 0.0) or 0.0)
                 m.total_pnl_quote += pnl
                 if pnl >= 0:
@@ -215,6 +251,61 @@ def compute_metrics(
 
     m.unsellable = len(opened)
     return m
+
+
+def compute_coverage(
+    ledgers: list[Path] | None = None,
+) -> dict[str, float | None]:
+    """R4-P4-1: rejection-stream coverage metric over the shadow ledger.
+
+    Two observation pipelines (the snipe path and the copy/monitor paths)
+    can see disjoint mint sets — the 2609.18975 result showed a 0.8%
+    overlap between two well-built pipelines. This computes Jaccard and
+    Dice overlap between:
+
+    - ``detected``: every mint the snipe path saw (detect rows)
+    - ``rejected``: mints the detectors saw but filters refused
+      (detect rows with skip_reason set) — what the filters throw away
+
+    A high ``rejected_mint_share`` + low overlap means the filter stack is
+    discarding most of what an alternative observer might see; it is the
+    quickest blind-spot check on the shadow ledger.
+    """
+    detected: set[str] = set()
+    rejected: set[str] = set()
+    files: list[Path] = []
+    if ledgers is not None:
+        files.extend(ledgers)
+    elif Path("shadow_data").is_dir():
+        files.extend(sorted(Path("shadow_data").glob("*.jsonl")))
+    for path in files:
+        for row in _iter_jsonl(path):
+            if row is None or row.get("type") != "detect":
+                continue
+            mint = str(row.get("mint", ""))
+            if not mint:
+                continue
+            detected.add(mint)
+            if row.get("skip_reason"):
+                rejected.add(mint)
+    overlap = detected & rejected
+    jaccard = (
+        len(overlap) / len(detected | rejected)
+        if (detected | rejected)
+        else None
+    )
+    dice = (
+        2 * len(overlap) / (len(detected) + len(rejected))
+        if (len(detected) + len(rejected)) > 0
+        else None
+    )
+    return {
+        "detected": len(detected),
+        "rejected": len(rejected),
+        "overlap": len(overlap),
+        "jaccard": jaccard,
+        "dice": dice,
+    }
 
 
 if __name__ == "__main__":

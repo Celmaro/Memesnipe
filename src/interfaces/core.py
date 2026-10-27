@@ -74,6 +74,11 @@ class TokenInfo:
     creator_vault: Pubkey | None = None
     token_program_id: Pubkey | None = None  # Token or Token2022 program
     is_mayhem_mode: bool = False  # pump.fun mayhem mode flag
+    # R4-P0-4: slot of the create transaction (from the geyser frame that
+    # delivered it). None when the listener path has no slot (fallback
+    # listeners). Used for the landed-slot race KPI (decision slot minus
+    # create slot); 0-2 slots is the known-good benchmark.
+    create_slot: int | None = None
 
     # pump.fun cashback coin flag. create_v2 rejects new cashback coins with
     # 6082 CashbackDeprecated, but existing ones keep trading and accruing, so

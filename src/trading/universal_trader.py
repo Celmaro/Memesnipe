@@ -3,7 +3,7 @@
 import asyncio
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from time import monotonic
@@ -1394,6 +1394,7 @@ class UniversalTrader:
                     f"buy of {token_info.symbol} for {size_sol:.6f} SOL "
                     f"at {price:.3e} SOL/token (no tx sent)"
                 )
+                race_fields = await self._race_kpi_fields(token_info)
                 self.shadow_capture.sim_open(
                     mint=str(token_info.mint),
                     symbol=token_info.symbol,
@@ -1403,6 +1404,7 @@ class UniversalTrader:
                     quote_spent=size_sol,
                     pool_snapshot=await self._pool_snapshot(token_info),
                     mirror_of=(target.alias or str(target.wallet)[:8]),
+                    **race_fields,
                 )
                 self.risk_tracker.record_spend(size_sol)
                 return True
@@ -1432,6 +1434,42 @@ class UniversalTrader:
         except Exception:
             logger.exception("Copy-trader mirror buy raised")
             return False
+
+    async def _race_kpi_fields(
+        self, token_info: TokenInfo
+    ) -> dict[str, Any]:
+        """R4-P0-4/1: landed-slot + reordering-slippage fields for the
+        shadow ledger.
+
+        ``landed_slot_offset`` is (decision slot - create slot), the bot's
+        reaction latency in slots — 0-2 is the known-good benchmark (top
+        sniper lands 79.6% in the deploy slot). ``reordering_bps`` is 0 by
+        construction for shadow fills (they fill at the observed price, no
+        adversarial reordering possible); the field exists so live fills
+        populate it. One ``get_slot`` RPC, shadow mode only. Also records
+        the UTC entry hour (R4-P1-5 research logging, no gate) so the
+        ledger can be stratified by hour without parsing the ISO timestamp.
+        """
+        fields: dict[str, Any] = {
+            "create_slot": getattr(token_info, "create_slot", None),
+            "entry_tx_idx_in_block": None,  # live-only (tx position)
+            "reordering_bps": 0,  # shadow fills simulate at observed price
+            "entry_hour_utc": datetime.now(timezone.utc).hour,  # R4-P1-5
+        }
+        if not self.shadow_mode:
+            return fields
+        decision_slot: int | None = None
+        try:
+            decision_slot = await self.solana_client.get_slot()
+        except Exception:
+            decision_slot = None
+        fields["decision_slot"] = decision_slot
+        create_slot = getattr(token_info, "create_slot", None)
+        if decision_slot is not None and create_slot is not None:
+            fields["landed_slot_offset"] = decision_slot - create_slot
+        else:
+            fields["landed_slot_offset"] = None
+        return fields
 
     async def _backfill_gap(self) -> None:
         """T2.6: replay missed transactions from RPC when enabled.
@@ -2214,6 +2252,7 @@ class UniversalTrader:
                 )
                 if self.shadow_capture is not None:
                     fee_fields = await self._fee_estimate_fields()
+                    race_fields = await self._race_kpi_fields(token_info)
                     self.shadow_capture.sim_open(
                         mint=str(token_info.mint),
                         symbol=token_info.symbol,
@@ -2223,6 +2262,7 @@ class UniversalTrader:
                         quote_spent=self.quote_amounts.get(token_quote_mint, 0.0),
                         pool_snapshot=await self._pool_snapshot(token_info),
                         **fee_fields,
+                        **race_fields,
                     )
                     # R4-P1-7: register this position with the strategies
                     # ledger so the same price path is evaluated against
@@ -2239,6 +2279,7 @@ class UniversalTrader:
                             ),
                             pool_snapshot=await self._pool_snapshot(token_info),
                             **fee_fields,
+                            **race_fields,
                         )
             else:
                 # R3-P2-13: a buy never overlaps an in-flight sell (WSOL
@@ -2465,6 +2506,7 @@ class UniversalTrader:
                         hold_seconds=self.wait_time_after_buy or 0.0,
                         pool_snapshot=await self._pool_snapshot(token_info),
                         **fee_fields,
+                        reordering_bps=0,  # R4-P0-1: shadow fills at observed price
                     )
                     # R4-P1-7: finalize the strategies-ledger entry (time-
                     # based close; shadow only).
@@ -3311,6 +3353,7 @@ class UniversalTrader:
                 hold_seconds=(datetime.now() - position.entry_time).total_seconds(),
                 pool_snapshot=await self._pool_snapshot(token_info),
                 **fee_fields,
+                reordering_bps=0,  # R4-P0-1: shadow fills at observed price
             )
             logger.info(
                 f"[SHADOW] staged {exit_reason} sell {qty:.6f} {token_info.symbol} "
@@ -3436,6 +3479,7 @@ class UniversalTrader:
                     hold_seconds=hold_seconds,
                     pool_snapshot=await self._pool_snapshot(token_info),
                     **fee_fields,
+                    reordering_bps=0,  # R4-P0-1: shadow fills at observed price
                 )
                 # R4-P1-7: finalize the strategies-ledger entry at the same
                 # close so each registered strategy reports its would-be
