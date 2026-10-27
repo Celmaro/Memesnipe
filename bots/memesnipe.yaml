@@ -60,7 +60,13 @@ research:
     - {name: tp20_sl10, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.10}}
     - {name: tp30_sl20, kind: tp_sl, config: {take_profit_pct: 0.30, stop_loss_pct: 0.20}}
     - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
+    - {name: st_tp20_sl10, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.10}}
+    - {name: st_tp30_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.30, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
     - {name: trail8, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
+    - {name: trail10, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
+    - {name: hold_120s, kind: time_exit, config: {max_hold_s: 120}}
+    - {name: hold_300s, kind: time_exit, config: {max_hold_s: 300}}
+    - {name: stagn_600s, kind: time_exit, config: {max_hold_s: 600, stagnation_band_pct: 0.02}}
     - {name: hold, kind: hold, config: {}}
 
 trade:
@@ -236,7 +242,7 @@ filters:
   # persistent skip list (state/creator_pnl.db).
   creator_pnl_blacklist_enabled: true # Enabled 2026-10-27: ledger fed by tools/rug_memory.py (shadow closes + grad rugs)
   creator_pnl_db_path: state/creator_pnl.db
-  creator_pnl_min_trades: 3
+  creator_pnl_min_trades: 10 # R5-P0-3: evidence strength (was 3) — net-of-fees, sufficient sample before a persistent ban
   creator_pnl_max_net_sol: 0.0
   # P2-EXIT-4: slot-delta rug heuristics (off). On: exits immediately when the
   # pool drains below early_drain_ratio of its entry depth, or the coin has
@@ -340,8 +346,7 @@ filters:
 # under filters: silently disabled the engine despite enabled: true
 # (caught by verify_copy_hardening during R4-P2).
 copy_trader:
-  enabled: true # 5 targets loaded 2026-10-26 (Tier 1/3). Shadow-safe: mirror
-                # buys simulate + record to shadow_data/ in shadow mode.
+  enabled: false # R5-P0-4: lifecycle landed (sell-follow, mode flag, qualification) — keep OFF until verified live, per audit
   db: /home/agentuser/Memesnipe/state/copy_targets.db
   min_buy_interval: 5.0 # seconds between mirrored buys (rate guard)
   # R4-P2-1: persistent-ring vetting (0 = off). Stop mirroring a leader

@@ -34,6 +34,8 @@ from typing import Any
 
 from trading.trail_exit import TrailDecision, TrailExitState
 
+from research.cost_model import net_round_trip  # R5-P1-3 / R5-P0-1
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -59,7 +61,7 @@ def _tp_sl_evaluator(entry_price: float, **cfg: Any) -> Any:
             self.tp: float | None = None  # price level that triggered
             self.sl: float | None = None
 
-        def on_tick(self, price: float) -> TrailDecision:
+        def on_tick(self, price: float, hold_seconds: float | None = None) -> TrailDecision:
             if price <= 0:
                 return TrailDecision("hold", "no_price", price=0.0)
             # Same semantics as Position.should_exit: TP wins on ties.
@@ -84,7 +86,53 @@ def _staged_trail_evaluator(entry_price: float, **cfg: Any) -> Any:
         trail_pct=float(cfg.get("trail_pct", 0.08)),
         hard_stop_pct=float(cfg.get("hard_stop_pct", 0.20)),
     )
-    return st  # TrailExitState.on_tick returns TrailDecision directly
+
+    class _StagedSim:
+        """Adapter: works when `hold_seconds` is passed by decide()."""
+
+        def __init__(self, state: TrailExitState) -> None:
+            self._st = state
+
+        def on_tick(
+            self, price: float, hold_seconds: float | None = None
+        ) -> TrailDecision:
+            return self._st.on_tick(price)
+
+    return _StagedSim(st)
+
+
+def _time_exit_evaluator(entry_price: float, **cfg: Any) -> Any:
+    """R5-P1-2: exit-all after a maximum hold (time control).
+
+    Pure time exit: once ``hold_seconds >= max_hold_s`` the position exits
+    regardless of price. Optional ``stagnation_band_pct`` refines the trigger
+    (exit only if price stayed within +/-band of entry until the timeout).
+    """
+
+    max_hold_s = float(cfg.get("max_hold_s", 300.0))
+    band = float(cfg.get("stagnation_band_pct", 0.0))
+
+    class _TimeExit:
+        def __init__(self, entry: float, max_hold: float, band: float) -> None:
+            self.entry = entry
+            self.max_hold = max_hold
+            self.band = band
+
+        def on_tick(
+            self, price: float, hold_seconds: float | None = None
+        ) -> TrailDecision:
+            if price <= 0:
+                return TrailDecision("hold", "no_price", price=0.0)
+            if hold_seconds is None or hold_seconds < self.max_hold:
+                return TrailDecision("hold", "", price=price)
+            if self.band > 0:
+                dev = abs(price / self.entry - 1.0) if self.entry else 0.0
+                if dev > self.band:
+                    return TrailDecision("hold", "", price=price)
+                return TrailDecision("exit_all", "stagnation", price=price)
+            return TrailDecision("exit_all", "max_hold", price=price)
+
+    return _TimeExit(entry_price, max_hold_s, band)
 
 
 class _StrategySpec:
@@ -125,6 +173,9 @@ class StrategiesLedger:
                 self._specs.append(_StrategySpec(name, _tp_sl_evaluator, cfg))
             elif kind == "staged_trail":
                 self._specs.append(_StrategySpec(name, _staged_trail_evaluator, cfg))
+            elif kind == "time_exit":
+                # R5-P1-2: time-controlled exits (max_hold_s / stagnation).
+                self._specs.append(_StrategySpec(name, _time_exit_evaluator, cfg))
             elif kind == "hold":
                 # A hold-everything strategy is the counterfactual baseline
                 # (what ignoring exits would have done).
@@ -133,7 +184,7 @@ class StrategiesLedger:
                         def __init__(self) -> None:
                             self.entry = entry_price
 
-                        def on_tick(self, price: float) -> TrailDecision:
+                        def on_tick(self, price: float, hold_seconds: float | None = None) -> TrailDecision:
                             return TrailDecision("hold", "", price=price)
 
                     return _H()
@@ -193,6 +244,7 @@ class StrategiesLedger:
             "quote_spent": quote_spent,
             "pool_snapshot": pool_snapshot or {},
             "sims": sims,
+            "firsts": {},  # strategy name -> first fire (R5-P0-1)
             "extra": extra,
         }
         self._emit(
@@ -216,10 +268,29 @@ class StrategiesLedger:
             return
         for name, sim in pos["sims"].items():
             try:
-                decision = sim.on_tick(current_price)
+                decision = sim.on_tick(current_price, hold_seconds)  # R5-P1-2: time controls need hold duration
+            except TypeError:
+                # Older evaluators that only accept price.
+                try:
+                    decision = sim.on_tick(current_price)
+                except Exception:
+                    continue
             except Exception:
                 continue
             if decision.action in ("sell_share", "exit_all"):
+                # R5-P0-1: record the strategy's OWN first exit (price, time,
+                # reason, share). Later marks keep emitting decide rows but
+                # never overwrite the first fire.
+                first = pos["firsts"].setdefault(
+                    name,
+                    {
+                        "first_exit_price": current_price,
+                        "first_exit_reason": decision.reason,
+                        "first_exit_hold_s": hold_seconds,
+                        "first_action": decision.action,
+                        "first_share": decision.share,
+                    },
+                )
                 self._emit(
                     "strategy_decide",
                     mint=mint,
@@ -232,6 +303,10 @@ class StrategiesLedger:
                     share=decision.share,
                     hold_seconds=hold_seconds,
                     would=True,  # hypothetical: the live path may differ
+                    first_exit_price=first["first_exit_price"],
+                    first_exit_reason=first["first_exit_reason"],
+                    first_exit_hold_s=first["first_exit_hold_s"],
+                    first_share=first["first_share"],
                 )
 
     def close_position(
@@ -250,6 +325,7 @@ class StrategiesLedger:
             return
         entry_price = pos["entry_price"] or 1e-30
         amount = pos["amount_tokens"] or 0.0
+        quote_spent = pos.get("quote_spent") or (entry_price * amount)
         for name, sim in pos["sims"].items():
             # Final decision at the close price (a strategy that would have
             # exited earlier still reports its FIRST exit, stored by decide;
@@ -260,6 +336,21 @@ class StrategiesLedger:
                 final = None
             pnl_quote = (close_price - pos["entry_price"]) * amount
             pnl_pct = (close_price - pos["entry_price"]) / entry_price
+            # R5-P0-1: this strategy's own first exit (recorded by decide()),
+            # plus its OWN PnL at that first-exit price — the price that
+            # strategy would actually have realised, not the live close.
+            first = pos["firsts"].get(name)
+            first_pnl_quote = 0.0
+            if first is not None:
+                first_pnl_quote = (
+                    first["first_exit_price"] - pos["entry_price"]
+                ) * amount
+            gross_fraction = (
+                pnl_quote / quote_spent if quote_spent > 0 else 0.0
+            )
+            net_pnl_quote = net_round_trip(gross_fraction, quote_spent) * (
+                quote_spent if quote_spent > 0 else 0.0
+            )
             self._emit(
                 "strategy_close",
                 mint=mint,
@@ -274,6 +365,17 @@ class StrategiesLedger:
                 pnl_quote=pnl_quote,
                 pnl_pct=pnl_pct,
                 hold_seconds=hold_seconds,
+                first_exit_price=(
+                    first["first_exit_price"] if first is not None else None
+                ),
+                first_exit_reason=(
+                    first["first_exit_reason"] if first is not None else None
+                ),
+                first_exit_hold_s=(
+                    first["first_exit_hold_s"] if first is not None else None
+                ),
+                first_exit_pnl_quote=first_pnl_quote,
+                net_pnl_quote=net_pnl_quote,
                 **extra,
             )
 
