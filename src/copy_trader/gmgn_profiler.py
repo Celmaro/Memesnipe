@@ -68,15 +68,24 @@ class WalletProfiler:
         GMGN exposes the same rank endpoint with a `period` query; the 24h
         fetch doubles as the single-window profile. A failed window falls
         back to {} so qualification's fail-open semantics apply.
+
+        R5-P2-1: the three period fetches run concurrently (gather) instead
+        of sequentially; a slow 30d window used to delay the mirror decision
+        by three HTTP round-trips back-to-back.
         """
         now = time.monotonic()
         cache_key = f"{wallet}:multi"
         cached = self._cache.get(cache_key)
         if cached and now - cached[0] < self.ttl_seconds:
             return cached[1]
+        try:
+            results = await asyncio.gather(
+                *(self._fetch(wallet, period=p) for p in ("1d", "7d", "30d"))
+            )
+        except Exception:
+            return {}
         merged: dict[str, Any] = {}
-        for period in ("1d", "7d", "30d"):
-            p = await self._fetch(wallet, period=period)
+        for period, p in zip(("1d", "7d", "30d"), results):
             if p:
                 merged.setdefault("windows", {})[period] = p
         self._cache[cache_key] = (time.monotonic(), merged)
@@ -125,6 +134,15 @@ class WalletProfiler:
             "realized_pnl": payload.get("realized_pnl"),
             "total_pnl": payload.get("total_pnl"),
             "total_trades": payload.get("total_trades"),
+            # R5-P2-1: audit found the engine's LeaderStats consumed
+            # `trades`/`tokens_traded` but the profiler only ever emitted
+            # `total_trades`/`buy_30d`, so every leader scored neutral.
+            # Normalize both spellings here (prefer the richer period field).
+            "trades": payload.get("trades", payload.get("total_trades")),
+            "tokens_traded": payload.get(
+                "tokens_traded",
+                payload.get("buy_30d") or payload.get("sell_30d"),
+            ),
             "buy_30d": payload.get("buy_30d"),
             "sell_30d": payload.get("sell_30d"),
             "followers": payload.get("followers"),

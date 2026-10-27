@@ -1192,6 +1192,7 @@ class UniversalTrader:
                 self.solana_client,
                 store,
                 buy_mirror=self._mirror_buy,
+                sell_mirror=self._mirror_sell,  # R5-P0-4: leader-sell lifecycle
                 min_buy_interval=self.copy_trader_min_interval,
                 profiler=WalletProfiler(),
                 ring_cofire_threshold=self.copy_ring_cofire_threshold,
@@ -1559,7 +1560,7 @@ class UniversalTrader:
             )
             return False
         try:
-            if self.shadow_capture is not None:
+            if self.shadow_mode:  # R5-P0-4: mode flag, not shadow_capture presence
                 price = await self._read_price(token_info)
                 logger.info(
                     f"[SHADOW] would mirror {target.alias or target.wallet[:8]} "
@@ -1605,6 +1606,56 @@ class UniversalTrader:
             return bool(result and result.success)
         except Exception:
             logger.exception("Copy-trader mirror buy raised")
+            return False
+
+    async def _mirror_sell(
+        self, token_info: TokenInfo, target: Any, size_sol: float, reason: str
+    ) -> bool:
+        """Close a mirrored position when the leader sells (R5-P0-4).
+
+        Shadow-aware, matching _mirror_buy: shadow mode records a simulated
+        close in the research ledger (no transaction); live mode sells through
+        the platform seller. A failed live sell keeps the position tracked by
+        the engine (it re-arms on the next leader-sell event).
+        """
+        try:
+            if self.shadow_mode:
+                price = await self._read_price(token_info)
+                logger.info(
+                    f"[SHADOW] would mirror-sell {target.alias or target.wallet[:8]} "
+                    f"{token_info.symbol} for {size_sol:.6f} SOL "
+                    f"at {price:.3e} SOL/token (no tx sent, {reason})"
+                )
+                if self.shadow_capture is not None:
+                    self.shadow_capture.sim_close(
+                        mint=str(token_info.mint),
+                        symbol=token_info.symbol,
+                        platform=token_info.platform.value,
+                        price=price,
+                        amount_tokens=0.0,
+                        quote_received=size_sol,
+                        exit_reason=f"mirror_{reason}",
+                        pnl_quote=0.0,
+                        pnl_pct=0.0,
+                        hold_seconds=0.0,
+                    )
+                return True
+            # Live path: real sell through the platform-aware seller.
+            from trading.platform_aware import PlatformAwareSeller
+
+            seller = PlatformAwareSeller(
+                self.solana_client,
+                self.wallet,
+                self.priority_fee_manager,
+                slippage=self.sell_slippage,
+                max_retries=self.max_retries,
+                executor=self.executor,
+            )
+            async with self._trade_serialization_lock:
+                result = await seller.execute(token_info)
+            return bool(result and result.success)
+        except Exception:
+            logger.exception("Copy-trader mirror sell raised")
             return False
 
     async def _race_kpi_fields(self, token_info: TokenInfo) -> dict[str, Any]:
@@ -2020,13 +2071,18 @@ class UniversalTrader:
             # Keep only the trailing hour (bounded memory).
             cutoff = now - 3600.0
             window[:] = [t for t in window if t >= cutoff]
-            # Launches/hour over the observed window (min 60s denominator so
-            # a single launch doesn't read as infinite).
-            window_span = max(
-                (now - (window[0] if window else now)) / 3600.0, 1.0 / 60.0
-            )
-            cadence = len(window) / window_span
-            if self.factory_deploy_rate > 0 and cadence > self.factory_deploy_rate:
+            # Launches/hour over the observed window. R5-P2-2: a lone observation is
+            # not a rate — a single launch used to read exactly 60/h (span
+            # floored at 1/60h) and could trigger the factory gate on a
+            # creator's first launch. Require >= 2 launches before cadence.
+            from screening.rug_score import cadence_mints_per_hour
+
+            cadence = cadence_mints_per_hour(window, now)
+            if (
+                cadence is not None
+                and self.factory_deploy_rate > 0
+                and cadence > self.factory_deploy_rate
+            ):
                 return (
                     f"creator {creator_key[:12]}... is a factory "
                     f"({cadence:.1f} mints/hr > {self.factory_deploy_rate})"
@@ -2045,17 +2101,15 @@ class UniversalTrader:
 
             snap = self._holder_store.get(str(token_info.mint))
             buyers = self._rug_buyers.get(str(token_info.mint))
+            # R5-P2-2: reuse the same cadence barrier — a lone observation
+            # is None, not 60/h, so the rug score never sees the artifact.
+            from screening.rug_score import cadence_mints_per_hour
+
             window = self._creator_launch_ts.get(creator_key, [])
-            cadence_now = monotonic()
-            window_span = max(
-                (cadence_now - (window[0] if window else cadence_now)) / 3600.0,
-                1.0 / 60.0,
-            )
+            cadence_hr = cadence_mints_per_hour(window, monotonic())
             score = compute_rug_score(
                 RugScoreInput(
-                    creator_cadence_mints_per_hour=(
-                        len(window) / window_span if window else None
-                    ),
+                    creator_cadence_mints_per_hour=cadence_hr,
                     holder_gini=snap.gini if snap else None,
                     top10_fraction=snap.top10_fraction if snap else None,
                     unique_buyers=len(buyers) if buyers else None,
@@ -2066,7 +2120,7 @@ class UniversalTrader:
             reason = rug_score_reason(score, self.rug_score_threshold)
             if reason:
                 return (
-                    f"{reason} (cadence {len(window) / window_span if window else 0:.1f}/hr, "
+                    f"{reason} (cadence {cadence_hr if cadence_hr is not None else 0:.1f}/hr, "
                     f"holders {snap.unique_holders if snap else 0}, "
                     f"buyers {len(buyers) if buyers else 0})"
                 )
@@ -2105,6 +2159,64 @@ class UniversalTrader:
             token_info, "is_holder_reward", False
         ):
             return "holder-reward coin (holder_reward_mode=skip)"
+        # Static config gates (creation-time fields; can never change between
+        # detection and buy, so they live here, not in the pre-buy recheck).
+        if (
+            self.allowed_quote_mints is not None
+            and quote_mint not in self.allowed_quote_mints
+        ):
+            return f"quote mint {quote_mint} not in allowed_quote_mints"
+        if quote_mint not in self.quote_amounts:
+            return f"no buy amount configured for quote mint {quote_mint}"
+        if (
+            self.max_transfer_fee_bps is not None
+            and token_info.transfer_fee_bps > self.max_transfer_fee_bps
+        ):
+            return (
+                f"transfer fee {token_info.transfer_fee_bps} bps exceeds "
+                f"max_transfer_fee_bps {self.max_transfer_fee_bps}"
+            )
+        return self._dynamic_screening_reason(token_info, quote_mint)
+
+    def _dynamic_screening_reason(
+        self, token_info: TokenInfo, quote_mint: Any = None
+    ) -> str | None:
+        """Re-check the DATA-DEPENDENT gates with a fresh snapshot (R5-P0-2).
+
+        These gates evaluate live observations (holder snapshot, buyer set,
+        wash volume, metadata) and can change between detection and buy —
+        the audit's P0-2: `_skip_reason()` ran them at detection, then only
+        the curve gate re-ran before the buy, so a coin could pass on stale
+        (or empty) data. This helper is stateless (no creator-cadence side
+        effect) and is safe to call again immediately before submission.
+
+        Parent controls it: the cadence bookkeeping in the factory/rug block
+        lives ONLY in `_skip_reason()` so re-evaluation never double-counts.
+        """
+        if quote_mint is None:
+            quote_mint = normalize_quote_mint(token_info.quote_mint)
+        # R4-P1-3: insider-coordination supply gate (0 = off). Fraction of
+        # the mint's early buyers that co-fire across >= 3 OTHER launches is
+        # a coordination signal (MELT 36.5% average). Fail-open: no
+        # observations -> share 0.
+        if self.max_coordinated_supply_share > 0:
+            share = self._cofire.coordinated_share(str(token_info.mint))
+            if share > self.max_coordinated_supply_share:
+                return (
+                    f"insider-coordination: {share:.1%} of early buyers "
+                    f"co-fire across launches "
+                    f"(max_coordinated_supply_share="
+                    f"{self.max_coordinated_supply_share:.1%})"
+                )
+        # R4-P1-6: wash-trade share gate (0 = off). Recent quote volume from
+        # wallets that round-trip the same mint = fake volume (2507.01963).
+        if self.max_wash_share > 0:
+            wash = self._wash_lpi.wash_share(str(token_info.mint))
+            if wash > self.max_wash_share:
+                return (
+                    f"wash-trading: {wash:.1%} of quote volume is "
+                    f"round-trip (max_wash_share={self.max_wash_share:.1%})"
+                )
         # R3-P1-5: holder-concentration gates (0 = off). Local snapshot lookup
         # only — the background refresher owns the RPC. Fail-open: a mint with
         # no snapshot yet is allowed (the refresher may simply not have run).
@@ -2599,6 +2711,22 @@ class UniversalTrader:
                         f"Gate confirmation ok for {token_info.symbol} "
                         f"({self.consecutive_match_count} consecutive passes)"
                     )
+
+            # R5-P0-2: pre-buy fresh re-evaluation of the data-dependent
+            # gates. The audit's P0-2: wash/cofire/holder/metadata were only
+            # checked at detection (pre-wait); the curve gate was the only
+            # thing re-run before buy. Re-run the stateless dynamic checks
+            # now with the post-wait snapshot so a coin that passed on stale
+            # (or empty) data is refused before submission. Stateless: the
+            # creator-cadence side effect lives only in _skip_reason().
+            prebuy_reason = self._dynamic_screening_reason(token_info)
+            if prebuy_reason:
+                logger.info(
+                    f"Skipping {token_info.symbol} - {prebuy_reason} "
+                    f"(pre-buy recheck)"
+                )
+                self._capture_detect(token_info, prebuy_reason)
+                return
 
             # Buy token
             # R3-P2-10: session risk guards — the loss limit blocks NEW buys

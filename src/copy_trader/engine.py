@@ -73,6 +73,9 @@ class CopyTraderEngine:
         buy_mirror: Callable(token_info, target, size_sol) that performs the
             actual buy through the shared buyer. Returned bool = success.
             ``size_sol`` is the engine-computed mirror size (fixed or percent).
+        sell_mirror: Callable(token_info, target, size_sol, reason) that
+            closes a mirrored position (real sell in live mode, shadow close
+            in shadow mode). Returned bool = success.
         min_buy_interval: Min seconds between mirrored buys (rate guard)
         profiler: Optional GMGN WalletProfiler; when set, a leader's profile
             is consulted before mirroring (risk filter, never a hard gate)
@@ -83,6 +86,7 @@ class CopyTraderEngine:
         client: SolanaClient,
         store: CopyTargetStore,
         buy_mirror: Callable[[TokenInfo, CopyTarget, float], Any] | None = None,
+        sell_mirror: Callable[[TokenInfo, CopyTarget, float, str], Any] | None = None,
         min_buy_interval: float = 5.0,
         profiler: Any | None = None,
         # R4-P2-1: persistent-ring vetting (0 = off). When a target's buy
@@ -105,6 +109,7 @@ class CopyTraderEngine:
         self.client = client
         self.store = store
         self.buy_mirror = buy_mirror
+        self.sell_mirror = sell_mirror
         self.min_buy_interval = min_buy_interval
         self.profiler = profiler
         self.ring_cofire_threshold = ring_cofire_threshold
@@ -113,6 +118,9 @@ class CopyTraderEngine:
         self.min_leader_score = min_leader_score
         self._last_buy_ts: float = 0.0
         self._last_mirrored: dict[str, float] = {}  # "{trader}:{mint}" -> ts, dedupe
+        # R5-P0-4: open mirrored positions keyed "{trader}:{mint}" -> SOL
+        # size, so a leader sell event reconciles and exits the copy.
+        self._mirror_positions: dict[str, float] = {}
         # R4-P2-1: co-fire tracker over the engine's own buy observations.
         from screening.coordination import CoFireTracker
 
@@ -142,12 +150,40 @@ class CopyTraderEngine:
         return None
 
     async def _maybe_mirror(self, trade: dict[str, Any]) -> None:
-        if not trade.get("is_buy"):
-            return
         mint = trade.get("mint", "")
         if not mint:
             return
         trader = trade.get("trader", "")
+        key = f"{trader}:{mint}"
+        # R5-P0-4: leader SELL event — reconcile the mirrored position and
+        # exit the copy (was previously ignored, stranding positions).
+        if not trade.get("is_buy"):
+            if key in self._mirror_positions and self.sell_mirror is not None:
+                size = self._mirror_positions.pop(key)
+                target = self._target_for(trader)
+                try:
+                    ok = await self.sell_mirror(
+                        self._token_info_from_trade(trade), target, size, "leader_sell"
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Copy-trader: sell mirror raised on {mint[:8]}"
+                    )
+                    self._mirror_positions[key] = size  # retry next event
+                    return
+                if ok:
+                    logger.info(
+                        f"Copy-trader: mirrored sell on {mint[:8]} "
+                        f"({size:.6f} SOL, leader_sell)"
+                    )
+                else:
+                    logger.warning(
+                        f"Copy-trader: mirror sell failed on {mint[:8]}; "
+                        f"position stays open"
+                    )
+                    self._mirror_positions[key] = size
+            return
+
         if self._is_duplicate(trader, mint):
             return
 
@@ -157,8 +193,6 @@ class CopyTraderEngine:
         target = next((t for t in targets if t.wallet == trader), None)
         if target is None:
             return
-
-        # Rate guard: at least min_buy_interval since the last mirror.
         now = time.monotonic()
         if now - self._last_buy_ts < self.min_buy_interval:
             logger.info(
@@ -266,6 +300,10 @@ class CopyTraderEngine:
                         f"7d={windows.get('7d', {}).get('realized_pnl')} "
                         f"30d={windows.get('30d', {}).get('realized_pnl')}"
                     )
+                    # R5-P0-4: wire the qualification module into the live
+                    # mirror path (previously exported but never called).
+                    # Deny an unqualified leader regardless of min_leader_score
+                    # when the profiler has data; the audit's P0-3.
                     if self.min_leader_score > 0:
                         from screening.leader_score import (
                             LeaderStats,
@@ -304,6 +342,51 @@ class CopyTraderEngine:
                             f"Copy-trader: leader {trader[:8]} score "
                             f"{score:.2f} >= {self.min_leader_score}"
                         )
+                    # R5-P0-4: stale/negative leader veto (qualification.py is
+                    # the module the audit found unused; wire it as the
+                    # quality gate the engine was missing). Baseline rules:
+                    # >= MIN_CLOSED_TRADES_30D closes + both 7d/30d windows
+                    # profitable + fresh 24h. Off-baseline when the profiler
+                    # only returned partial windows.
+                    try:
+                        from copy_trader.qualification import (
+                            LeaderProfile,
+                            LeaderVerdict,
+                            TradeSummary,
+                            qualify_leader,
+                        )
+
+                        lp = LeaderProfile(
+                            address=trader,
+                            last_seen_days_ago=0.0,
+                            windows={
+                                int(k): TradeSummary(
+                                    window_days=int(k),
+                                    closed_trades=_profile_int(
+                                        w.get("trades")
+                                    )
+                                    or 0,
+                                    net_pnl_sol=_profile_float(
+                                        w.get("realized_pnl")
+                                    )
+                                    or 0.0,
+                                )
+                                for k, w in windows.items()
+                                if w
+                            },
+                        )
+                        verdict = qualify_leader(lp)
+                        if verdict is not LeaderVerdict.QUALIFIED:
+                            logger.warning(
+                                f"Copy-trader: skipping {trader[:8]} buy on "
+                                f"{mint[:8]} — qualification {verdict.value}"
+                            )
+                            return
+                    except Exception:
+                        logger.debug(
+                            "Copy-trader: qualification unavailable; "
+                            "proceeding on profile"
+                        )
             except Exception:
                 logger.exception(
                     f"Copy-trader: profile lookup failed for {trader[:8]}; "
@@ -339,12 +422,55 @@ class CopyTraderEngine:
             if ok:
                 self._last_buy_ts = time.monotonic()
                 self._last_mirrored[f"{trader}:{mint}"] = time.monotonic()
+                # R5-P0-4: track the open copy so a later leader sell can
+                # reconcile it (per-leader/mint size; add-on buys keep the
+                # position open at the accumulated size).
+                self._mirror_positions[key] = self._mirror_positions.get(key, 0.0) + size
                 logger.info(
                     f"Copy-trader: mirrored buy on {mint[:8]} "
                     f"({quanta} quanta x {per_quantum:.6f} SOL)"
                 )
             else:
                 logger.warning(f"Copy-trader: mirror buy failed on {mint[:8]}")
+
+    def _target_for(self, trader: str) -> Any | None:
+        """Active target for a trader wallet, or None."""
+        try:
+            targets = self.store.get_active_wallets()
+            return next((t for t in targets if t.wallet == trader), None)
+        except Exception:
+            return None
+
+    def _token_info_from_trade(self, trade: dict[str, Any]) -> Any | None:
+        """Build a minimal TokenInfo for the sell callback from a TradeEvent."""
+        mint = trade.get("mint", "")
+        try:
+            token_info = TokenInfo(
+                name=(trade.get("name") or trade.get("symbol") or mint[:6]),
+                symbol=(trade.get("symbol") or mint[:6]),
+                uri=(trade.get("uri") or ""),
+                mint=Pubkey.from_string(mint),
+                platform=self._platform(trade),
+                bonding_curve=(
+                    Pubkey.from_string(trade["bonding_curve"])
+                    if trade.get("bonding_curve")
+                    else None
+                ),
+                token_program_id=(
+                    Pubkey.from_string(trade["token_program_id"])
+                    if trade.get("token_program_id")
+                    else None
+                ),
+                creation_timestamp=trade.get("timestamp"),
+                creator=(
+                    Pubkey.from_string(trade["creator"])
+                    if trade.get("creator")
+                    else None
+                ),
+            )
+            return token_info
+        except Exception:
+            return None
 
     def _is_duplicate(self, trader: str, mint: str) -> bool:
         last = self._last_mirrored.get(f"{trader}:{mint}", 0.0)

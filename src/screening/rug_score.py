@@ -64,6 +64,21 @@ class RugScoreInput:
     dev_ceiling: float = 0.2  # dev holds > 20% = control risk
 
 
+def cadence_mints_per_hour(launch_ts: list[float], now: float) -> float | None:
+    """Launches/hour over a trailing window; None when not meaningful.
+
+    R5-P2-2: a lone observation is not a rate. The old inline math floored
+    the window span at 1/60h, so a creator's FIRST observed launch read
+    exactly 60 mints/hour — enough to trip a factory gate or push the rug
+    score. With fewer than 2 launches there is no cadence yet: return None
+    (the rug score treats None as unknown/benign).
+    """
+    if len(launch_ts) < 2:
+        return None
+    span_h = max((now - launch_ts[0]) / 3600.0, 1.0 / 60.0)
+    return len(launch_ts) / span_h
+
+
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
