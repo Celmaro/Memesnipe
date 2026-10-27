@@ -53,13 +53,14 @@ research:
   # Parallel exit-strategy grid — every open shadow position is evaluated
   # against each spec (kind: tp_sl | staged_trail | hold). "hold" is the
   # no-exit baseline. tp_sl variants probe tighter/looser stops; trail
-  # variants come from the hour-11 backtest (trail10 was the leader).
+  # variants come from the hour-11 backtest + param sweep (trail8 = pure
+  # trail with the sweep-tuned 8% distance).
   strategies:
     - {name: tp_sl, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.20}}
     - {name: tp20_sl10, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.10}}
     - {name: tp30_sl20, kind: tp_sl, config: {take_profit_pct: 0.30, stop_loss_pct: 0.20}}
-    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.25, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
-    - {name: trail10, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
+    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
+    - {name: trail8, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
     - {name: hold, kind: hold, config: {}}
 
 trade:
@@ -108,7 +109,7 @@ trade:
   exit_strategy: "tp_sl"
   # R4-P1-7: exit shape within the tp_sl family. "tp_sl" (default) = current
   # single/staged TP/SL unchanged. "staged_trail" = asymmetric staged-then-
-  # trail: sell 40% at +25%, arm a break-even floor at +10%, trail the rest
+  # trail: sell 40% at +20%, arm a break-even floor at +10%, trail the rest
   # 8% behind each new high, exit on the floor or the -20% hard stop. The
   # same rule is shadow-tested in parallel via the strategies ledger
   # (research.strategies_ledger_enabled) regardless of which mode is active.
