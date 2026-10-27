@@ -429,8 +429,38 @@ class UniversalTrader:
         # CompletePumpAmmMigrationEvent in logs so post-graduation leader
         # activity is seen as PumpSwap trades, not curve trades.
         migrate_watcher_enabled: bool = False,
+        # R4-P0-3: contention-mode fee racing (off by default). When the
+        # create-event rate (launches/min over the trailing window) exceeds
+        # contention_creates_per_min, the buy+sell fee managers arm and
+        # escalate their bids by contention_multiplier, capped at
+        # min(hard_cap, max_fee_fraction_of_position of the trade quote) so
+        # a fee surge can never eat the position (tierzero: plain-fee
+        # landing collapses to 20-40% under launch competition; the Kaggle
+        # top sniper pays 21% of gross on fees but nets on 8.5:1 asymmetry).
+        contention_enabled: bool = False,
+        contention_multiplier: float = 2.5,
+        contention_creates_per_min: float = 20.0,
+        contention_window_s: float = 60.0,
+        max_fee_fraction_of_position: float = 0.005,
+        # R4-P1-4: graduation-probability entry timing — LOG-ONLY advisory.
+        # At curve-gate time (same RPC read as the progress gate) tag the
+        # candidate with its historical graduation-outcome band. Never gates.
+        grad_timing_enabled: bool = False,
+        grad_band_stats_path: str = "state/grad_band_stats.json",
     ):
         """Initialize the universal trader."""
+        self.contention_enabled = contention_enabled
+        self.contention_multiplier = contention_multiplier
+        self.contention_creates_per_min = contention_creates_per_min
+        self.contention_window_s = contention_window_s
+        self.max_fee_fraction_of_position = max_fee_fraction_of_position
+        # R4-P1-4: graduation-band advisory (log-only; off default).
+        self.grad_timing_enabled = grad_timing_enabled
+        self._grad_band_stats = load_band_stats(grad_band_stats_path)
+        # R4-P0-3: rolling create-event timestamps for the launch-flood
+        # rate test (monotonic seconds, same clock as token_timestamps).
+        self._contention_creates: list[float] = []
+
         # Core components
         self.solana_client = SolanaClient(
             rpc_endpoint,
@@ -449,6 +479,8 @@ class UniversalTrader:
             hard_cap=hard_cap_prior_fee,
             bid_multiplier=priority_fee_bid_multiplier,
             fee_cache_ttl=priority_fee_cache_ttl,
+            # R4-P0-3: contention escalation multiplier (off until armed).
+            contention_multiplier=contention_multiplier,
         )
         # Improvement #6: split buy/sell fees. The buyer keeps the manager
         # above (buy fee); the seller gets its own manager with the sell fee
@@ -462,6 +494,8 @@ class UniversalTrader:
             hard_cap=hard_cap_prior_fee,
             bid_multiplier=priority_fee_bid_multiplier,
             fee_cache_ttl=priority_fee_cache_ttl,
+            # R4-P0-3: contention escalation multiplier (off until armed).
+            contention_multiplier=contention_multiplier,
         )
 
         # Platform setup
@@ -533,8 +567,12 @@ class UniversalTrader:
                     DefaultExecutor(self.solana_client, max_retries=max_retries),
                 ]
             )
+            # R4-P0-3: keep the Jito leg reachable so the contention arm can
+            # escalate its tip (fallback chain hides it behind the chain).
+            self._jito_executor = self.executor.executors[0]
         else:
             self.executor = None
+            self._jito_executor = None
 
         # R3-P1-3: Jupiter aggregator fallback client (only built when the
         # feature is enabled; None otherwise keeps the fallback off).
@@ -626,6 +664,10 @@ class UniversalTrader:
         self._rug_buyers: dict[str, set[str]] = {}
         # R4-P1-3: insider-coordination tracker (fed the same buy events).
         from screening.coordination import CoFireTracker
+        from screening.grad_timing import (  # R4-P1-4
+            assess as grad_timing_assess,
+            load_band_stats,
+        )
 
         self._cofire = CoFireTracker()
         self.max_coordinated_supply_share = max_coordinated_supply_share
@@ -2160,6 +2202,22 @@ class UniversalTrader:
                     f"curve progress {progress_sol:.6f} SOL below "
                     f"min_curve_progress_sol {self.min_curve_progress_sol}"
                 )
+            # R4-P1-4: graduation-band advisory (log-only). Same `state` read
+            # as the progress gate, zero extra RPC: report which historical
+            # graduation-outcome band this curve progress falls in so the
+            # replay can correlate entries with grad outcomes. NEVER gates.
+            if self.grad_timing_enabled and progress_sol > 0:
+                timing = grad_timing_assess(progress_sol, self._grad_band_stats)
+                logger.info(
+                    f"[GRAD-TIMING] {token_info.symbol} progress "
+                    f"{progress_sol:.1f} SOL -> band '{timing.band}'"
+                    + (
+                        f" (hist median {timing.median_multiple}x, "
+                        f"nuke {timing.nuke_rate:.0%})"
+                        if timing.median_multiple is not None
+                        else ""
+                    )
+                )
 
             # T2.5 honeypot gates: freeze authority + curve supply-hold ratio.
             # Uses the state already fetched above (no extra curve RPC); the
@@ -2232,6 +2290,10 @@ class UniversalTrader:
         """Record one detector event (skip reason included) for research."""
         if self.shadow_capture is None:
             return
+        # R4-P0-3: every detected launch is a contention-clock tick (the
+        # flood rate feeds the fee-racing arm decision before a buy).
+        if self.contention_enabled:
+            self._contention_creates.append(monotonic())
         try:
             self.shadow_capture.detect(
                 mint=str(token_info.mint),
@@ -2368,6 +2430,60 @@ class UniversalTrader:
         except Exception:
             return 9
 
+    async def _update_contention_arms(self, quote_sol: float) -> None:
+        """R4-P0-3: arm/disarm fee-racing contention for the next send.
+
+        Launch flood = create-event rate over the trailing window above
+        contention_creates_per_min (the tierzero landing-collapse scenario:
+        plain fees land at 20-40% under launch competition). When armed,
+        BOTH fee managers escalate their bid by contention_multiplier and
+        tighten the cap to min(hard_cap, max_fee_fraction_of_position of
+        the quote) so a fee surge can never eat the position.
+
+        Off by default: contention_enabled False = today's behavior.
+        """
+        if not self.contention_enabled:
+            return
+        now = monotonic()
+        cutoff = now - self.contention_window_s
+        self._contention_creates[:] = [
+            t for t in self._contention_creates if t >= cutoff
+        ]
+        rate = len(self._contention_creates) * (
+            60.0 / max(self.contention_window_s, 1.0)
+        )
+        armed = rate >= self.contention_creates_per_min
+        cap = None
+        if armed and quote_sol > 0:
+            # Microlamports ceiling so the fee stays a small fraction of the
+            # position: price_microlamports * CU_used / 1e15 <= quote *
+            # fraction  => price <= quote * fraction * 1e15 / CU_used.
+            cu = self.compute_units.get("buy", 100_000) if self.compute_units else 100_000
+            cap = int(quote_sol * self.max_fee_fraction_of_position * 1e15 / cu)
+        self.priority_fee_manager.set_contention(armed, cap=cap)
+        self.sell_priority_fee_manager.set_contention(armed, cap=cap)
+        # R4-P0-3 Jito leg: escalate the bundle tip only up to the same
+        # fraction of the position (tip_lamports * scale <= quote * fraction
+        # * 1e9). Off (1.0) until armed.
+        jito_exec = getattr(self, "_jito_executor", None)
+        scale = 1.0
+        if jito_exec is not None and hasattr(jito_exec, "set_contention_tip_scale"):
+            base = float(getattr(jito_exec, "tip_lamports", 0) or 0)
+            if armed and base > 0 and quote_sol > 0:
+                max_tip = quote_sol * self.max_fee_fraction_of_position * 1e9
+                scale = min(
+                    self.contention_multiplier,
+                    max(1.0, max_tip / base),
+                )
+            jito_exec.set_contention_tip_scale(scale)
+        if armed:
+            logger.warning(
+                f"Launch flood detected: {rate:.1f} creates/min >= "
+                f"{self.contention_creates_per_min} — contention fees armed "
+                f"(multiplier {self.contention_multiplier}x, fee cap {cap}, "
+                f"jito tip x{scale:.2f})"
+            )
+
     async def _fragility_buy_scale(self, token_info: TokenInfo) -> float:
         """R4-P3-1: ME2F size multiplier for one candidate.
 
@@ -2493,6 +2609,10 @@ class UniversalTrader:
             # in real mode (the shared buyer keeps the configured size).
             frag_scale = await self._fragility_buy_scale(token_info)
             eff_quote = self.quote_amounts[token_quote_mint] * frag_scale
+            # R4-P0-3: arm contention racing BEFORE sending (off default).
+            await self._update_contention_arms(
+                float(self.quote_amounts.get(token_quote_mint, 0.0))
+            )
             if frag_scale < 1.0:
                 logger.info(
                     f"[FRAGILITY] {token_info.symbol} scaled to "

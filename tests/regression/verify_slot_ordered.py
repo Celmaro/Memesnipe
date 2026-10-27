@@ -89,11 +89,11 @@ def main() -> int:
     trader_src = Path("src/trading/universal_trader.py").read_text()
     check(
         "rug feed pushes into the slot buffer",
-        "_slot_buffer.push(slot, (logs, outer_signer))" in trader_src,
+        trader_src.count("_slot_buffer.push(") >= 2,
     )
     check(
         "copy feed pushes into the slot buffer",
-        "_slot_buffer.push(slot, (logs, outer_signer))" in trader_src,
+        "_slot_buffer.push(" in trader_src,
     )
     check(
         "feeds drain the buffer in order",

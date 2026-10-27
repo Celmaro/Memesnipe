@@ -66,7 +66,7 @@ EXIT_GRID = [
         "name": "staged_trail",
         "staged": True,
         "tp_share": 0.40,
-        "tp_pnl": 0.25,
+        "tp_pnl": 0.20,
         "floor_arm": 0.10,
         "floor_pct": 0.10,
         "trail_distance": 0.08,

@@ -59,6 +59,8 @@ def _trader(**kw):
         quote_amounts={Pubkey.from_string("So11111111111111111111111111111111111111112"): 0.01},
         max_transfer_fee_bps=None,
         solana_client=None,
+        grad_timing_enabled=False,  # R4-P1-4 mock
+        _grad_band_stats={},  # R4-P1-4 mock
     )
 
     async def gate(_self, token):

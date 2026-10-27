@@ -73,6 +73,8 @@ async def _shutdown_with(  # noqa: ANN202
     trader._momentum_peak_rate = {}  # R4-P1-8 mock state
     trader._momentum_peak_price = {}  # R4-P1-8 mock state
     trader.fragility_scale_min = 1.0  # R4-P3-1 mock default (off)
+    trader.grad_timing_enabled = False  # R4-P1-4 mock
+    trader._grad_band_stats = {}  # R4-P1-4 mock
     trader.fragility_whale_threshold = 0.6  # R4-P3-1 mock default
     trader.fragility_rate_threshold = 0.6  # R4-P3-1 mock default
     trader.stagnation_exit_min = 0  # R4-P1-9 mock default (off)

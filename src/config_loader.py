@@ -214,6 +214,37 @@ CONFIG_VALIDATION_RULES = [
         1.0,
         "filters.fragility_rate_threshold must be a fraction between 0 and 1",
     ),
+    # R4-P0-3: contention-mode fee racing (off by default).
+    (
+        "filters.contention_creates_per_min",
+        (int, float),
+        0.0,
+        10_000.0,
+        "filters.contention_creates_per_min must be a non-negative rate "
+        "(0 = off; 0 disables the arm entirely)",
+    ),
+    (
+        "filters.contention_multiplier",
+        (int, float),
+        1.0,
+        100.0,
+        "filters.contention_multiplier must be >= 1 (1 = no escalation)",
+    ),
+    (
+        "filters.contention_window_s",
+        (int, float),
+        1.0,
+        3_600.0,
+        "filters.contention_window_s must be a positive window in seconds",
+    ),
+    (
+        "filters.max_fee_fraction_of_position",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.max_fee_fraction_of_position must be a fraction between 0 and 1 "
+        "(0 = no fraction cap; 0.005 = 0.5% of the quote)",
+    ),
     (
         "filters.min_metadata_extensions",
         int,
@@ -426,6 +457,8 @@ BOOL_FIELDS = [
     "filters.exit_on_creator_sell",  # R3-P1-4
     "trade.event_driven_exits_enabled",  # R3-P2-12
     "node.startup_latency_test",  # R4-P4-3
+    "filters.contention_enabled",  # R4-P0-3
+    "trade.grad_timing_enabled",  # R4-P1-4 log-only advisory
     "copy_trader.enabled",
     "jito.dontfront",  # R3-P2-6
 ]

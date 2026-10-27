@@ -505,6 +505,14 @@ def check_f_single_token_mode_waits_past_refused_coins() -> bool:
         _creator_launch_ts={},  # R4-P1-2 cadence window
         max_coordinated_supply_share=0.0,  # R4-P1-3 off
         max_wash_share=0.0,  # R4-P1-6 off
+        grad_timing_enabled=False,  # R4-P1-4 mock
+        _grad_band_stats={},  # R4-P1-4 mock
+        contention_enabled=False,  # R4-P0-3 off
+        contention_multiplier=2.5,
+        contention_creates_per_min=20.0,
+        contention_window_s=60.0,
+        max_fee_fraction_of_position=0.005,
+        _jito_executor=None,
         _wash_lpi=WashLpiDetector(),  # R4-P1-6
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
         exit_on_creator_sell=False,  # R3-P1-4 off in verifiers

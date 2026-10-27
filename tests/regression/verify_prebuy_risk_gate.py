@@ -60,6 +60,8 @@ def _trader() -> UniversalTrader:
     t.max_coordinated_supply_share = 0.0  # R4-P1-3 mock default
     t.exit_mode = "tp_sl"  # R4-P1-7 mock default
     t.strategies_ledger = None  # R4-P1-7 mock default
+    t.grad_timing_enabled = False  # R4-P1-4 mock
+    t._grad_band_stats = {}  # R4-P1-4 mock
     t.blocked_creators = set()
     t.creator_pnl_store = None
     t.allow_mayhem_mode = True

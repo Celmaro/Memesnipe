@@ -81,6 +81,12 @@ def _make_trader(
     t.max_coordinated_supply_share = 0.0  # R4-P1-3 mock default
     t.exit_mode = "tp_sl"  # R4-P1-7 mock default
     t.strategies_ledger = None  # R4-P1-7 mock default
+    t.contention_enabled = False  # R4-P0-3 mock default
+    t.contention_multiplier = 2.5
+    t.contention_creates_per_min = 20.0
+    t.contention_window_s = 60.0
+    t.max_fee_fraction_of_position = 0.005
+    t._jito_executor = None
     from interfaces.core import Platform
 
     from interfaces.core import Platform

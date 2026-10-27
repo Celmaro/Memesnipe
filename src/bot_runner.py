@@ -306,6 +306,29 @@ async def start_bot(config_path: str):
             fragility_rate_threshold=cfg["filters"].get(
                 "fragility_rate_threshold", 0.6
             ),
+            # R4-P0-3: contention-mode fee racing (off by default).
+            contention_enabled=cfg.get("filters", {}).get(
+                "contention_enabled", False
+            ),
+            # R4-P1-4: graduation-band advisory (log-only).
+            grad_timing_enabled=cfg.get("trade", {}).get(
+                "grad_timing_enabled", False
+            ),
+            grad_band_stats_path=cfg.get("trade", {}).get(
+                "grad_band_stats_path", "state/grad_band_stats.json"
+            ),
+            contention_multiplier=cfg.get("filters", {}).get(
+                "contention_multiplier", 2.5
+            ),
+            contention_creates_per_min=cfg.get("filters", {}).get(
+                "contention_creates_per_min", 20.0
+            ),
+            contention_window_s=cfg.get("filters", {}).get(
+                "contention_window_s", 60.0
+            ),
+            max_fee_fraction_of_position=cfg.get("filters", {}).get(
+                "max_fee_fraction_of_position", 0.005
+            ),
             min_metadata_extensions=cfg["filters"].get(
                 "min_metadata_extensions", 0
             ),

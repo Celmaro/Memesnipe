@@ -59,7 +59,7 @@ research:
     - {name: tp20_sl10, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.10}}
     - {name: tp30_sl20, kind: tp_sl, config: {take_profit_pct: 0.30, stop_loss_pct: 0.20}}
     - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.25, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
-    - {name: trail10, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
+    - {name: trail10, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
     - {name: hold, kind: hold, config: {}}
 
 trade:
@@ -112,9 +112,9 @@ trade:
   # 8% behind each new high, exit on the floor or the -20% hard stop. The
   # same rule is shadow-tested in parallel via the strategies ledger
   # (research.strategies_ledger_enabled) regardless of which mode is active.
-  exit_mode: "trail10"
+  exit_mode: "staged_trail"
   trail_initial_tp_share: 0.4  # fraction of the position sold at first TP
-  trail_initial_tp_pct: 0.25  # +25% first take-profit level
+  trail_initial_tp_pct: 0.20  # +20% first take-profit level (sweep-tuned)
   trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
   trail_trail_pct: 0.08  # floor trails 8% behind each new high
   trail_hard_stop_pct: 0.20  # -20% hard stop before any profit is armed
@@ -123,6 +123,13 @@ trade:
   trail10_arm_pct: 0.10  # arm the trail once unrealized reaches +10%
   trail10_trail_pct: 0.10  # exit when price falls 10% off its peak
   trail10_hard_stop_pct: 0.20  # -20% hard stop if the trail never arms
+  # R4-P1-4: graduation-band entry-timing advisory (OFF, log-only). When
+  # on, each curve-gate read also logs which historical graduation-outcome
+  # band the curve progress falls in (nuke_zone <50 SOL / sweet_spot
+  # 85-120 SOL per the graduation monitor recut). NEVER gates a buy;
+  # band stats optional via grad_band_stats_path.
+  grad_timing_enabled: false
+  grad_band_stats_path: state/grad_band_stats.json
   # R3-P2-12: event-driven sell-fill (off by default = current polling). When
   # on, a TradeEvent from the bot's own wallet prompts the monitor to evaluate
   # the exit immediately instead of waiting for the next price-check tick.
@@ -286,6 +293,17 @@ filters:
   fragility_scale_min: 1.0
   fragility_whale_threshold: 0.6  # VDS/whale score trigger
   fragility_rate_threshold: 0.6  # SAS/trade-rate trigger
+  # R4-P0-3: contention-mode fee racing (OFF). When the launch-create rate
+  # over contention_window_s exceeds contention_creates_per_min (tierzero:
+  # landing collapses to 20-40% under launch competition), both fee managers
+  # escalate their bid by contention_multiplier and cap the fee at
+  # max_fee_fraction_of_position of the quote so a fee surge can never eat
+  # the position.
+  contention_enabled: false
+  contention_creates_per_min: 20.0
+  contention_multiplier: 2.5
+  contention_window_s: 60.0
+  max_fee_fraction_of_position: 0.005  # 0.5% of the trade quote
   # R3-P2-8: metadata socials gate (0 = off). When >0, require at least this
   # many non-empty metadata extensions (twitter/telegram/website) from the
   # token's metadata JSON. Fail-open until the refresher has read it.

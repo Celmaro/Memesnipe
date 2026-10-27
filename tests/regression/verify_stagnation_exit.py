@@ -99,6 +99,8 @@ def main() -> int:
     t_off._momentum_peak_rate = {}  # R4-P1-8 mock state
     t_off._momentum_peak_price = {}  # R4-P1-8 mock state
     t_off.fragility_scale_min = 1.0  # R4-P3-1 mock default (off)
+    t_off.grad_timing_enabled = False  # R4-P1-4 mock
+    t_off._grad_band_stats = {}  # R4-P1-4 mock
     t_off.fragility_whale_threshold = 0.6  # R4-P3-1 mock default
     t_off.fragility_rate_threshold = 0.6  # R4-P3-1 mock default
     t_off.stagnation_exit_min = 0

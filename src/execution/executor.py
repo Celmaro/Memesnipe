@@ -171,9 +171,23 @@ class JitoExecutor:
             self.endpoints = endpoints or JITO_BUNDLE_ENDPOINTS
         self.tip_lamports = tip_lamports
         self._tip_accounts = tip_accounts
+        # R4-P0-3: contention tip scaling. While armed, the tip sent to the
+        # block engine is tip_lamports * contention_tip_scale (off = 1.0).
+        self._contention_tip_scale = 1.0
         self.timeout_s = timeout_s
         self.auth_keypairs = auth_keypairs or []
         self._auth_round_robin = 0
+
+    def set_contention_tip_scale(self, scale: float) -> None:
+        """R4-P0-3: escalate the Jito tip during a launch flood.
+
+        Off by default (1.0). The trader arms THIS alongside the priority-fee
+        managers when contention-mode fees are on, so a bundled send still
+        races the flood. A tip surge can never exceed
+        max_fee_fraction_of_position: bot_runner applies the same fraction
+        cap when deriving the scale.
+        """
+        self._contention_tip_scale = max(1.0, float(scale))
 
     async def get_tip_accounts(self) -> list[Pubkey]:
         """Fetch current tip recipients from block-engine (cached 60s)."""
@@ -263,11 +277,15 @@ class JitoExecutor:
                     via="jito",
                 )
             tip_account = random.choice(tip_accounts)
+            # R4-P0-3: contention races escalate the block-engine tip by the
+            # armed scale (1.0 = off) so a bundled send competes with the
+            # launch flood.
+            tip_lamports = int(self.tip_lamports * self._contention_tip_scale)
             tip_ix = transfer(
                 TransferParams(
                     from_pubkey=signer_keypair.pubkey(),
                     to_pubkey=tip_account,
-                    lamports=self.tip_lamports,
+                    lamports=tip_lamports,
                 )
             )
             recent = await self.client.get_cached_blockhash()

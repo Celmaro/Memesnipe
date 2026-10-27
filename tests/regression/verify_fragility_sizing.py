@@ -126,6 +126,8 @@ def main() -> int:
     t2._momentum_peak_rate = {}  # R4-P1-8 mock state
     t2._momentum_peak_price = {}  # R4-P1-8 mock state
     t2.fragility_scale_min = 0.5
+    t2.grad_timing_enabled = False  # R4-P1-4 mock
+    t2._grad_band_stats = {}  # R4-P1-4 mock
     t2.fragility_whale_threshold = 0.6
     t2.fragility_rate_threshold = 0.6
     t2._wash_lpi = WashLpiDetector(lpi_small_quote_sol=0.05, min_jump_mult=3.0)
@@ -144,8 +146,16 @@ def main() -> int:
     # Off: scale_min 1.0 -> always 1.0.
     t3 = object.__new__(UniversalTrader)
     t3._momentum_peak_rate = {}  # R4-P1-8 mock state
+    t3.grad_timing_enabled = False  # R4-P1-4 mock
+    t3._grad_band_stats = {}  # R4-P1-4 mock
     t3._momentum_peak_price = {}  # R4-P1-8 mock state
     t3.fragility_scale_min = 1.0
+    t3.contention_enabled = False
+    t3.contention_multiplier = 2.5
+    t3.contention_creates_per_min = 20.0
+    t3.contention_window_s = 60.0
+    t3.max_fee_fraction_of_position = 0.005
+    t3._jito_executor = None
     t3.fragility_whale_threshold = 0.6
     t3.fragility_rate_threshold = 0.6
     t3._wash_lpi = WashLpiDetector()
