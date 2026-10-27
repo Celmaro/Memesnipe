@@ -87,7 +87,7 @@ class CreatorPnlStore:
     def is_blacklisted(
         self,
         creator: str,
-        min_trades: int = 3,
+        min_trades: int = 10,
         max_net_sol: float = 0.0,
     ) -> bool:
         """True when a creator's history is net-negative enough to skip.

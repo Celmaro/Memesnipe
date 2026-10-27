@@ -45,6 +45,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPLAY_BASE = "https://replay.pumpapi.io/{dt:%Y/%m/%d/%H}.jsonl.zst"
 OUT_DIR = PROJECT_ROOT / "state" / "replay"
 
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from research.cost_model import net_round_trip  # noqa: E402
+
 # ---- entry filter: mirror memesnipe.yaml (shadow mode of 2026-10-26) ----
 ENTRY = {
     "min_curve_progress_sol": 0.25,  # skip the first pixels of the curve
@@ -262,6 +265,10 @@ class ReplayBacktester:
             # staged: blend realized partial-leg pnl with the remaining share's
             # exit pnl (realized_pnl already size-weighted in %-of-position)
             pnl_pct = pos.realized_pnl + pos.remaining_share * pnl_pct
+        # R5-P1-3: net of modeled fees (pump.fun 1.25%/side + network). The
+        # audit's P1-3 — a +20% price move is not +20% realized. Computed on
+        # the blended gross, at the shadow position size.
+        net_pnl_pct = net_round_trip(pnl_pct / 100.0, ENTRY["position_sol"]) * 100
         self.trades_out.append(
             {
                 "strategy": pos.strategy,
@@ -271,6 +278,7 @@ class ReplayBacktester:
                 "exit_time": ts,
                 "hold_s": round(ts - pos.entry_time, 1),
                 "pnl_pct": round(pnl_pct, 2),
+                "net_pnl_pct": round(net_pnl_pct, 2),  # R5-P1-3
                 "exit_reason": reason,
                 "peak_pnl_pct": round((pos.peak_price / pos.entry_price - 1) * 100, 2),
             }
@@ -309,6 +317,7 @@ class ReplayBacktester:
                 out[name] = {"trades": 0}
                 continue
             pnls = [t["pnl_pct"] for t in trades]
+            net_pnls = [t.get("net_pnl_pct", t["pnl_pct"]) for t in trades]
             wins = [p for p in pnls if p > 0]
             total = sum(pnls)
             out[name] = {
@@ -316,6 +325,8 @@ class ReplayBacktester:
                 "winrate": round(len(wins) / len(trades) * 100, 1),
                 "avg_pnl_pct": round(total / len(trades), 2),
                 "total_pnl_pct": round(total, 1),
+                "avg_net_pct": round(sum(net_pnls) / len(net_pnls), 2),  # R5-P1-3
+                "total_net_pct": round(sum(net_pnls), 1),  # R5-P1-3
                 "median_hold_s": round(statistics.median(t["hold_s"] for t in trades), 1),
                 "exit_mix": _tally(t["exit_reason"] for t in trades),
                 "best": max(pnls),

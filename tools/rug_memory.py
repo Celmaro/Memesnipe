@@ -77,7 +77,16 @@ def ingest_shadow(ledger_glob: str = "2026-*.jsonl") -> int:
             if mark in seen:
                 continue
             # bot's realized PnL on 0.01 SOL sims, scaled to SOL
+            # R5-P0-3: net of modeled fees — gross shadow pnl overstates the
+            # creator's true result; blacklist evidence is cost-adjusted with
+            # the same model the strategy ledger uses for ranking.
             pnl_sol = (c.get("pnl_quote") or 0.0)
+            try:
+                from research.cost_model import net_round_trip
+
+                pnl_sol = net_round_trip(pnl_sol / 0.01, 0.01) * 0.01
+            except Exception:
+                pass  # cost model unavailable: keep gross (research tooling)
             store.record_trade(creator, pnl_sol)
             _mark_seen("shadow", mark)
             n += 1
