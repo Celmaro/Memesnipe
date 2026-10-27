@@ -38,6 +38,7 @@ def _trader(budget: float = 0.0, loss_limit: float = 0.0) -> SimpleNamespace:
             budget_sol=budget,
         ),
         shadow_capture=None,
+        shadow_mode=False,  # R5-P0-4: branch on mode, not capture presence
         solana_client=object(),
         wallet=SimpleNamespace(public_key="wallet"),
         priority_fee_manager=object(),

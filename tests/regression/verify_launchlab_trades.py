@@ -516,6 +516,7 @@ def check_f_single_token_mode_waits_past_refused_coins() -> bool:
         _wash_lpi=WashLpiDetector(),  # R4-P1-6
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
         exit_on_creator_sell=False,  # R3-P1-4 off in verifiers
+        _dynamic_screening_reason=lambda token_info, quote_mint=None: None,  # R5-P0-2
     )
     from trading.risk_guard import RiskTracker
 

@@ -108,6 +108,7 @@ def main() -> int:
         _creator_launch_ts={},  # R4-P1-2 cadence window
         _wash_lpi=WashLpiDetector(),  # R4-P1-6
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
+        _dynamic_screening_reason=lambda token_info, quote_mint=None: None,  # R5-P0-2
     )
     token = SimpleNamespace(
         creator="c1", user=None, quote_mint="So11111111111111111111111111111111111111112"
@@ -138,6 +139,7 @@ def main() -> int:
         _creator_launch_ts={},  # R4-P1-2 cadence window
         _wash_lpi=WashLpiDetector(),  # R4-P1-6
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
+        _dynamic_screening_reason=lambda token_info, quote_mint=None: None,  # R5-P0-2: dynamic gates off
     )
     reason2 = UniversalTrader._skip_reason(t2, token)
     check(
