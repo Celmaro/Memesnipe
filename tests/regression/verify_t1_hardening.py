@@ -128,6 +128,11 @@ check("watchdog sets force-reconnect", asyncio.run(_watchdog_probe()))
 from trading.universal_trader import UniversalTrader
 
 stub = object.__new__(UniversalTrader)
+stub._momentum_peak_rate = {}  # R4-P1-8 mock state
+stub._momentum_peak_price = {}  # R4-P1-8 mock state
+stub.fragility_scale_min = 1.0  # R4-P3-1 mock default (off)
+stub.fragility_whale_threshold = 0.6  # R4-P3-1 mock default
+stub.fragility_rate_threshold = 0.6  # R4-P3-1 mock default
 stub.stagnation_exit_min = 0  # R4-P1-9 mock default (off)
 stub.stagnation_band_pct = 0.02  # R4-P1-9 mock default
 stub.max_wash_share = 0.0  # R4-P1-6 mock default

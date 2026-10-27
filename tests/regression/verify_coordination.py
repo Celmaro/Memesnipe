@@ -81,6 +81,11 @@ def main() -> int:
     from trading.universal_trader import UniversalTrader
 
     t = object.__new__(UniversalTrader)
+    t._momentum_peak_rate = {}  # R4-P1-8 mock state
+    t._momentum_peak_price = {}  # R4-P1-8 mock state
+    t.fragility_scale_min = 1.0  # R4-P3-1 mock default (off)
+    t.fragility_whale_threshold = 0.6  # R4-P3-1 mock default
+    t.fragility_rate_threshold = 0.6  # R4-P3-1 mock default
     t.stagnation_exit_min = 0  # R4-P1-9 mock default (off)
     t.stagnation_band_pct = 0.02  # R4-P1-9 mock default
     t.max_wash_share = 0.0  # R4-P1-6 mock default
@@ -109,6 +114,11 @@ def main() -> int:
         f"-> {share_v:.3f} > {t.max_coordinated_supply_share}",
     )
     t2 = object.__new__(UniversalTrader)
+    t2._momentum_peak_rate = {}  # R4-P1-8 mock state
+    t2._momentum_peak_price = {}  # R4-P1-8 mock state
+    t2.fragility_scale_min = 1.0  # R4-P3-1 mock default (off)
+    t2.fragility_whale_threshold = 0.6  # R4-P3-1 mock default
+    t2.fragility_rate_threshold = 0.6  # R4-P3-1 mock default
     t2.stagnation_exit_min = 0  # R4-P1-9 mock default (off)
     t2.stagnation_band_pct = 0.02  # R4-P1-9 mock default
     t2.max_wash_share = 0.0  # R4-P1-6 mock default

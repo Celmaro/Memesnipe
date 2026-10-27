@@ -127,3 +127,20 @@ class WashLpiDetector:
                     flags += 1
                     break
         return flags
+
+    def price_path(self, mint: str) -> list[float]:
+        """Observed implied unit prices for the mint (R4-P3-1 VDS input)."""
+        events = self._events.get(mint)
+        if not events:
+            return []
+        return [px for (_ts, _w, _ib, _q, px) in events if px is not None and px > 0]
+
+    def event_rate_per_min(self, mint: str) -> float | None:
+        """Fills/min over the observed window (R4-P3-1 SAS input)."""
+        events = self._events.get(mint)
+        if not events:
+            return None
+        span = events[-1][0] - events[0][0]
+        if span <= 0:
+            return None
+        return len(events) / (span / 60.0)

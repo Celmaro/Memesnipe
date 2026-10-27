@@ -192,6 +192,28 @@ CONFIG_VALIDATION_RULES = [
         1.0,
         "filters.max_wash_share must be a fraction between 0 and 1 (0 = off)",
     ),
+    # R4-P3-1: fragility-scaled sizing (scale_min 1.0 = off; 0.05..1.0).
+    (
+        "filters.fragility_scale_min",
+        (int, float),
+        0.05,
+        1.0,
+        "filters.fragility_scale_min must be between 0.05 and 1.0 (1.0 = off)",
+    ),
+    (
+        "filters.fragility_whale_threshold",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.fragility_whale_threshold must be a fraction between 0 and 1",
+    ),
+    (
+        "filters.fragility_rate_threshold",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.fragility_rate_threshold must be a fraction between 0 and 1",
+    ),
     (
         "filters.min_metadata_extensions",
         int,
@@ -424,7 +446,7 @@ VALID_VALUES = {
     "cleanup.mode": ["disabled", "on_fail", "after_sell", "post_session"],
     "trade.exit_strategy": ["time_based", "tp_sl", "manual"],
     # R4-P1-7: exit mode selects the exit SHAPE within tp_sl-family paths.
-    "trade.exit_mode": ["tp_sl", "staged_trail"],
+    "trade.exit_mode": ["tp_sl", "staged_trail", "trail10"],
     "platform": ["pump_fun", "lets_bonk", "stonk_fun"],
 }
 

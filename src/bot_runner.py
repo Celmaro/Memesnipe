@@ -190,6 +190,9 @@ async def start_bot(config_path: str):
             trail_arm_pct=cfg["trade"].get("trail_arm_pct", 0.10),
             trail_trail_pct=cfg["trade"].get("trail_trail_pct", 0.08),
             trail_hard_stop_pct=cfg["trade"].get("trail_hard_stop_pct", 0.20),
+            trail10_arm_pct=cfg["trade"].get("trail10_arm_pct", 0.10),
+            trail10_trail_pct=cfg["trade"].get("trail10_trail_pct", 0.10),
+            trail10_hard_stop_pct=cfg["trade"].get("trail10_hard_stop_pct", 0.20),
             take_profit_percentage=cfg["trade"].get("take_profit_percentage"),
             stop_loss_percentage=cfg["trade"].get("stop_loss_percentage"),
             tp_ranges=cfg["trade"].get("tp_ranges") or [],
@@ -296,6 +299,13 @@ async def start_bot(config_path: str):
                 "max_coordinated_supply_share", 0.0
             ),
             max_wash_share=cfg["filters"].get("max_wash_share", 0.0),
+            fragility_scale_min=cfg["filters"].get("fragility_scale_min", 1.0),
+            fragility_whale_threshold=cfg["filters"].get(
+                "fragility_whale_threshold", 0.6
+            ),
+            fragility_rate_threshold=cfg["filters"].get(
+                "fragility_rate_threshold", 0.6
+            ),
             min_metadata_extensions=cfg["filters"].get(
                 "min_metadata_extensions", 0
             ),

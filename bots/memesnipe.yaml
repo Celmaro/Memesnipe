@@ -112,12 +112,17 @@ trade:
   # 8% behind each new high, exit on the floor or the -20% hard stop. The
   # same rule is shadow-tested in parallel via the strategies ledger
   # (research.strategies_ledger_enabled) regardless of which mode is active.
-  exit_mode: "tp_sl"
+  exit_mode: "trail10"
   trail_initial_tp_share: 0.4  # fraction of the position sold at first TP
   trail_initial_tp_pct: 0.25  # +25% first take-profit level
   trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
   trail_trail_pct: 0.08  # floor trails 8% behind each new high
   trail_hard_stop_pct: 0.20  # -20% hard stop before any profit is armed
+  # trail10 (exit_mode "trail10"): pure trailing stop, backtest winner
+  # (5h replay, 2420 trades: +25.1% avg vs +16.7% tp_sl, 67.8% WR)
+  trail10_arm_pct: 0.10  # arm the trail once unrealized reaches +10%
+  trail10_trail_pct: 0.10  # exit when price falls 10% off its peak
+  trail10_hard_stop_pct: 0.20  # -20% hard stop if the trail never arms
   # R3-P2-12: event-driven sell-fill (off by default = current polling). When
   # on, a TradeEvent from the bot's own wallet prompts the monitor to evaluate
   # the exit immediately instead of waiting for the next price-check tick.
@@ -275,6 +280,12 @@ filters:
   # round-trip the same mint (fake volume; 2507.01963: 82.8% of high-return
   # tokens show artificial growth).
   max_wash_share: 0.0
+  # R4-P3-1: fragility-scaled position sizing (1.0 = off). When the
+  # ME2F two-signal trigger fires (volatility/whale score AND trade rate
+  # both >= thresholds), buy size scales down toward fragility_scale_min.
+  fragility_scale_min: 1.0
+  fragility_whale_threshold: 0.6  # VDS/whale score trigger
+  fragility_rate_threshold: 0.6  # SAS/trade-rate trigger
   # R3-P2-8: metadata socials gate (0 = off). When >0, require at least this
   # many non-empty metadata extensions (twitter/telegram/website) from the
   # token's metadata JSON. Fail-open until the refresher has read it.

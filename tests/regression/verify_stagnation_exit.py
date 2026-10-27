@@ -60,6 +60,11 @@ def main() -> int:
         return lower <= current_price <= upper
 
     t = object.__new__(UniversalTrader)
+    t._momentum_peak_rate = {}  # R4-P1-8 mock state
+    t._momentum_peak_price = {}  # R4-P1-8 mock state
+    t.fragility_scale_min = 1.0  # R4-P3-1 mock default (off)
+    t.fragility_whale_threshold = 0.6  # R4-P3-1 mock default
+    t.fragility_rate_threshold = 0.6  # R4-P3-1 mock default
     t.stagnation_exit_min = 5  # minutes
     t.stagnation_band_pct = 0.02  # +/-2%
 
@@ -91,6 +96,11 @@ def main() -> int:
 
     # 3. Threshold 0 = off.
     t_off = object.__new__(UniversalTrader)
+    t_off._momentum_peak_rate = {}  # R4-P1-8 mock state
+    t_off._momentum_peak_price = {}  # R4-P1-8 mock state
+    t_off.fragility_scale_min = 1.0  # R4-P3-1 mock default (off)
+    t_off.fragility_whale_threshold = 0.6  # R4-P3-1 mock default
+    t_off.fragility_rate_threshold = 0.6  # R4-P3-1 mock default
     t_off.stagnation_exit_min = 0
     t_off.stagnation_band_pct = 0.02
     check(

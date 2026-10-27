@@ -169,8 +169,10 @@ def main() -> int:
     )
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML default exit_mode tp_sl",
-        cfg["trade"].get("exit_mode") == "tp_sl",
+        "YAML exit_mode is a VALID_VALUES member",
+        cfg["trade"].get("exit_mode") in config_loader.VALID_VALUES.get(
+            "trade.exit_mode", []
+        ),
         f"-> {cfg['trade'].get('exit_mode')!r}",
     )
     check(

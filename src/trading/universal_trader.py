@@ -228,6 +228,11 @@ class UniversalTrader:
         trail_arm_pct: float = 0.10,
         trail_trail_pct: float = 0.08,
         trail_hard_stop_pct: float = 0.20,
+        # trail10 knobs (exit_mode "trail10"): pure trailing stop, no
+        # initial TP leg - arm at +10%, trail 10% off the peak, -20% stop.
+        trail10_arm_pct: float = 0.10,
+        trail10_trail_pct: float = 0.10,
+        trail10_hard_stop_pct: float = 0.20,
         take_profit_percentage: float | None = None,
         stop_loss_percentage: float | None = None,
         # R3-P1-2: staged TP/SL ranges (off by default = current single
@@ -299,6 +304,13 @@ class UniversalTrader:
         # (buy+sell the same mint) — fake volume (2507.01963). Fed by the
         # trade feed; fail-open (0) until observed.
         max_wash_share: float = 0.0,
+        # R4-P3-1: fragility-scaled position sizing (ME2F; 0/1 = off).
+        # When the holder-distribution whale score AND the observed trade
+        # rate both spike (the paper's two-score trigger), buy size scales
+        # down toward fragility_scale_min (1.0 = flat sizing, off).
+        fragility_scale_min: float = 1.0,
+        fragility_whale_threshold: float = 0.6,
+        fragility_rate_threshold: float = 0.6,
         # R3-P0-2: Mayhem Mode coins are a distinct asset class (AI agent
         # mints +1B tokens and trades randomly for 24h; 1 in 50 graduations
         # fills the pool). Off by default: mayhem coins are skipped entirely.
@@ -583,9 +595,7 @@ class UniversalTrader:
             geyser_api_token=geyser_api_token,
             geyser_auth_type=geyser_auth_type,
             platforms=[self.platform],  # Only listen for our platform
-            in_stream_updates_enabled=getattr(
-                self, "in_stream_updates_enabled", False
-            ),
+            in_stream_updates_enabled=getattr(self, "in_stream_updates_enabled", False),
         )
 
         # Trading parameters
@@ -625,6 +635,14 @@ class UniversalTrader:
 
         self._wash_lpi = WashLpiDetector()
         self.max_wash_share = max_wash_share
+        # R4-P1-8: momentum-fade advisory state (log-only; peak trade rate
+        # and peak price per mint for the -50%-rate-without-new-high test).
+        self._momentum_peak_rate: dict[str, float] = {}
+        self._momentum_peak_price: dict[str, float] = {}
+        # R4-P3-1: fragility sizing knobs (off defaults).
+        self.fragility_scale_min = fragility_scale_min
+        self.fragility_whale_threshold = fragility_whale_threshold
+        self.fragility_rate_threshold = fragility_rate_threshold
         # mint -> (entry_slot, entry_real_quote_lamports)
         self._rug_entry: dict[str, tuple[int, float]] = {}
         self.max_retries = max_retries
@@ -637,6 +655,9 @@ class UniversalTrader:
         # same VALID_VALUES list as exit_strategy at config load; here we
         # keep a normalized lowercased copy plus the trail configuration.
         self.exit_mode = exit_mode.lower()
+        self.trail10_arm_pct = trail10_arm_pct
+        self.trail10_trail_pct = trail10_trail_pct
+        self.trail10_hard_stop_pct = trail10_hard_stop_pct
         self.trail_initial_tp_share = float(trail_initial_tp_share)
         self.trail_initial_tp_pct = float(trail_initial_tp_pct)
         self.trail_arm_pct = float(trail_arm_pct)
@@ -922,6 +943,7 @@ class UniversalTrader:
         logger.info(f"Marry mode: {self.marry_mode}")
         logger.info(f"YOLO mode: {self.yolo_mode}")
         logger.info(f"Exit strategy: {self.exit_strategy}")
+        logger.info(f"Exit mode: {self.exit_mode}")
 
         if self.exit_strategy == "tp_sl":
             logger.info(
@@ -1144,7 +1166,9 @@ class UniversalTrader:
                 # out-of-order geyser delivery must not mirror a leader buy
                 # before the fill it depends on.
                 if self.slot_ordered_feed_enabled and self._slot_buffer is not None:
-                    if slot is not None and self._slot_buffer.push(slot, (logs, outer_signer)):
+                    if slot is not None and self._slot_buffer.push(
+                        slot, (logs, outer_signer)
+                    ):
                         for buffered_logs, buffered_signer in self._slot_buffer.drain():
                             await self._consume_copy_logs(
                                 engine, buffered_logs, buffered_signer
@@ -1198,7 +1222,9 @@ class UniversalTrader:
                 # delivery must not let a later fill count a buyer/creator
                 # before the earlier one (position state stays consistent).
                 if self.slot_ordered_feed_enabled and self._slot_buffer is not None:
-                    if slot is not None and self._slot_buffer.push(slot, (logs, outer_signer)):
+                    if slot is not None and self._slot_buffer.push(
+                        slot, (logs, outer_signer)
+                    ):
                         for buffered_logs, buffered_signer in self._slot_buffer.drain():
                             await self._consume_trade_logs(
                                 buffered_logs, buffered_signer
@@ -1393,7 +1419,11 @@ class UniversalTrader:
             )
 
             meta_pda, _ = Pubkey.find_program_address(
-                [b"metadata", Pubkey.from_string(METADATA_PROGRAM).__bytes__(), mint_pk.__bytes__()],
+                [
+                    b"metadata",
+                    Pubkey.from_string(METADATA_PROGRAM).__bytes__(),
+                    mint_pk.__bytes__(),
+                ],
                 Pubkey.from_string(METADATA_PROGRAM),
             )
             try:
@@ -1446,7 +1476,9 @@ class UniversalTrader:
         try:
             timeout = aiohttp.ClientTimeout(total=4.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(uri, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                async with session.get(
+                    uri, headers={"User-Agent": "Mozilla/5.0"}
+                ) as resp:
                     if resp.status != 200:
                         return ""
                     return (await resp.text())[:65_536]
@@ -1471,7 +1503,9 @@ class UniversalTrader:
         # snipe buy; the loss limit and budget apply to mirrors too.
         if not self.risk_tracker.buy_allowed:
             reason = self.risk_tracker.blocked_reason or "risk guard blocked"
-            logger.warning(f"Copy-trader: skipping mirror on {token_info.symbol} - {reason}")
+            logger.warning(
+                f"Copy-trader: skipping mirror on {token_info.symbol} - {reason}"
+            )
             return False
         try:
             if self.shadow_capture is not None:
@@ -1522,9 +1556,7 @@ class UniversalTrader:
             logger.exception("Copy-trader mirror buy raised")
             return False
 
-    async def _race_kpi_fields(
-        self, token_info: TokenInfo
-    ) -> dict[str, Any]:
+    async def _race_kpi_fields(self, token_info: TokenInfo) -> dict[str, Any]:
         """R4-P0-4/1: landed-slot + reordering-slippage fields for the
         shadow ledger.
 
@@ -1939,7 +1971,9 @@ class UniversalTrader:
             window[:] = [t for t in window if t >= cutoff]
             # Launches/hour over the observed window (min 60s denominator so
             # a single launch doesn't read as infinite).
-            window_span = max((now - (window[0] if window else now)) / 3600.0, 1.0 / 60.0)
+            window_span = max(
+                (now - (window[0] if window else now)) / 3600.0, 1.0 / 60.0
+            )
             cadence = len(window) / window_span
             if self.factory_deploy_rate > 0 and cadence > self.factory_deploy_rate:
                 return (
@@ -2334,6 +2368,49 @@ class UniversalTrader:
         except Exception:
             return 9
 
+    async def _fragility_buy_scale(self, token_info: TokenInfo) -> float:
+        """R4-P3-1: ME2F size multiplier for one candidate.
+
+        The paper's action rule is two-signal: "VDS and SAS both high ->
+        tighten risk". Volatility dynamics here is the max of the observed
+        price-path volatility and the holder-distribution whale score
+        (concentrated holders = fragile structure); sentiment amplification
+        is the observed trade rate. Unknown dims fail open (no scale).
+        Off by default (scale_min 1.0 = flat sizing).
+        """
+        if self.fragility_scale_min >= 1.0:
+            return 1.0
+        from screening.fragility import (
+            fragility_scale,
+            sentiment_score,
+            volatility_score,
+            whale_score,
+        )
+
+        snap = self._holder_store.get(str(token_info.mint))
+        whale = whale_score(
+            snap.gini if snap else None,
+            snap.top10_fraction if snap else None,
+        )
+        prices = self._wash_lpi.price_path(str(token_info.mint))
+        vds_path = volatility_score(prices)
+        # Whale dominance acts as structural fragility: a concentrated
+        # holder set is a fragile structure even before the price swings.
+        vds = (
+            max(vds_path, whale)
+            if vds_path is not None and whale is not None
+            else (vds_path or whale)
+        )
+        rate = self._wash_lpi.event_rate_per_min(str(token_info.mint))
+        sas = sentiment_score([rate] if rate is not None else None)
+        return fragility_scale(
+            vds,
+            sas,
+            scale_min=self.fragility_scale_min,
+            vds_threshold=self.fragility_whale_threshold,
+            sas_threshold=self.fragility_rate_threshold,
+        )
+
     async def _handle_token(self, token_info: TokenInfo) -> None:
         """Handle a new token creation event."""
         try:
@@ -2411,17 +2488,25 @@ class UniversalTrader:
                 f"{token_quote_mint} worth of {token_info.symbol} "
                 f"on {token_info.platform.value}..."
             )
+            # R4-P3-1: ME2F fragility size multiplier (1.0 = off). Applied
+            # to the quote spent in shadow and to a per-trade scaled buyer
+            # in real mode (the shared buyer keeps the configured size).
+            frag_scale = await self._fragility_buy_scale(token_info)
+            eff_quote = self.quote_amounts[token_quote_mint] * frag_scale
+            if frag_scale < 1.0:
+                logger.info(
+                    f"[FRAGILITY] {token_info.symbol} scaled to "
+                    f"{frag_scale:.2f}x ({eff_quote:.6f} "
+                    f"quote vs {self.quote_amounts[token_quote_mint]:.6f})"
+                )
             if self.shadow_mode:
                 # Shadow/paper mode (#8): simulate the fill at the current
                 # curve price (like the normal path would price it) and run
                 # the exit machinery against the simulated position. No
                 # transaction is sent and nothing is logged as spent.
                 sim_price = await self._read_price(token_info)
-                sim_amount = (
-                    self.quote_amounts[token_quote_mint] / sim_price
-                    if sim_price > 0
-                    else 0.0
-                )
+                sim_quote = eff_quote
+                sim_amount = sim_quote / sim_price if sim_price > 0 else 0.0
                 logger.info(
                     f"[SHADOW] would buy {sim_amount:.4f} {token_info.symbol} "
                     f"at {sim_price:.3e} SOL/token (no tx sent)"
@@ -2442,7 +2527,7 @@ class UniversalTrader:
                         platform=token_info.platform.value,
                         price=sim_price,
                         amount_tokens=sim_amount,
-                        quote_spent=self.quote_amounts.get(token_quote_mint, 0.0),
+                        quote_spent=sim_quote,
                         pool_snapshot=await self._pool_snapshot(token_info),
                         **fee_fields,
                         **race_fields,
@@ -2457,9 +2542,7 @@ class UniversalTrader:
                             platform=token_info.platform.value,
                             entry_price=sim_price,
                             amount_tokens=sim_amount,
-                            quote_spent=self.quote_amounts.get(
-                                token_quote_mint, 0.0
-                            ),
+                            quote_spent=sim_quote,
                             pool_snapshot=await self._pool_snapshot(token_info),
                             **fee_fields,
                             **race_fields,
@@ -2468,13 +2551,37 @@ class UniversalTrader:
                 # R3-P2-13: a buy never overlaps an in-flight sell (WSOL
                 # wrap/unwrap balance race). No-op without contention.
                 async with self._trade_serialization_lock:
-                    buy_result: TradeResult = await self.buyer.execute(token_info)
+                    if frag_scale < 1.0:
+                        # R4-P3-1: a fragile coin gets a per-trade SCALED
+                        # buyer (same pattern as _mirror_buy); the shared
+                        # buyer keeps the configured size for stable coins.
+                        from trading.platform_aware import PlatformAwareBuyer
+
+                        scaled_buyer = PlatformAwareBuyer(
+                            self.solana_client,
+                            self.wallet,
+                            self.priority_fee_manager,
+                            self.buy_amount * frag_scale,
+                            self.buy_slippage,
+                            self.max_retries,
+                            self.extreme_fast_token_amount,
+                            self.extreme_fast_mode,
+                            compute_units=self.compute_units,
+                            quote_amounts={
+                                q: v * frag_scale for q, v in self.quote_amounts.items()
+                            },
+                            curve_refresh_budget=2.0,
+                            trust_create_event=True,
+                            executor=self.executor,
+                        )
+                        buy_result: TradeResult = await scaled_buyer.execute(token_info)
+                    else:
+                        buy_result: TradeResult = await self.buyer.execute(token_info)
 
             if buy_result.success:
-                # R3-P2-10: track the buy for concurrency/budget accounting.
-                self.risk_tracker.record_buy(
-                    float(self.quote_amounts.get(token_quote_mint, 0.0))
-                )
+                # R3-P2-10: track the buy for concurrency/budget accounting
+                # using the EFFECTIVE quote spent (fragility-scaled).
+                self.risk_tracker.record_buy(float(eff_quote))
                 await self._handle_successful_buy(token_info, buy_result)
             else:
                 await self._handle_failed_buy(token_info, buy_result)
@@ -2618,6 +2725,47 @@ class UniversalTrader:
             self.cleanup_force_close_with_burn,
         )
 
+    async def _emit_shadow_mark(
+        self,
+        token_info: TokenInfo,
+        position: Position,
+        current_price: float,
+        quote_label: str,
+    ) -> None:
+        """Rate-limited sim_mark + strategies-ledger tick (every ~15s).
+
+        Shared by the tp_sl and trail exit paths so open positions stay
+        replayable regardless of exit mode.
+        """
+        if not (self.shadow_mode and self.shadow_capture is not None):
+            return
+        pnl = position.get_pnl(current_price)
+        mark_interval = max(1, 15 // max(1, self.price_check_interval))
+        self._mark_tick = getattr(self, "_mark_tick", 0) + 1
+        if self._mark_tick % mark_interval != 0:
+            return
+        logger.info(
+            f"[SHADOW] {token_info.symbol} unrealized: "
+            f"{pnl['price_change_pct']:+.2f}% "
+            f"({pnl['unrealized_pnl_quote']:+.6f} {quote_label}) "
+            f"price {current_price:.3e}"
+        )
+        self.shadow_capture.mark(
+            mint=str(token_info.mint),
+            symbol=token_info.symbol,
+            platform=token_info.platform.value,
+            price=current_price,
+            pnl_pct=float(pnl["price_change_pct"]),
+            pnl_quote=float(pnl["unrealized_pnl_quote"]),
+            hold_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
+        )
+        if self.strategies_ledger is not None:
+            self.strategies_ledger.decide(
+                mint=str(position.mint),
+                current_price=current_price,
+                hold_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
+            )
+
     async def _handle_tp_sl_exit(
         self, token_info: TokenInfo, buy_result: TradeResult
     ) -> None:
@@ -2626,6 +2774,9 @@ class UniversalTrader:
             await self._tp_sl_exit_inner(token_info, buy_result)
         finally:
             self._active_exit_mints.discard(str(token_info.mint))
+            # trail states are per-position; a stale one would give a
+            # re-opened mint the previous run's floor/peak
+            self._trail_states.pop(str(token_info.mint), None)
 
     async def _tp_sl_exit_inner(
         self, token_info: TokenInfo, buy_result: TradeResult
@@ -3111,12 +3262,19 @@ class UniversalTrader:
                 # "staged_trail", this runs INSTEAD of the single TP/SL
                 # check for the remainder of the position (the initial TP
                 # share + trailing floor). Disabled-first (tp_sl default).
-                if self.exit_mode == "staged_trail":
+                if self.exit_mode in ("staged_trail", "trail10"):
                     trail_exit = await self._handle_staged_trail_exit(
                         token_info, position, current_price
                     )
                     if trail_exit:
                         break
+                    # Emit the research mark/ledger tick here too: the shared
+                    # mark block below is only reached on the tp_sl path, and
+                    # skipping it left trail positions with no sim_mark and
+                    # no strategies-ledger decide rows (audit 2026-10-27).
+                    await self._emit_shadow_mark(
+                        token_info, position, current_price, quote_label
+                    )
                     # Keep monitoring: the floor re-arms as the price runs.
                     await asyncio.sleep(self.price_check_interval)
                     continue
@@ -3232,47 +3390,54 @@ class UniversalTrader:
                     # Log current status
                     exit_sell_attempts = 0
                     pnl = position.get_pnl(current_price)
-                    # Unrealized PnL is normally a debug line; in shadow mode
-                    # surface it at INFO every ~15s and record a `sim_mark`
-                    # research event, so open positions are replayable without
-                    # waiting for the close.
-                    mark_interval = max(1, 15 // max(1, self.price_check_interval))
-                    self._mark_tick = getattr(self, "_mark_tick", 0) + 1
-                    shadow_mark = (
-                        self.shadow_mode
-                        and self.shadow_capture is not None
-                        and self._mark_tick % mark_interval == 0
+                    # Research tick: rate-limited sim_mark + ledger decide,
+                    # shared with the trail exit path via _emit_shadow_mark.
+                    await self._emit_shadow_mark(
+                        token_info, position, current_price, quote_label
                     )
-                    if shadow_mark:
-                        logger.info(
-                            f"[SHADOW] {token_info.symbol} unrealized: "
-                            f"{pnl['price_change_pct']:+.2f}% "
-                            f"({pnl['unrealized_pnl_quote']:+.6f} {quote_label}) "
-                            f"price {current_price:.3e}"
+                    # R4-P1-8: momentum-fade advisory (LOG-ONLY, no
+                    # behavior change). The 53-trade cohort: volume
+                    # -50% from peak while price is not making new highs
+                    # = distribution, exit is the norm. Track the peak
+                    # trade rate per mint and log a hint when the rate
+                    # halves without a new price high. A replay can act
+                    # on the hint later; shadow mode only reports it.
+                    try:
+                        rate = self._wash_lpi.event_rate_per_min(str(position.mint))
+                        peak_rate = self._momentum_peak_rate.get(
+                            str(position.mint), 0.0
                         )
-                        self.shadow_capture.mark(
-                            mint=str(token_info.mint),
-                            symbol=token_info.symbol,
-                            platform=token_info.platform.value,
-                            price=current_price,
-                            pnl_pct=float(pnl["price_change_pct"]),
-                            pnl_quote=float(pnl["unrealized_pnl_quote"]),
-                            hold_seconds=(
-                                datetime.utcnow() - position.entry_time
-                            ).total_seconds(),
+                        peak_price = self._momentum_peak_price.get(
+                            str(position.mint), 0.0
                         )
-                        # R4-P1-7: feed the same price mark to the strategies
-                        # ledger so every registered strategy evaluates the
-                        # live price path in parallel (shadow only).
-                        if self.strategies_ledger is not None:
-                            self.strategies_ledger.decide(
-                                mint=str(position.mint),
-                                current_price=current_price,
-                                hold_seconds=(
-                                    datetime.utcnow() - position.entry_time
-                                ).total_seconds(),
-                            )
-                    elif logger.isEnabledFor(10):
+                        if rate is not None:
+                            if rate > peak_rate or current_price > peak_price:
+                                self._momentum_peak_rate[str(position.mint)] = max(
+                                    peak_rate, rate
+                                )
+                                self._momentum_peak_price[str(position.mint)] = max(
+                                    peak_price, current_price
+                                )
+                            elif (
+                                peak_rate > 0
+                                and rate < 0.5 * peak_rate
+                                and current_price <= peak_price * 1.05
+                            ):
+                                logger.info(
+                                    f"[SHADOW] momentum-fade hint for "
+                                    f"{token_info.symbol}: trade rate "
+                                    f"{rate:.1f}/min < 50% of peak "
+                                    f"{peak_rate:.1f}/min with no new "
+                                    f"high (price {current_price:.3e} vs "
+                                    f"peak {peak_price:.3e}) — "
+                                    f"distribution risk"
+                                )
+                    except Exception:
+                        logger.debug(
+                            "momentum-fade hint failed (non-fatal)",
+                            exc_info=True,
+                        )
+                    if logger.isEnabledFor(10):
                         logger.debug(
                             f"Position status: {current_price:.8f} {quote_label} "
                             f"({pnl['price_change_pct']:+.2f}%)"
@@ -3281,13 +3446,12 @@ class UniversalTrader:
                 # Wait before next price check
                 # R3-P2-12: an own-wallet trade prompt skips the wait so the
                 # exit is evaluated immediately (off by default = polling).
-                if self.event_driven_exits_enabled and str(
-                    token_info.mint
-                ) in self._own_trade_prompt:
+                if (
+                    self.event_driven_exits_enabled
+                    and str(token_info.mint) in self._own_trade_prompt
+                ):
                     self._own_trade_prompt.discard(str(token_info.mint))
-                    logger.debug(
-                        f"Event-driven exit prompt for {token_info.symbol}"
-                    )
+                    logger.debug(f"Event-driven exit prompt for {token_info.symbol}")
                     continue
                 await asyncio.sleep(self.price_check_interval)
 
@@ -3453,14 +3617,27 @@ class UniversalTrader:
         mint_key = str(token_info.mint)
         state = self._trail_states.get(mint_key)
         if state is None:
-            state = TrailExitState(
-                entry_price=position.entry_price or 0.0,
-                initial_tp_share=self.trail_initial_tp_share,
-                initial_tp_pct=self.trail_initial_tp_pct,
-                arm_pct=self.trail_arm_pct,
-                trail_pct=self.trail_trail_pct,
-                hard_stop_pct=self.trail_hard_stop_pct,
-            )
+            if self.exit_mode == "trail10":
+                # Pure trailing stop: no initial TP leg (share=0), arm at
+                # +trail10_arm_pct, trail trail10_trail_pct off the peak,
+                # hard stop trail10_hard_stop_pct.
+                state = TrailExitState(
+                    entry_price=position.entry_price or 0.0,
+                    initial_tp_share=0.0,
+                    initial_tp_pct=self.trail10_arm_pct,
+                    arm_pct=self.trail10_arm_pct,
+                    trail_pct=self.trail10_trail_pct,
+                    hard_stop_pct=self.trail10_hard_stop_pct,
+                )
+            else:
+                state = TrailExitState(
+                    entry_price=position.entry_price or 0.0,
+                    initial_tp_share=self.trail_initial_tp_share,
+                    initial_tp_pct=self.trail_initial_tp_pct,
+                    arm_pct=self.trail_arm_pct,
+                    trail_pct=self.trail_trail_pct,
+                    hard_stop_pct=self.trail_hard_stop_pct,
+                )
             self._trail_states[mint_key] = state
 
         decision = state.on_tick(current_price)
