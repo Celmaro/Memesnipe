@@ -74,6 +74,21 @@ CONFIG_VALIDATION_RULES = [
         10.0,
         "priority_fees.bid_multiplier must be between 1.0 and 10.0",
     ),
+    # R4-P1-9: stagnation exit (0 = off; minutes must be non-negative).
+    (
+        "trade.stagnation_exit_min",
+        int,
+        0,
+        1440,
+        "trade.stagnation_exit_min is minutes and must be non-negative (0 = off)",
+    ),
+    (
+        "trade.stagnation_band_pct",
+        (int, float),
+        0.0,
+        1.0,
+        "trade.stagnation_band_pct must be a fraction between 0 and 1",
+    ),
     (
         "priority_fees.fee_cache_ttl",
         (int, float),
@@ -168,6 +183,14 @@ CONFIG_VALIDATION_RULES = [
         0.0,
         1.0,
         "filters.max_coordinated_supply_share must be a fraction between 0 and 1 (0 = off)",
+    ),
+    # R4-P1-6: wash-trade share gate (0 = off; share 0..1).
+    (
+        "filters.max_wash_share",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.max_wash_share must be a fraction between 0 and 1 (0 = off)",
     ),
     (
         "filters.min_metadata_extensions",

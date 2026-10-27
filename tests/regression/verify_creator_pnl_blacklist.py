@@ -16,6 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from screening.wash_lpi import WashLpiDetector  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -95,7 +96,9 @@ def main() -> int:
         rug_score_threshold=0.0,  # R4-P1-1 off
         factory_deploy_rate=0.0,  # R4-P1-2 off
         max_coordinated_supply_share=0.0,  # R4-P1-3 off
+        max_wash_share=0.0,  # R4-P1-6 off
         _creator_launch_ts={},  # R4-P1-2 cadence window
+        _wash_lpi=WashLpiDetector(),  # R4-P1-6
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
     )
     token = SimpleNamespace(
@@ -123,7 +126,9 @@ def main() -> int:
         rug_score_threshold=0.0,  # R4-P1-1 off
         factory_deploy_rate=0.0,  # R4-P1-2 off
         max_coordinated_supply_share=0.0,  # R4-P1-3 off
+        max_wash_share=0.0,  # R4-P1-6 off
         _creator_launch_ts={},  # R4-P1-2 cadence window
+        _wash_lpi=WashLpiDetector(),  # R4-P1-6
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
     )
     reason2 = UniversalTrader._skip_reason(t2, token)

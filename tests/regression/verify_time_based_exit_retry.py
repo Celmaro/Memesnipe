@@ -128,6 +128,11 @@ def _make_trader(
 ) -> UniversalTrader:
     """Build a trader carrying only what the time-based exit touches."""
     trader = object.__new__(UniversalTrader)
+    trader.stagnation_exit_min = 0  # R4-P1-9 mock default (off)
+    trader.stagnation_band_pct = 0.02  # R4-P1-9 mock default
+    trader.max_wash_share = 0.0  # R4-P1-6 mock default
+    from screening.wash_lpi import WashLpiDetector as _WLD  # R4-P1-6 mock default
+    trader._wash_lpi = _WLD()  # R4-P1-6 mock default
     trader.max_gini_coefficient = 0.0  # R4-P1-10 mock default
     trader.rug_score_threshold = 0.0  # R4-P1-1 mock default
     trader.factory_deploy_rate = 0.0  # R4-P1-2 mock default

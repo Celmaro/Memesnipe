@@ -131,6 +131,11 @@ def main() -> int:
     from trading.universal_trader import UniversalTrader
 
     t = object.__new__(UniversalTrader)
+    t.stagnation_exit_min = 0  # R4-P1-9 mock default (off)
+    t.stagnation_band_pct = 0.02  # R4-P1-9 mock default
+    t.max_wash_share = 0.0  # R4-P1-6 mock default
+    from screening.wash_lpi import WashLpiDetector as _WLD  # R4-P1-6 mock default
+    t._wash_lpi = _WLD()  # R4-P1-6 mock default
     t._holder_store = HolderSnapshotStore()  # noqa: SLF001
     t.min_unique_holders = 0
     t.max_top10_concentration = 0.0

@@ -195,6 +195,8 @@ async def start_bot(config_path: str):
             tp_ranges=cfg["trade"].get("tp_ranges") or [],
             sl_ranges=cfg["trade"].get("sl_ranges") or [],
             max_hold_time=cfg["trade"].get("max_hold_time"),
+            stagnation_exit_min=cfg["trade"].get("stagnation_exit_min", 0),
+            stagnation_band_pct=cfg["trade"].get("stagnation_band_pct", 0.02),
             price_check_interval=cfg["trade"].get("price_check_interval", 10),
             max_exit_sell_attempts=cfg["trade"].get(
                 "max_exit_sell_attempts", DEFAULT_MAX_EXIT_SELL_ATTEMPTS
@@ -293,6 +295,7 @@ async def start_bot(config_path: str):
             max_coordinated_supply_share=cfg["filters"].get(
                 "max_coordinated_supply_share", 0.0
             ),
+            max_wash_share=cfg["filters"].get("max_wash_share", 0.0),
             min_metadata_extensions=cfg["filters"].get(
                 "min_metadata_extensions", 0
             ),
@@ -397,6 +400,13 @@ async def start_bot(config_path: str):
             # R3-P2-6: DontFront/MEV shield (off by default)
             jito_dontfront=cfg.get("jito", {}).get("dontfront", False),
         )
+
+        # Close sims orphaned by the previous process (restart zombies) so
+        # open-position counts stay honest; must run before trading starts.
+        if trader.shadow_capture is not None:
+            swept = trader.shadow_capture.sweep_zombies()
+            if swept:
+                logging.info(f"Shadow zombie sweep: closed {swept} orphaned sims")
 
         await trader.start()
 

@@ -235,6 +235,12 @@ class UniversalTrader:
         tp_ranges: list | None = None,
         sl_ranges: list | None = None,
         max_hold_time: int | None = None,
+        # R4-P1-9: stagnation exit (opt-in, 0 = off). If the price stays
+        # inside stagnation_band_pct of the entry price for
+        # stagnation_exit_min minutes, exit — a flat token's hype window
+        # has passed (53-trade cohort: flat 30-60 min = distribution).
+        stagnation_exit_min: int = 0,
+        stagnation_band_pct: float = 0.02,
         price_check_interval: int = 10,
         max_exit_sell_attempts: int = DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
         # Persistent exit monitoring: after the bounded retries are spent, an
@@ -288,6 +294,11 @@ class UniversalTrader:
         # of supply held by coordinated accounts on average). The tracker is
         # fed buy trade events; fail-open until it has observations.
         max_coordinated_supply_share: float = 0.0,
+        # R4-P1-6: wash-trade share gate (0 = off). Refuses coins where this
+        # fraction of recent quote volume comes from wallets that round-trip
+        # (buy+sell the same mint) — fake volume (2507.01963). Fed by the
+        # trade feed; fail-open (0) until observed.
+        max_wash_share: float = 0.0,
         # R3-P0-2: Mayhem Mode coins are a distinct asset class (AI agent
         # mints +1B tokens and trades randomly for 24h; 1 in 50 graduations
         # fills the pool). Off by default: mayhem coins are skipped entirely.
@@ -603,6 +614,12 @@ class UniversalTrader:
 
         self._cofire = CoFireTracker()
         self.max_coordinated_supply_share = max_coordinated_supply_share
+        # R4-P1-6: wash-trade / LPI manipulation detector (fed every trade
+        # event; no RPC). Gate config: max_wash_share (0 = off).
+        from screening.wash_lpi import WashLpiDetector
+
+        self._wash_lpi = WashLpiDetector()
+        self.max_wash_share = max_wash_share
         # mint -> (entry_slot, entry_real_quote_lamports)
         self._rug_entry: dict[str, tuple[int, float]] = {}
         self.max_retries = max_retries
@@ -644,6 +661,9 @@ class UniversalTrader:
         self._tp_fired: set[tuple[int, float]] = set()
         self._sl_fired: set[tuple[int, float]] = set()
         self.max_hold_time = max_hold_time
+        # R4-P1-9: stagnation exit state (off by default).
+        self.stagnation_exit_min = stagnation_exit_min
+        self.stagnation_band_pct = stagnation_band_pct
         # The attempt cap is clamped: below 1 would mean "never try to sell".
         self.price_check_interval, self.max_exit_sell_attempts = (
             price_check_interval,
@@ -787,6 +807,8 @@ class UniversalTrader:
         # until they clear or the TTL expires, instead of abandoning them
         # ("no longer monitored" from the pre-persistent code).
         self._unsold_positions: dict[str, tuple[TokenInfo, Position]] = {}
+        # mints with a live TP/SL exit monitor; guards against duplicate buys
+        self._active_exit_mints: set[str] = set()
         self._unsold_watcher_task: asyncio.Task | None = None
         # Orphaned-token sweeper task (improvement #3), started when
         # stuck_sweep_interval > 0.
@@ -1206,6 +1228,21 @@ class UniversalTrader:
             return None
         mint_key = str(trade.get("mint", ""))
         trader_key = str(trade.get("trader") or "")
+        # R4-P1-6: feed the wash/LPI detector every trade event (bounded
+        # per-mint windows; quote_lamports + implied price from the event).
+        try:
+            tok_amt = float(trade.get("token_amount") or 0)
+            sol_amt = float(trade.get("sol_amount") or 0)
+            self._wash_lpi.observe_trade(
+                mint_key,
+                trader_key,
+                is_buy=bool(trade.get("is_buy")),
+                quote_lamports=int(float(trade.get("quote_amount") or 0)),
+                ts=monotonic(),
+                token_price=(sol_amt / tok_amt if tok_amt > 0 else None),
+            )
+        except Exception:
+            logger.debug("wash/LPI observe failed (non-fatal)", exc_info=True)
         # R3-P1-4: creator-sell trigger — a sell whose trader matches
         # a registered creator for this mint marks it for exit.
         if self.exit_on_creator_sell and not trade.get("is_buy"):
@@ -1947,6 +1984,15 @@ class UniversalTrader:
                     f"(max_coordinated_supply_share="
                     f"{self.max_coordinated_supply_share:.1%})"
                 )
+        # R4-P1-6: wash-trade share gate (0 = off). Recent quote volume from
+        # wallets that round-trip the same mint = fake volume (2507.01963).
+        if self.max_wash_share > 0:
+            wash = self._wash_lpi.wash_share(str(token_info.mint))
+            if wash > self.max_wash_share:
+                return (
+                    f"wash-trading: {wash:.1%} of quote volume is "
+                    f"round-trip (max_wash_share={self.max_wash_share:.1%})"
+                )
         if (
             self.allowed_quote_mints is not None
             and quote_mint not in self.allowed_quote_mints
@@ -2499,6 +2545,16 @@ class UniversalTrader:
         if token_info.token_program_id:
             self.traded_token_programs[mint_str] = token_info.token_program_id
 
+        # Per-mint dedup: a second detect of the same mint must not open a
+        # second position while one is live (seen live: GEKKO bought twice
+        # 5s apart, both stopped out at -20%).
+        if mint_str in self._active_exit_mints:
+            logger.warning(
+                f"Skipping {token_info.symbol} - position already open for this mint"
+            )
+            self._capture_detect(token_info, "position_already_open")
+            return
+
         # Choose exit strategy
         if not self.marry_mode:
             if self.exit_strategy == "tp_sl":
@@ -2507,10 +2563,16 @@ class UniversalTrader:
                 # only for the single-token modes; in yolo mode it must run
                 # as a task or the token-queue processor starves behind the
                 # first open position (seen live: 1306 queued, 2 processed).
+                self._active_exit_mints.add(mint_str)
                 if self.yolo_mode:
+                    # fire-and-forget: awaiting inline starves the token-queue
+                    # processor (the 1306-queued/2-processed deadlock).
                     asyncio.create_task(self._handle_tp_sl_exit(token_info, buy_result))
                 else:
-                    await self._handle_tp_sl_exit(token_info, buy_result)
+                    try:
+                        await self._handle_tp_sl_exit(token_info, buy_result)
+                    finally:
+                        self._active_exit_mints.discard(mint_str)
             elif self.exit_strategy == "time_based":
                 await self._handle_time_based_exit(token_info, buy_result)
             elif self.exit_strategy == "manual":
@@ -2546,6 +2608,15 @@ class UniversalTrader:
         self, token_info: TokenInfo, buy_result: TradeResult
     ) -> None:
         """Handle take profit/stop loss exit strategy."""
+        try:
+            await self._tp_sl_exit_inner(token_info, buy_result)
+        finally:
+            self._active_exit_mints.discard(str(token_info.mint))
+
+    async def _tp_sl_exit_inner(
+        self, token_info: TokenInfo, buy_result: TradeResult
+    ) -> None:
+        """Take-profit/stop-loss monitor body (dedup cleanup lives above)."""
         position = Position.create_from_buy_result(
             mint=token_info.mint,
             symbol=token_info.symbol,
@@ -3036,6 +3107,38 @@ class UniversalTrader:
                     await asyncio.sleep(self.price_check_interval)
                     continue
 
+                # R4-P1-9: stagnation exit (opt-in, 0 = off). If the price
+                # has stayed inside stagnation_band_pct of the ENTRY price
+                # for stagnation_exit_min minutes, the hype window passed —
+                # exit rather than wait for a TP that's not coming.
+                if self.stagnation_exit_min > 0:
+                    elapsed_min = (
+                        datetime.utcnow() - position.entry_time
+                    ).total_seconds() / 60.0
+                    if elapsed_min >= self.stagnation_exit_min:
+                        upper = position.entry_price * (1 + self.stagnation_band_pct)
+                        lower = position.entry_price * (1 - self.stagnation_band_pct)
+                        if lower <= current_price <= upper:
+                            logger.info(
+                                f"Stagnation exit for {token_info.symbol}: price "
+                                f"{current_price:.3e} inside "
+                                f"[{lower:.3e}, {upper:.3e}] band for "
+                                f"{elapsed_min:.1f} min (>= "
+                                f"{self.stagnation_exit_min})"
+                            )
+                            exit_reason = ExitReason.STAGNATION
+                            exit_price = current_price
+                            exit_sell_attempts += 1
+                            if await self._run_exit_attempt(
+                                token_info,
+                                position,
+                                exit_reason,
+                                exit_price,
+                                exit_sell_attempts,
+                            ):
+                                break
+                            continue
+
                 # Check if position should be exited
                 should_exit, exit_reason = position.should_exit(current_price)
 
@@ -3141,7 +3244,7 @@ class UniversalTrader:
                             pnl_pct=float(pnl["price_change_pct"]),
                             pnl_quote=float(pnl["unrealized_pnl_quote"]),
                             hold_seconds=(
-                                datetime.now() - position.entry_time
+                                datetime.utcnow() - position.entry_time
                             ).total_seconds(),
                         )
                         # R4-P1-7: feed the same price mark to the strategies
@@ -3152,7 +3255,7 @@ class UniversalTrader:
                                 mint=str(position.mint),
                                 current_price=current_price,
                                 hold_seconds=(
-                                    datetime.now() - position.entry_time
+                                    datetime.utcnow() - position.entry_time
                                 ).total_seconds(),
                             )
                     elif logger.isEnabledFor(10):
@@ -3473,7 +3576,7 @@ class UniversalTrader:
                 pnl_pct=(price - position.entry_price) / position.entry_price
                 if position.entry_price > 0
                 else 0.0,
-                hold_seconds=(datetime.now() - position.entry_time).total_seconds(),
+                hold_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
                 pool_snapshot=await self._pool_snapshot(token_info),
                 **fee_fields,
                 reordering_bps=0,  # R4-P0-1: shadow fills at observed price
@@ -3504,7 +3607,7 @@ class UniversalTrader:
                     close_price=price,
                     exit_reason="staged_drain",
                     hold_seconds=(
-                        datetime.now() - position.entry_time
+                        datetime.utcnow() - position.entry_time
                     ).total_seconds(),
                 )
 
@@ -3587,7 +3690,7 @@ class UniversalTrader:
                 f"{sim_price:.3e} SOL/token ({exit_reason.value}, no tx sent)"
             )
             if self.shadow_capture is not None:
-                hold_seconds = (datetime.now() - position.entry_time).total_seconds()
+                hold_seconds = (datetime.utcnow() - position.entry_time).total_seconds()
                 fee_fields = await self._fee_estimate_fields()
                 self.shadow_capture.sim_close(
                     mint=str(token_info.mint),

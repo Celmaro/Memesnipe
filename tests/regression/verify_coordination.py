@@ -81,6 +81,11 @@ def main() -> int:
     from trading.universal_trader import UniversalTrader
 
     t = object.__new__(UniversalTrader)
+    t.stagnation_exit_min = 0  # R4-P1-9 mock default (off)
+    t.stagnation_band_pct = 0.02  # R4-P1-9 mock default
+    t.max_wash_share = 0.0  # R4-P1-6 mock default
+    from screening.wash_lpi import WashLpiDetector as _WLD  # R4-P1-6 mock default
+    t._wash_lpi = _WLD()  # R4-P1-6 mock default
     t._cofire = CoFireTracker()  # noqa: SLF001
     t.max_coordinated_supply_share = 0.5
     t.min_unique_holders = 0
@@ -104,6 +109,11 @@ def main() -> int:
         f"-> {share_v:.3f} > {t.max_coordinated_supply_share}",
     )
     t2 = object.__new__(UniversalTrader)
+    t2.stagnation_exit_min = 0  # R4-P1-9 mock default (off)
+    t2.stagnation_band_pct = 0.02  # R4-P1-9 mock default
+    t2.max_wash_share = 0.0  # R4-P1-6 mock default
+    from screening.wash_lpi import WashLpiDetector as _WLD  # R4-P1-6 mock default
+    t2._wash_lpi = _WLD()  # R4-P1-6 mock default
     t2.max_gini_coefficient = 0.0  # R4-P1-10 mock default
     t2._cofire = CoFireTracker()  # noqa: SLF001
     t2.max_coordinated_supply_share = 0.0  # off

@@ -28,6 +28,7 @@ run never pollutes the repo.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,55 @@ class ShadowDataCapture:
     def summary(self, **fields: Any) -> None:
         """One aggregate row at session end (seen/traded/skipped counts)."""
         self._emit("summary", **fields)
+
+    def sweep_zombies(self) -> int:
+        """Force-close sims left open by a previous process (restart orphans).
+
+        Restarts wipe the in-memory position registry, so positions from the
+        prior run are never marked or closed again ("zombies" — they inflate
+        open-position counts). Reads all daily JSONLs, replays sim_open minus
+        sim_close per mint, and emits a sim_close at 0% with
+        exit_reason=orphan_restart. Returns the number swept.
+        """
+        if not self._check():
+            return 0
+        try:
+            open_counts: Counter[str] = Counter()
+            symbols: dict[str, str] = {}
+            for f in sorted(self.dir_path.glob("*.jsonl")):
+                with f.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        t = row.get("type")
+                        if t == "sim_open":
+                            open_counts[row["mint"]] += 1
+                            symbols[row["mint"]] = row.get("symbol", "?")
+                        elif t == "sim_close":
+                            open_counts[row["mint"]] -= 1
+            swept = 0
+            for mint, n in open_counts.items():
+                for _ in range(max(0, n)):
+                    self.sim_close(
+                        mint=mint,
+                        symbol=symbols.get(mint, "?"),
+                        platform="pump_fun",
+                        price=0.0,
+                        amount_tokens=0.0,
+                        quote_received=0.0,
+                        exit_reason="orphan_restart",
+                        pnl_quote=0.0,
+                        pnl_pct=0.0,
+                        hold_seconds=0.0,
+                    )
+                    swept += 1
+            if swept:
+                self._emit("summary", note="zombie_sweep", swept=swept)
+            return swept
+        except Exception:
+            return 0
 
     def mark(
         self,

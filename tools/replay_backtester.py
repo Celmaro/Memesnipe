@@ -59,6 +59,19 @@ EXIT_GRID = [
     {"name": "tp50_sl25", "tp": 0.50, "sl": -0.25},
     {"name": "trail20", "trail_activation": 0.15, "trail_distance": 0.20, "sl": -0.20},
     {"name": "trail10", "trail_activation": 0.10, "trail_distance": 0.10, "sl": -0.20},
+    # staged_trail (R4-P1-7): sell 40% at +25%, arm BE floor at +10%,
+    # trail the rest 8% below peak, -20% hard stop. pnl_pct reported is the
+    # size-weighted blend of the partial sell and the final exit.
+    {
+        "name": "staged_trail",
+        "staged": True,
+        "tp_share": 0.40,
+        "tp_pnl": 0.25,
+        "floor_arm": 0.10,
+        "floor_pct": 0.10,
+        "trail_distance": 0.08,
+        "sl": -0.20,
+    },
 ]
 
 MAX_OPEN_POSITIONS = 40  # cap concurrent positions per strategy (bot realism)
@@ -76,6 +89,11 @@ class Position:
     tokens: float
     peak_price: float = 0.0
     trailing_stop: float | None = None
+    # staged_trail state
+    tp_fired: bool = False
+    remaining_share: float = 1.0
+    realized_pnl: float = 0.0  # size-weighted pnl of legs already sold
+    floor_price: float | None = None
 
 
 @dataclass
@@ -188,7 +206,9 @@ class ReplayBacktester:
                     )
 
             reason = None
-            if cfg.get("tp") is not None and pnl >= cfg["tp"]:
+            if cfg.get("staged"):
+                reason = self._staged_exit(cfg, pos, price, pnl)
+            elif cfg.get("tp") is not None and pnl >= cfg["tp"]:
                 reason = "take_profit"
             elif cfg.get("sl") is not None and pnl <= cfg["sl"]:
                 reason = "stop_loss"
@@ -198,9 +218,50 @@ class ReplayBacktester:
             if reason:
                 self._close(st, pos, price, ts, reason)
 
+    def _staged_exit(self, cfg: dict, pos: Position, price: float, pnl: float) -> str | None:
+        """R4-P1-7 state machine: partial TP -> BE floor -> trail -> hard stop.
+
+        Mirrors src/trading/trail_exit.py. Returns exit reason or None; on the
+        partial leg, blends realized pnl into pos.realized_pnl and returns None.
+        """
+        peak_pnl = pos.peak_price / pos.entry_price - 1.0
+
+        # hard stop always live
+        if pnl <= cfg["sl"]:
+            pos.realized_pnl += pos.remaining_share * pnl * 100
+            pos.remaining_share = 0.0
+            return "stop_loss"
+
+        # leg 1: partial take profit
+        if not pos.tp_fired and pnl >= cfg["tp_pnl"]:
+            pos.tp_fired = True
+            share = cfg["tp_share"]
+            pos.realized_pnl += share * pnl * 100
+            pos.remaining_share -= share
+
+        # BE floor arms after the TP leg (floor = +floor_pct above entry)
+        if pos.tp_fired and pos.floor_price is None and peak_pnl >= cfg["floor_arm"]:
+            pos.floor_price = pos.entry_price * (1 + cfg["floor_pct"])
+
+        # trail the remainder
+        if pos.tp_fired:
+            trail = pos.peak_price * (1 - cfg["trail_distance"])
+            pos.floor_price = max(pos.floor_price or 0.0, trail)
+
+        if pos.tp_fired and pos.floor_price is not None and price <= pos.floor_price:
+            pos.realized_pnl += pos.remaining_share * pnl * 100
+            pos.remaining_share = 0.0
+            return "trail_floor"
+
+        return None
+
     def _close(self, st: StrategyState, pos: Position, price: float, ts: float, reason: str) -> None:
         st.open.pop(pos.mint, None)
         pnl_pct = (price / pos.entry_price - 1.0) * 100
+        if pos.tp_fired:
+            # staged: blend realized partial-leg pnl with the remaining share's
+            # exit pnl (realized_pnl already size-weighted in %-of-position)
+            pnl_pct = pos.realized_pnl + pos.remaining_share * pnl_pct
         self.trades_out.append(
             {
                 "strategy": pos.strategy,

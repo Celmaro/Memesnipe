@@ -43,6 +43,7 @@ import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from screening.wash_lpi import WashLpiDetector  # noqa: E402
 
 import base58
 
@@ -503,6 +504,8 @@ def check_f_single_token_mode_waits_past_refused_coins() -> bool:
         factory_deploy_rate=0.0,  # R4-P1-2 off
         _creator_launch_ts={},  # R4-P1-2 cadence window
         max_coordinated_supply_share=0.0,  # R4-P1-3 off
+        max_wash_share=0.0,  # R4-P1-6 off
+        _wash_lpi=WashLpiDetector(),  # R4-P1-6
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
         exit_on_creator_sell=False,  # R3-P1-4 off in verifiers
     )
