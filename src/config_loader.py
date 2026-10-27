@@ -483,7 +483,138 @@ VALID_VALUES = {
     "platform": ["pump_fun", "lets_bonk", "stonk_fun"],
 }
 
-# Platform-specific listener compatibility
+# --- A2-P0-1: unknown-key lint ---------------------------------------------
+# Keys the bot ACTUALLY reads, per section (harvested from bot_runner.py +
+# universal_trader.py + validation tables). Anything else in a YAML is
+# silently ignored by the loader, which let a pasted audit config no-op or
+# re-route live behavior. Warn loudly instead.
+_KNOWN_SECTION_KEYS: dict[str, set[str]] = {
+    "geyser": {"endpoint", "api_token", "auth_type", "commitment"},
+    "research": {
+        "shadow_capture_enabled", "strategies", "strategies_ledger_enabled",
+        "in_stream_updates_enabled", "slot_ordered_feed_enabled",
+        "shadow_ledger_enabled", "replay_archive_hours",
+        "pumpswap_migrate_watcher", "shadow_data_dir",
+    },
+    "trade": {
+        "buy_amount", "buy_slippage", "sell_slippage", "shadow_mode",
+        "exit_strategy", "exit_mode", "trail_initial_tp_share",
+        "trail_initial_tp_pct", "trail_arm_pct", "trail_trail_pct",
+        "trail_hard_stop_pct", "trail", "max_hold_time", "price_check_interval",
+        "quote_amounts", "stuck_sweep_interval", "tp_ranges", "sl_ranges",
+        "take_profit_percentage", "stop_loss_percentage",
+        "stagnation_exit_min", "stagnation_band_pct", "extreme_fast_mode",
+        "extreme_fast_token_amount", "trust_create_event",
+        "curve_refresh_budget", "max_sell_impact_bps", "close_ata_on_sell",
+        "aggregator_fallback", "aggregator_slippage_bps", "min_pool_depth_sol",
+        "persistent_exit_ttl", "max_exit_sell_attempts", "durable_nonce_account",
+        "alt_addresses", "event_driven_exits_enabled",
+        "sell_slippage_inflation_bps", "blockhash_refresh_interval",
+        "aggregator_max_price_impact_pct", "trail10_arm_pct",
+        "trail10_trail_pct", "trail10_hard_stop_pct", "grad_timing_enabled",
+        "grad_band_stats_path", "persistent_exit_interval", "backfill",
+    },
+    "priority_fees": {
+        "enable_dynamic", "enable_fixed", "fixed_amount", "buy_fixed_amount",
+        "sell_fixed_amount", "hard_cap", "bid_multiplier", "extra_percentage",
+        "fee_cache_ttl", "contention_multiplier", "contention_creates_per_min",
+        "contention_window_s", "max_fee_fraction_of_position",
+    },
+    "jito": {"enabled", "endpoints", "auth_keypairs", "tip_lamports", "dontfront"},
+    "risk": {
+        "max_concurrent_positions", "budget_sol", "daily_loss_limit_sol",
+        "max_consecutive_losses", "cooldown_after_loss_streak_sec",
+    },
+    "filters": {
+        "listener_type", "allowed_quote_mints", "allow_mayhem_mode",
+        "blocked_creators", "max_token_age", "max_transfer_fee_bps",
+        "marry_mode", "yolo_mode", "max_wash_share", "max_gini_coefficient",
+        "min_unique_holders", "max_top10_concentration",
+        "max_coordinated_supply_share", "rug_score_threshold",
+        "rug_heuristics_enabled", "exit_on_creator_sell",
+        "post_entry_advisories_enabled", "factory_deploy_rate",
+        "creator_pnl_blacklist_enabled", "creator_pnl_min_trades",
+        "creator_pnl_max_net_sol", "min_metadata_extensions",
+        "min_curve_progress_sol", "max_market_cap_sol", "min_market_cap_sol",
+        "fragility_scale_min", "fragility_whale_threshold",
+        "fragility_rate_threshold", "match_string", "bro_address",
+        "consecutive_match_count", "gate_recheck_interval",
+        "max_tracked_tokens", "fail_closed_gates",
+        "grad_timing_enabled", "grad_min_seconds", "grad_max_seconds",
+        "max_metadata_extensions", "max_coordinated_buyers",
+        "contention_enabled", "contention_multiplier",
+        "contention_creates_per_min", "contention_window_s",
+        "max_fee_fraction_of_position", "creator_pnl_db_path",
+        "rug_min_unique_buyers", "rug_check_slots", "rug_early_drain_ratio",
+        "holder_reward_mode", "honeypot_freeze_authority",
+        "min_curve_hold_fraction", "risk",
+    },
+    "copy_trader": {
+        "enabled", "db", "min_leader_score", "min_buy_interval",
+        "ring_cofire_threshold", "mirror_jitter_ms", "mirror_split_quanta",
+    },
+    "retries": {
+        "max_attempts", "wait_after_creation", "wait_after_buy",
+        "wait_before_new_token",
+    },
+    "cleanup": {"mode", "force_close_with_burn", "with_priority_fee"},
+    "node": {"max_rps", "startup_latency_test"},
+    "backfill": {"enabled", "checkpoint", "max_pages", "page_size"},
+    "timing": {"token_wait_timeout"},
+}
+_KNOWN_TOP_KEYS = {
+    "name", "env_file", "rpc_endpoint", "wss_endpoint", "private_key",
+    "enabled", "separate_process", "platform", "geyser", "research", "trade",
+    "priority_fees", "jito", "risk", "filters", "copy_trader", "retries",
+    "cleanup", "node", "backfill", "timing",
+}
+
+
+def collect_unknown_config_keys(config: dict) -> list[str]:
+    """Return dotted paths of keys the bot never reads (A2-P0-1).
+
+    Unknown keys are silently ignored by every cfg.get(...) read. A pasted
+    config (e.g. an audit's 'screening:'/'risk_guards:'/'copy_trading:'
+    sections) therefore *appears* to take effect while the bot keeps its old
+    behavior — or worse, re-routes via a default (exit_strategy without
+    exit_mode re-arms plain tp_sl). This walks the config and returns any
+    key outside the known read-set so callers can warn.
+    """
+    unknown: list[str] = []
+    for top, val in config.items():
+        if top in _KNOWN_TOP_KEYS:
+            if isinstance(val, dict):
+                known = _KNOWN_SECTION_KEYS.get(top, set())
+                for k in val:
+                    if k not in known:
+                        unknown.append(f"{top}.{k}")
+        else:
+            unknown.append(top)
+    return unknown
+
+
+def warn_unknown_config_keys(config: dict) -> None:
+    """Log a warning per unknown key (A2-P0-1). Not fatal: shadow/test configs
+    may carry extra metadata; the watchdog is the log line."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    for path in collect_unknown_config_keys(config):
+        logger.warning(
+            f"[config-lint] key '{path}' is not read by the bot — it is "
+            f"ignored. If this came from a template/audit YAML, it did NOT "
+            f"take effect."
+        )
+    # exit_mode cross-check: a config that sets exit_strategy but omits
+    # exit_mode silently re-arms plain tp_sl (the pre-staged era).
+    trade = config.get("trade", {})
+    if "exit_strategy" in trade and "exit_mode" not in trade:
+        logger.warning(
+            "[config-lint] trade.exit_strategy is set without trade.exit_mode — "
+            "exit_mode defaults to 'tp_sl' and staged_trail/trail10 knobs are "
+            "ignored. Set trade.exit_mode explicitly."
+        )
+    # Platform-specific listener compatibility
 PLATFORM_LISTENER_COMPATIBILITY = {
     Platform.PUMP_FUN: ["logs", "blocks", "geyser", "shreds"],
     Platform.LETS_BONK: ["blocks", "geyser"],
@@ -513,6 +644,7 @@ def load_bot_config(path: str) -> dict:
         config["platform"] = "pump_fun"
 
     validate_config(config)
+    warn_unknown_config_keys(config)  # A2-P0-1: surface ignored keys loudly
     return config
 
 

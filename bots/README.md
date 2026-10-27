@@ -5,6 +5,10 @@ Each YAML is a standalone bot configuration for the Memesnipe sniper.
 - `memesnipe.yaml` — primary pump.fun config (shadow mode ON; see below).
 - `bot-sniper-{1,2,3,5}.yaml` — pump.fun listener variants (geyser / logs / blocks / shreds).
 - `bot-sniper-6-stonkfun.yaml` — StonkFun platform config.
+- `disabled/` — these five are archived here (A2-P1-2): they are `enabled: false`
+  but `bot_runner.run_all_bots()` globs `bots/*.yaml` and VALIDATES every file,
+  which produced a Traceback per file on every startup. Keep them out of the
+  active glob unless reactivating a listener variant.
 
 ## Shadow mode (default in memesnipe.yaml)
 

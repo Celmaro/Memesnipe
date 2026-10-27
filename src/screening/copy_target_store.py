@@ -84,8 +84,12 @@ class CopyTargetStore:
                 )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
         conn.row_factory = sqlite3.Row
+        # A2-P1-1: WAL + NORMAL so the qualified-wallet lookup never blocks on
+        # a concurrent writer (wallet_scout / engine / this store).
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def upsert(self, target: CopyTarget) -> None:

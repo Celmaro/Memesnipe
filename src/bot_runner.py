@@ -1,9 +1,16 @@
 import asyncio
+import gc
 import logging
 import multiprocessing
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# A2-P2-1: raise GC thresholds so stop-the-world collections are rare and
+# never land mid-transaction-build on the hot path (audit §7.2). The young
+# (0) and old (1) generation thresholds matter less than the large gen-0
+# trigger; the numbers come from the audited configuration.
+gc.set_threshold(50000, 50, 50)
 
 # Try to use uvloop on Unix or winloop on Windows for better performance
 # Fall back to standard asyncio if not available
