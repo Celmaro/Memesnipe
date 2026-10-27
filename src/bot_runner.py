@@ -285,6 +285,14 @@ async def start_bot(config_path: str):
             max_top10_concentration=cfg["filters"].get(
                 "max_top10_concentration", 0.0
             ),
+            max_gini_coefficient=cfg["filters"].get(
+                "max_gini_coefficient", 0.0
+            ),
+            rug_score_threshold=cfg["filters"].get("rug_score_threshold", 0.0),
+            factory_deploy_rate=cfg["filters"].get("factory_deploy_rate", 0.0),
+            max_coordinated_supply_share=cfg["filters"].get(
+                "max_coordinated_supply_share", 0.0
+            ),
             min_metadata_extensions=cfg["filters"].get(
                 "min_metadata_extensions", 0
             ),

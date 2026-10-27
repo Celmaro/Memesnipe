@@ -51,9 +51,9 @@ class TrailExitState:
     def __post_init__(self) -> None:
         if self.entry_price <= 0:
             raise ValueError(f"entry_price must be > 0: {self.entry_price!r}")
-        if not 0 < self.initial_tp_share <= 1.0:
+        if not 0 <= self.initial_tp_share <= 1.0:
             raise ValueError(
-                f"initial_tp_share must be in (0, 1]: {self.initial_tp_share!r}"
+                f"initial_tp_share must be in [0, 1]: {self.initial_tp_share!r}"
             )
         self.peak_price = self.entry_price
         self.floor_price = self.entry_price * (1 - self.hard_stop_pct)
@@ -82,7 +82,7 @@ class TrailExitState:
             return TrailDecision("exit_all", "stop_loss", price=current_price)
 
         # 3. Initial take-profit share.
-        if not self.initial_tp_fired:
+        if not self.initial_tp_fired and self.initial_tp_share > 0:
             tp_level = self.entry_price * (1 + self.initial_tp_pct)
             if current_price >= tp_level:
                 self.initial_tp_fired = True

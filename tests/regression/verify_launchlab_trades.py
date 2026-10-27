@@ -498,6 +498,11 @@ def check_f_single_token_mode_waits_past_refused_coins() -> bool:
         holder_reward_mode="trade",  # R3-P0-3 default
         min_unique_holders=0,  # R3-P1-5 off in verifiers
         max_top10_concentration=0.0,
+        max_gini_coefficient=0.0,  # R4-P1-10 off
+        rug_score_threshold=0.0,  # R4-P1-1 off
+        factory_deploy_rate=0.0,  # R4-P1-2 off
+        _creator_launch_ts={},  # R4-P1-2 cadence window
+        max_coordinated_supply_share=0.0,  # R4-P1-3 off
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
         exit_on_creator_sell=False,  # R3-P1-4 off in verifiers
     )

@@ -63,6 +63,20 @@ class GraduationMonitor:
         ts = time.time()
 
         if action in ("migrate", "createPool"):
+            # Unit guard (2026-10-27 audit): pumpapi's marketCapQuote is
+            # ambiguous — SOL for some events, USD for others (verified:
+            # mc_at_grad == quote_in_pool in 108/298 rows, grad_price*1e9 in
+            # 142/298). Banding on it produced a fake "$100-200k" story; the
+            # reproducible edge bands on quote_in_pool (pure SOL): avoid
+            # <50 SOL grads (41% nuked), prefer 85-120 SOL (1.83x median).
+            mc = e.get("marketCapQuote") or 0.0
+            quote_sol = e.get("quoteInPool") or 0.0
+            if mc > 0 and quote_sol > 0 and abs(mc - quote_sol) < 0.01:
+                mc_units = "sol"
+            elif mc > 0 and price > 0 and abs(mc - price * 1e9) / max(mc, 1e-9) < 0.02:
+                mc_units = "usd"
+            else:
+                mc_units = "unknown"
             rec = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "type": "graduation",
@@ -71,7 +85,8 @@ class GraduationMonitor:
                 "pool": e.get("pool"),
                 "poolId": e.get("poolId"),
                 "mc_at_grad": mc,
-                "quote_in_pool": e.get("quoteInPool"),
+                "mc_units": mc_units,  # sol | usd | unknown — band on this
+                "quote_in_pool": quote_sol,
                 "tokens_in_pool": e.get("tokensInPool"),
                 "grad_price": price,
                 "creator": e.get("txSigner"),  # deployer wallet (platform is poolCreatedBy)
@@ -113,6 +128,7 @@ class GraduationMonitor:
             "pool": rec["pool"],
             "creator": rec.get("creator"),
             "mc_at_grad": rec["mc_at_grad"],
+            "mc_units": rec.get("mc_units", "unknown"),
             "quote_in_pool": rec["quote_in_pool"],
             "grad_price": grad_price,
             "peak_multiple": round(peak / grad_price, 3) if grad_price else None,

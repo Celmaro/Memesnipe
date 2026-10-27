@@ -91,6 +91,11 @@ def main() -> int:
         holder_reward_mode="trade",  # R3-P0-3 default
         min_unique_holders=0,  # R3-P1-5 off in verifiers
         max_top10_concentration=0.0,
+        max_gini_coefficient=0.0,  # R4-P1-10 off
+        rug_score_threshold=0.0,  # R4-P1-1 off
+        factory_deploy_rate=0.0,  # R4-P1-2 off
+        max_coordinated_supply_share=0.0,  # R4-P1-3 off
+        _creator_launch_ts={},  # R4-P1-2 cadence window
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
     )
     token = SimpleNamespace(
@@ -114,6 +119,11 @@ def main() -> int:
         holder_reward_mode="trade",  # R3-P0-3 default
         min_unique_holders=0,  # R3-P1-5 off in verifiers
         max_top10_concentration=0.0,
+        max_gini_coefficient=0.0,  # R4-P1-10 off
+        rug_score_threshold=0.0,  # R4-P1-1 off
+        factory_deploy_rate=0.0,  # R4-P1-2 off
+        max_coordinated_supply_share=0.0,  # R4-P1-3 off
+        _creator_launch_ts={},  # R4-P1-2 cadence window
         min_metadata_extensions=0,  # R3-P2-8 off in verifiers
     )
     reason2 = UniversalTrader._skip_reason(t2, token)

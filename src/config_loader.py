@@ -137,6 +137,38 @@ CONFIG_VALIDATION_RULES = [
         1.0,
         "filters.max_top10_concentration must be a fraction between 0 and 1 (0 = off)",
     ),
+    # R4-P1-10: Gini-coefficient gate (0 = off; 1.0 = everything unequal).
+    (
+        "filters.max_gini_coefficient",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.max_gini_coefficient must be a fraction between 0 and 1 (0 = off)",
+    ),
+    # R4-P1-1: rug-risk score gate (0 = off; score 0..1).
+    (
+        "filters.rug_score_threshold",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.rug_score_threshold must be a fraction between 0 and 1 (0 = off)",
+    ),
+    # R4-P1-2: creator-factory rate gate (0 = off; launches/hour).
+    (
+        "filters.factory_deploy_rate",
+        (int, float),
+        0.0,
+        86400.0,
+        "filters.factory_deploy_rate is launches/hour and must be non-negative (0 = off)",
+    ),
+    # R4-P1-3: insider-coordination supply gate (0 = off; share 0..1).
+    (
+        "filters.max_coordinated_supply_share",
+        (int, float),
+        0.0,
+        1.0,
+        "filters.max_coordinated_supply_share must be a fraction between 0 and 1 (0 = off)",
+    ),
     (
         "filters.min_metadata_extensions",
         int,

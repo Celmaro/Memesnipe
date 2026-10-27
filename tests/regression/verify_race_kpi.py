@@ -56,6 +56,7 @@ def main() -> int:
     from trading.universal_trader import UniversalTrader
 
     t = object.__new__(UniversalTrader)
+    t.max_gini_coefficient = 0.0  # R4-P1-10 mock default
     t.shadow_mode = True
     t.solana_client = type(
         "C", (), {"get_slot": lambda self: _AsyncResult(1234)}

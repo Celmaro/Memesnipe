@@ -3,7 +3,7 @@
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from time import monotonic
@@ -273,7 +273,21 @@ class UniversalTrader:
         creator_pnl_max_net_sol: float = 0.0,
         max_market_cap_sol: float | None = None,
         min_curve_progress_sol: float | None = None,
+        # R4-P1-1: multi-dimensional rug-risk score gate (0 = off). A
+        # weighted sum over creator cadence / curve progress / holder
+        # concentration / buyer set / dev balance; refuses entry when the
+        # score exceeds rug_score_threshold. Calibrated on replay; ships
+        # conservative (off).
+        rug_score_threshold: float = 0.0,
+        # R4-P1-2: creator-factory filter (0 = off). Refuses coins whose
+        # creator launches more than factory_deploy_rate mints/hour.
+        factory_deploy_rate: float = 0.0,
         min_market_cap_sol: float | None = None,
+        # R4-P1-3: insider-coordination supply gate (0 = off). Refuses coins whose
+        # early-buyer wallets co-fire across too many launches (MELT: 36.5%
+        # of supply held by coordinated accounts on average). The tracker is
+        # fed buy trade events; fail-open until it has observations.
+        max_coordinated_supply_share: float = 0.0,
         # R3-P0-2: Mayhem Mode coins are a distinct asset class (AI agent
         # mints +1B tokens and trades randomly for 24h; 1 in 50 graduations
         # fills the pool). Off by default: mayhem coins are skipped entirely.
@@ -305,6 +319,11 @@ class UniversalTrader:
         # no snapshot yet.
         min_unique_holders: int = 0,
         max_top10_concentration: float = 0.0,
+        # R4-P1-10: Gini-coefficient gate (0 = off). Refuses coins where the
+        # OBSERVED holder balance distribution is too unequal — rugs run
+        # Gini > 0.8, normal projects < 0.5 (2608.01609). Same snapshot,
+        # same fail-open contract as the other holder gates.
+        max_gini_coefficient: float = 0.0,
         # R3-P2-8: metadata socials gate (0 = off). When >0, the pre-buy
         # gate requires the token's metadata JSON to carry at least this many
         # non-empty extensions (socials/description). The URI read happens in
@@ -579,6 +598,11 @@ class UniversalTrader:
         self.strategies_ledger = strategies_ledger if shadow_mode else None
         # mint -> set of buyer wallet strings observed via trade events.
         self._rug_buyers: dict[str, set[str]] = {}
+        # R4-P1-3: insider-coordination tracker (fed the same buy events).
+        from screening.coordination import CoFireTracker
+
+        self._cofire = CoFireTracker()
+        self.max_coordinated_supply_share = max_coordinated_supply_share
         # mint -> (entry_slot, entry_real_quote_lamports)
         self._rug_entry: dict[str, tuple[int, float]] = {}
         self.max_retries = max_retries
@@ -655,6 +679,12 @@ class UniversalTrader:
         self.blocked_creators = {str(a) for a in (blocked_creators or [])}
         self.max_market_cap_sol = max_market_cap_sol
         self.min_curve_progress_sol = min_curve_progress_sol
+        # R4-P1-1: rug-risk score gate (0 = off) + the local state the score
+        # reads: per-creator launch timestamps for cadence, and the per-mint
+        # early-buyer set already tracked by the rug heuristics (_rug_buyers).
+        self.rug_score_threshold = rug_score_threshold
+        self._creator_launch_ts: dict[str, list[float]] = {}
+        self.factory_deploy_rate = factory_deploy_rate
         self.min_market_cap_sol = min_market_cap_sol
         self.allow_mayhem_mode = allow_mayhem_mode
         self.holder_reward_mode = holder_reward_mode
@@ -673,6 +703,7 @@ class UniversalTrader:
         self._holder_store = HolderSnapshotStore()
         self.min_unique_holders = min_unique_holders
         self.max_top10_concentration = max_top10_concentration
+        self.max_gini_coefficient = max_gini_coefficient
         self._holder_refresh_task = None
         self._metadata_refresh_task = None
         # R3-P2-8: metadata socials gate (0 = off) + snapshot store.
@@ -1183,6 +1214,7 @@ class UniversalTrader:
                 self._creator_sold_for_exit.add(mint_key)
         if trade.get("is_buy") and mint_key and trader_key:
             self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
+            self._cofire.observe_buy(mint_key, trader_key)
         # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
         # is the bot's wallet prompts the monitor for an immediate
         # exit evaluation (off by default = current polling).
@@ -1193,7 +1225,11 @@ class UniversalTrader:
 
     def _holder_gates_on(self) -> bool:
         """R3-P1-5: whether either holder-concentration gate is configured."""
-        return self.min_unique_holders > 0 or self.max_top10_concentration > 0
+        return (
+            self.min_unique_holders > 0
+            or self.max_top10_concentration > 0
+            or self.max_gini_coefficient > 0
+        )
 
     async def _holder_refresh_loop(self, interval: float = 30.0) -> None:
         """R3-P1-5: background holder-snapshot refresher.
@@ -1454,7 +1490,7 @@ class UniversalTrader:
             "create_slot": getattr(token_info, "create_slot", None),
             "entry_tx_idx_in_block": None,  # live-only (tx position)
             "reordering_bps": 0,  # shadow fills simulate at observed price
-            "entry_hour_utc": datetime.now(timezone.utc).hour,  # R4-P1-5
+            "entry_hour_utc": datetime.now(UTC).hour,  # R4-P1-5
         }
         if not self.shadow_mode:
             return fields
@@ -1723,7 +1759,7 @@ class UniversalTrader:
                     f", launch_ts={launch_age:.3f}" if launch_age is not None else ""
                 )
 
-                if token_age > self.max_token_age:
+                if self.max_token_age > 0 and token_age > self.max_token_age:
                     logger.info(
                         f"Skipping token {token_info.symbol} - too old "
                         f"({token_age:.1f}s queue wait{age_note} > {self.max_token_age}s)"
@@ -1788,7 +1824,7 @@ class UniversalTrader:
                 token_age = monotonic() - self.token_timestamps.get(
                     token_key, monotonic()
                 )
-                if token_age > max_age:
+                if max_age > 0 and token_age > max_age:
                     logger.info(
                         f"Drain: skipping {token_info.symbol} - too old ({token_age:.1f}s)"
                     )
@@ -1831,6 +1867,86 @@ class UniversalTrader:
                     f"creator {creator} on PnL blacklist "
                     f"({trades} trades, net {net:.4f} SOL)"
                 )
+        # R4-P1-2: creator "factory" — too many launches per hour = a
+        # mass-deployer (2609.10246); Mazorra (via 2602.13480): most rugs
+        # come from wallets with prior disposable-token history. The cadence
+        # clock records every detected launch for the creator; a rate above
+        # factory_deploy_rate refuses the coin. Off by default (0).
+        creator_key = str(token_info.creator or "") or (
+            str(token_info.user) if token_info.user else ""
+        )
+        # Record launch cadence when EITHER the factory filter OR the rug
+        # score reads it (both consume the same trailing-hour window).
+        if creator_key and (
+            self.factory_deploy_rate > 0 or self.rug_score_threshold > 0
+        ):
+            now = monotonic()
+            window = self._creator_launch_ts.setdefault(creator_key, [])
+            window.append(now)
+            # Keep only the trailing hour (bounded memory).
+            cutoff = now - 3600.0
+            window[:] = [t for t in window if t >= cutoff]
+            # Launches/hour over the observed window (min 60s denominator so
+            # a single launch doesn't read as infinite).
+            window_span = max((now - (window[0] if window else now)) / 3600.0, 1.0 / 60.0)
+            cadence = len(window) / window_span
+            if self.factory_deploy_rate > 0 and cadence > self.factory_deploy_rate:
+                return (
+                    f"creator {creator_key[:12]}... is a factory "
+                    f"({cadence:.1f} mints/hr > {self.factory_deploy_rate})"
+                )
+        # R4-P1-1: multi-dimensional rug-risk score (0 = off). Weighted sum
+        # over the features this path already has locally (creator cadence,
+        # holder snapshot, early-buyer set) — NO new RPC on the hot path.
+        # Unknown dimensions (curve progress, dev balance) contribute a
+        # benign 0 until a caller feeds them. Calibrated on replay; ships off.
+        if self.rug_score_threshold > 0:
+            from screening.rug_score import (
+                RugScoreInput,
+                compute_rug_score,
+                rug_score_reason,
+            )
+
+            snap = self._holder_store.get(str(token_info.mint))
+            buyers = self._rug_buyers.get(str(token_info.mint))
+            window = self._creator_launch_ts.get(creator_key, [])
+            cadence_now = monotonic()
+            window_span = max(
+                (cadence_now - (window[0] if window else cadence_now)) / 3600.0,
+                1.0 / 60.0,
+            )
+            score = compute_rug_score(
+                RugScoreInput(
+                    creator_cadence_mints_per_hour=(
+                        len(window) / window_span if window else None
+                    ),
+                    holder_gini=snap.gini if snap else None,
+                    top10_fraction=snap.top10_fraction if snap else None,
+                    unique_buyers=len(buyers) if buyers else None,
+                    # curve progress + dev balance unknown on this path:
+                    # pass None (benign) until callers feed them.
+                )
+            )
+            reason = rug_score_reason(score, self.rug_score_threshold)
+            if reason:
+                return (
+                    f"{reason} (cadence {len(window) / window_span if window else 0:.1f}/hr, "
+                    f"holders {snap.unique_holders if snap else 0}, "
+                    f"buyers {len(buyers) if buyers else 0})"
+                )
+        # R4-P1-3: insider-coordination supply gate (0 = off). Fraction of
+        # the mint's early buyers that co-fire across >= 3 OTHER launches is
+        # a coordination signal (MELT 36.5% average). Fail-open: no
+        # observations -> share 0.
+        if self.max_coordinated_supply_share > 0:
+            share = self._cofire.coordinated_share(str(token_info.mint))
+            if share > self.max_coordinated_supply_share:
+                return (
+                    f"insider-coordination: {share:.1%} of early buyers "
+                    f"co-fire across launches "
+                    f"(max_coordinated_supply_share="
+                    f"{self.max_coordinated_supply_share:.1%})"
+                )
         if (
             self.allowed_quote_mints is not None
             and quote_mint not in self.allowed_quote_mints
@@ -1847,17 +1963,24 @@ class UniversalTrader:
         # R3-P1-5: holder-concentration gates (0 = off). Local snapshot lookup
         # only — the background refresher owns the RPC. Fail-open: a mint with
         # no snapshot yet is allowed (the refresher may simply not have run).
-        if self.min_unique_holders > 0 or self.max_top10_concentration > 0:
+        if (
+            self.min_unique_holders > 0
+            or self.max_top10_concentration > 0
+            or self.max_gini_coefficient > 0
+        ):
             snap = self._holder_store.get(str(token_info.mint))
             if snap is not None and not snap.passes(
                 min_unique_holders=self.min_unique_holders,
                 max_top10_concentration=self.max_top10_concentration,
+                max_gini=self.max_gini_coefficient,
             ):
                 return (
                     f"holder distribution: {snap.unique_holders} unique "
-                    f"holders, top-10 {snap.top10_fraction:.1%} of supply "
+                    f"holders, top-10 {snap.top10_fraction:.1%} of supply, "
+                    f"Gini {snap.gini:.3f} "
                     f"(min_unique_holders={self.min_unique_holders}, "
-                    f"max_top10_concentration={self.max_top10_concentration})"
+                    f"max_top10_concentration={self.max_top10_concentration}, "
+                    f"max_gini_coefficient={self.max_gini_coefficient})"
                 )
         # R3-P2-8: metadata socials gate (0 = off). Local snapshot lookup
         # only — the background refresher owns the URI fetch. Fail-open: a
@@ -3026,7 +3149,7 @@ class UniversalTrader:
                         # live price path in parallel (shadow only).
                         if self.strategies_ledger is not None:
                             self.strategies_ledger.decide(
-                                mint=str(token_info.mint),
+                                mint=str(position.mint),
                                 current_price=current_price,
                                 hold_seconds=(
                                     datetime.now() - position.entry_time

@@ -47,6 +47,10 @@ class StubSeller:
 
 def _trader(curve: StubCurve, min_depth: float) -> UniversalTrader:
     trader = object.__new__(UniversalTrader)
+    trader.max_gini_coefficient = 0.0  # R4-P1-10 mock default
+    trader.rug_score_threshold = 0.0  # R4-P1-1 mock default
+    trader.factory_deploy_rate = 0.0  # R4-P1-2 mock default
+    trader.max_coordinated_supply_share = 0.0  # R4-P1-3 mock default
     trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
     trader.strategies_ledger = None  # R4-P1-7 mock default
     trader.allow_mayhem_mode = False  # R3-P0-2 off in verifiers

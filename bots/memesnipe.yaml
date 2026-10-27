@@ -199,8 +199,7 @@ jito:
 # R3-P2-10: session risk guards (0 = off). The loss limit blocks NEW buys
 # while sells still run — it never traps money in a falling position.
 risk:
-  max_concurrent_positions: 1 # cap open positions (default 1 keeps the
-    # single-token run shape; raise for yolo/copy concurrency)
+  max_concurrent_positions: 0 # 0 = off (unlimited open positions; shadow A/B needs the sample)
   daily_loss_limit_sol: 0 # realized-loss floor for the session; 0 = off
   budget_sol: 0 # cap on total quote spent on buys this session; 0 = off
 
@@ -210,7 +209,7 @@ filters:
   bro_address: null
   allowed_quote_mints: ["sol"]
   listener_type: "geyser"
-  max_token_age: 1.0 # Phase 3: launch-age gate (fixed freshness semantics)
+  max_token_age: 0 # 0 = off (accept any queue age; was 1.0s, tighter than our own ~1.2s/token processing)
   max_transfer_fee_bps: 0 # reject Token-2022 transfer-tax coins outright
   # Quality gates
   blocked_creators: []
@@ -249,6 +248,23 @@ filters:
   # fills the holder snapshot; fail-open until it has data for a mint.
   min_unique_holders: 0
   max_top10_concentration: 0.0
+  # R4-P1-10: Gini-coefficient gate (0 = off). Refuses coins whose OBSERVED
+  # holder distribution is too unequal — rugs run Gini > 0.8, normal < 0.5
+  # (2608.01609). Same holder snapshot as the top-10 gate.
+  max_gini_coefficient: 0.0
+  # R4-P1-1: multi-dimensional rug-risk score gate (0 = off). Weighted sum
+  # over creator cadence / holder concentration / buyer set (local features
+  # only — no hot-path RPC); refuses when the score exceeds the threshold.
+  # Calibrated on replay before arming.
+  rug_score_threshold: 0.0
+  # R4-P1-2: creator-factory gate (0 = off; launches/hour). Refuses coins
+  # whose creator deploys faster than this (factory mass-deployers —
+  # 2609.10246; disposable-token rug history — 2602.13480).
+  factory_deploy_rate: 0.0
+  # R4-P1-3: insider-coordination gate (0 = off; share 0..1). Refuses coins
+  # where this fraction of early-buyer wallets co-fire across many launches
+  # (MELT: 36.5% of supply held by coordinated accounts on average).
+  max_coordinated_supply_share: 0.0
   # R3-P2-8: metadata socials gate (0 = off). When >0, require at least this
   # many non-empty metadata extensions (twitter/telegram/website) from the
   # token's metadata JSON. Fail-open until the refresher has read it.

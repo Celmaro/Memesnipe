@@ -24,6 +24,10 @@ import config_loader  # noqa: E402
 
 def _mk_trader(mint: str) -> UniversalTrader:
     t = object.__new__(UniversalTrader)
+    t.max_gini_coefficient = 0.0  # R4-P1-10 mock default
+    t.rug_score_threshold = 0.0  # R4-P1-1 mock default
+    t.factory_deploy_rate = 0.0  # R4-P1-2 mock default
+    t.max_coordinated_supply_share = 0.0  # R4-P1-3 mock default
     t.exit_mode = "tp_sl"  # R4-P1-7 mock default
     t.strategies_ledger = None  # R4-P1-7 mock default
     t.max_tracked_tokens = 50

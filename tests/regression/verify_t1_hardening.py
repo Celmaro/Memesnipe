@@ -128,6 +128,10 @@ check("watchdog sets force-reconnect", asyncio.run(_watchdog_probe()))
 from trading.universal_trader import UniversalTrader
 
 stub = object.__new__(UniversalTrader)
+stub.max_gini_coefficient = 0.0  # R4-P1-10 mock default
+stub.rug_score_threshold = 0.0  # R4-P1-1 mock default
+stub.factory_deploy_rate = 0.0  # R4-P1-2 mock default
+stub.max_coordinated_supply_share = 0.0  # R4-P1-3 mock default
 stub.exit_mode = "tp_sl"  # R4-P1-7 mock default
 stub.strategies_ledger = None  # R4-P1-7 mock default
 stub.allow_mayhem_mode = False  # R3-P0-2 off in verifiers

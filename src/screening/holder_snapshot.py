@@ -36,10 +36,20 @@ class HolderSnapshot:
     unique_holders: int
     top10_fraction: float  # 0..1 fraction of total supply held by top-10
     total_supply_raw: int
+    # R4-P1-10: Gini coefficient over the OBSERVED balance vector (the
+    # top-N accounts returned by getTokenLargestAccounts). This is a floor
+    # on the true Gini (hidden small accounts lower it), documented — the
+    # 2608.01609 thresholds (>0.8 rug / <0.5 normal) still separate
+    # distributions cleanly on the visible set.
+    gini: float = 0.0
     slot: int = 0
 
     def passes(
-        self, *, min_unique_holders: int, max_top10_concentration: float
+        self,
+        *,
+        min_unique_holders: int,
+        max_top10_concentration: float,
+        max_gini: float = 0.0,
     ) -> bool:
         """True when the snapshot satisfies the configured gates.
 
@@ -50,6 +60,8 @@ class HolderSnapshot:
         if max_top10_concentration > 0 and (
             self.top10_fraction > max_top10_concentration
         ):
+            return False
+        if max_gini > 0 and self.gini > max_gini:
             return False
         return True
 
@@ -65,6 +77,31 @@ class HolderSnapshotStore:
 
     def put(self, snapshot: HolderSnapshot) -> None:
         self.snapshots[snapshot.mint] = snapshot
+
+
+def gini_coefficient(balances: list[int]) -> float:
+    """Gini coefficient over a balance vector: 0 = equal, 1 = one holder.
+
+    R4-P1-10 (2608.01609): rug projects typically run Gini > 0.8 pre-
+    attack vs < 0.5 for normal projects. Computed on the OBSERVED vector
+    (top-N from getTokenLargestAccounts) — a floor on the true Gini.
+    """
+    if not balances:
+        return 0.0
+    # Zero-balance entries are noise; drop them so a sparse observation
+    # doesn't fake equality.
+    vals = sorted(int(b) for b in balances if b > 0)
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return 1.0
+    total = sum(vals)
+    if total <= 0:
+        return 0.0
+    # Gini = 2 * sum(i * b_i) / (n * total) - (n+1)/n  (sorted ascending)
+    weighted = sum((i + 1) * b for i, b in enumerate(vals))
+    return (2 * weighted) / (n * total) - (n + 1) / n
 
 
 def compute_snapshot(
@@ -85,8 +122,9 @@ def compute_snapshot(
         slot: Slot the read came from (0 when unknown).
 
     Returns:
-        Snapshot with unique_holders = len(rows) (the observed top-N floor)
-        and top10_fraction = sum(top-10 balances) / supply, clamped to [0,1].
+        Snapshot with unique_holders = len(rows) (the observed top-N floor),
+        top10_fraction = sum(top-10 balances) / supply clamped to [0,1], and
+        gini over the observed balance vector (R4-P1-10).
     """
     unique = len(largest_accounts)
     top10 = largest_accounts[:TOP_N]
@@ -100,5 +138,6 @@ def compute_snapshot(
         unique_holders=unique,
         top10_fraction=fraction,
         total_supply_raw=total_supply_raw,
+        gini=gini_coefficient([b for _addr, b in largest_accounts]),
         slot=slot,
     )
