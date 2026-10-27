@@ -397,9 +397,68 @@ Classification: **[NEW]** = not in Memesnipe at all · **[PARTIAL]** = exists in
 - **Solana_Memecoin_Sniper_Bot mint half** — the "Meme Coin Bot" (airdrop farming, fake volume, liquidity withdrawal) is a rug-playbook; plus `minAmountOut: 0` on every swap and plaintext private keys uploaded to a backend + appended to a `priv` file. Copy nothing from its key paths.
 - **Mayhem "free volume" selling** — a mayhem coin's 24h AI agent is randomized and the pump bot is *not* a directional edge; do not build a "trade the agent" strategy.
 
-### Verification protocol (unchanged, updated count)
-1. `uv run tests/regression/run_all.py` → 51/51 today; each R3 item adds a verifier; target stays green before any merge.
+## Round-4 — Improvement batch (speed / strategy / profitability / fees)
+
+> Derived from a 19-paper research pass (arXiv batch, Oct 2026): pump.fun
+> manipulation forensics, rug-pull early detection, copy-trade manipulation
+> resistance, graduation prediction, fragility scoring, MEV/slippage
+> decomposition, and a 15-day live-deployment risk study. Every item ships
+> disabled-first, shadow mode stays ON, one regression verifier per item.
+> Counts below are relative to the Round-3 suite (77/77).
+
+### R4-P0 — Money-safety & execution (must land before any live arm)
+
+| ID | Item | Evidence | Current | Action |
+|----|------|----------|---------|--------|
+| R4-P0-1 | **Reordering-slippage accounting in the shadow ledger** | 2309.13648 (Uniswap MEV cost decomposition: price-impact + adversarial reordering; reordering slippage is measurable without mempool data) | Shadow ledger records sim_open/sim_close PnL but no slippage decomposition | Record per-fill: quote price vs executed price, price-impact estimate, and inferred reordering delta; surface `avg_reordering_bps` in the daily summary. Lets us measure how much the snipe race actually costs vs naive fills. Verifier: a shadow close row carries `reordering_bps`. |
+| R4-P0-2 | **Per-path CU budget (buy vs sell) from the cost model** | 2309.13648 (small swaps = gas-dominated; large = impact-dominated) + our P0-1 fee table | One `fixed_amount` for both paths; buy/sell split already commented but unused | Wire `priority_fees.buy_fixed_amount` / `sell_fixed_amount` (already in YAML comments) through the executor; buys keep the race-worthy budget, sells use the cheaper tier. Off by default = current single fixed_amount. Verifier: buy path uses buy budget, sell path uses sell budget. |
+
+### R4-P1 — Entry strategy (profitability)
+
+| ID | Item | Evidence | Current | Action |
+|----|------|----------|---------|--------|
+| R4-P1-1 | **Multi-dimensional rug-risk score at entry** | 2608.20271 (6.4M Solana tokens; classic ML detects rugs with behavioral features; most rugs within 1h) + 2608.01609 (multi-dimensional feature design) | Rug heuristics = slot-delta drain + buyer-count only (`rug_heuristics_enabled`, off) | Add a lightweight scored gate (logistic-style weighted sum over: creator cadence, holder churn in first N slots, early-buyer concentration, liquidity depth at entry) computed offline from the shadow ledger's observed features; `rug_score_threshold` config, off by default. Pure shadow first — calibrate threshold on replay, then arm. Verifier: known-rug replay mint scores above threshold; clean replay mint scores below. |
+| R4-P1-2 | **Creator "factory" / multi-coin deployment filter** | 2609.10246 (pump.fun factories: strategic actors mass-deploy and pump signals) | `blocked_creators` static list only | Track per-creator deployment cadence (mints/hour from the create feed); flag creators above `factory_deploy_rate` (config) as low-quality. Off by default. Verifier: simulated factory creator (5 mints/min) blocked; normal creator passes. |
+| R4-P1-3 | **Insider-coordination supply gate** | 2602.13480 (MELT: 36.5% of supply held by coordinated accounts via bundle traces) | `max_top10_concentration` measures raw top-10, not coordination | Add co-spend clustering over the first-block buyer set (union-find on shared funded-by / co-fire), flag coins where coordinated share > `max_coordinated_supply_share`. Off by default. Verifier: synthetic coordinated cluster flagged; independent buyers pass. |
+| R4-P1-4 | **Graduation-probability entry timing** | 2602.14860 (P(graduate | curve SOL + structural/behavioral features) conditions the launch outcome) | `min_curve_progress_sol` static 0.25 | Fit/encode the graduation curve from our own replay archives (`state/replay_cache`, tools/replay_backtester): entry sweet-spot MC band + progress-rate bands. Expose `graduation_score_*` knobs (off = current behavior). Verifier: replay mints in sweet spot pass, outside-band rejects. |
+| R4-P1-5 | **Hour-aware entry gating** | 2606.08232 (15-day Solana DEX deployment: worst entry hours mean −11.60% vs others; filter stack net-positive; 40.5% WR, +0.62%/trade) | No time-of-day logic | `filters.blocked_entry_hours_utc: []` — when non-empty, skip entries in those UTC hours. Verifier: entry attempted at blocked hour rejected; at open hour passes. |
+| R4-P1-6 | **Wash-trade / LPI manipulation detector** | 2507.01963 (82.8% of >100% tokens show artificial growth; LPI = small buys → dramatic price jumps) | None | Detect same-wallet round trips and small-buy-large-jump patterns in the pre-entry window; flag mint as manipulated (`lpi_flag`). Off by default. Verifier: synthetic wash pattern flags. |
+
+### R4-P2 — Copy-trader hardening
+
+| ID | Item | Evidence | Current | Action |
+|----|------|----------|---------|--------|
+| R4-P2-1 | **Leader cohort vetting (persistent-ring detection)** | 2607.02795 (1,012 persistent wallet rings co-fire as early buyers; union-find co-occurrence on first-buyer windows — method sound; the paper's numerical results are withdrawn pending correction) | Copy targets are a static 5-wallet DB | Run the union-find first-buyer co-occurrence over the copy feed's own observations; when a leader's buys co-fire with a persistent ring beyond `ring_cofire_threshold`, mark that leader `ring_vetted=false` and stop mirroring. Off by default. Verifier: synthetic ring co-fire marks leader; independent leader unaffected. |
+| R4-P2-2 | **Anti-front-run mirror jitter + concealment** | 2601.08641 (adversaries front-run copiers, conceal positions, fabricate sentiment) | `min_buy_interval` only rate-guards | Add `mirror_jitter_ms` (random delay range) + optional `mirror_split_quanta` (split mirrored size into 2-3 fills so a leader's followers can't front-run the full amount). Off by default. Verifier: jitter applied, split preserves total size. |
+
+### R4-P3 — Exit / sizing
+
+| ID | Item | Evidence | Current | Action |
+|----|------|----------|---------|--------|
+| R4-P3-1 | **Fragility-scaled position sizing** | 2512.00377 (ME2F: volatility dynamics + whale dominance + sentiment amplification → fragility not evenly distributed) | Fixed 0.01 SOL per trade; `max_top10_concentration` is a pass/fail gate | Compute a fragility index per candidate (whale dominance + volatility persistence from replay); scale `buy_amount` down when fragile (config `fragility_scale_min`/`max`, off = 1.0 flat). Verifier: fragile synthetic coin sizes down, stable coin sizes full. |
+| R4-P3-2 | **Graduation-label validation before using it as an exit signal** | 2607.02823 (collector-generated graduation labels carry measurement error; logistic model fails temporal generalization) | `pumpswap_migrate_watcher` treats the migrate event as authoritative | Before any graduation-based exit/leader logic uses the label, confirm the migrate event against a direct pool-state read (the watcher's own curve/pool check); log `grad_label_verified` in shadow. Verifier: verified label passes, unverifiable label skipped. |
+
+### R4-P4 — Research methodology (shadow-data quality)
+
+| ID | Item | Evidence | Current | Action |
+|----|------|----------|---------|--------|
+| R4-P4-1 | **Rejection-stream coverage metric** | 2609.18975 (two observation pipelines see different mint sets; Jaccard/Dice quantify coverage) | Shadow capture logs every detect + skip reason, but nothing measures set overlap | Compute nightly `detected_vs_rejected` Jaccard/Dice over the shadow ledger (mints seen by the snipe path vs mints seen by copy/monitor paths) so filter-stack blind spots are visible. Verifier: synthetic two-set ledger yields expected Jaccard. |
+| R4-P4-2 | **Cross-pipeline graduation evidence from replay** | 2512.11850 (<2% of pump.fun tokens graduate; graduation is the rare event that matters) | Replay backtester exists; graduation edge (MC $100-200 at grad, 50% >2x) in memory notes | Add a replay report counting graduates vs total and the graduation-probability-by-entry-band table (feeds R4-P1-4). Verifier: report rows parse from replay cache. |
+
+### Round-4 RISKS — explicitly NOT to copy (evidence)
+
+- **2405.15288 (EVM inscription surge)** — Ethereum/rollup gas dynamics; Solana is a fee-per-CU venue and the inscription result does not transfer. Nothing to adopt.
+- **2412.04913 (Coin-Meme cultural clustering) / 2412.07591 (CoinCLIP/CoinVibe)** — CLIP/vision + comment-likes viability models require a social-data ingestion pipeline (comments, images) the bot does not collect; the marginal signal does not justify the infra. Note only; revisit if a social feed is ever added.
+- **2410.23794 (Zerebro AI-meme hyperstition)** — narrative analysis of AI-agent coins; our `allow_mayhem_mode` already treats AI mints as a distinct class. No code adoption.
+- **2601.08641's full multi-agent LLM + CoT stack** — a multi-modal LLM on the copy hot path adds latency and cost; only its defensive mechanisms (front-run jitter, position concealment, ring detection) transfer, as R4-P2.
+- **2608.20271's full ML pipeline (6.4M-token training)** — we do not train a model in-repo; R4-P1-1 encodes the *features*, calibrated against our replay archives.
+- **2607.02795's numerical claims** — the Oct 2026 correction states buyer records include sells and miss many buys; all effect sizes are withdrawn. Only the union-find *method* is used, on our own feed data.
+- **2607.02823's generalization claim** — the paper's own temporal holdout fails; treat any graduation label as noisy until R4-P3-2 verifies it.
+
+### Verification protocol (updated count)
+1. `uv run tests/regression/run_all.py` → 77/77 today; each R4 item adds a verifier; target stays green before any merge.
 2. Config dry-run (`load_bot_config` + `resolve_env_vars` + `validate_config`) every change.
 3. Live test only with explicit user approval + stated expected cost + burner wallet + `enabled: true` for one session, then back to `enabled: false`.
-4. Shadow mode stays ON for all of R3 implementation; real-mode-only items (DontFront, ALTs, durable nonce) ship disabled and are only ever enabled by explicit user approval.
+4. Shadow mode stays ON for all of R4 implementation; real-mode-only items (per-path CU, DontFront, ALTs, durable nonce) ship disabled and are only ever enabled by explicit user approval.
 5. Commit + push per item; never push secrets (`.env` ignored, `state/` ignored, `shadow_data/` ignored).
+6. Every scored gate (R4-P1-1/3/4, R4-P3-1) is calibrated on replay archives FIRST; thresholds ship conservative and are only tightened by evidence.
