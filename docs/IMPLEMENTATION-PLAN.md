@@ -507,6 +507,63 @@ Classification: **[NEW]** = not in Memesnipe at all · **[PARTIAL]** = exists in
 - **2512.11850 (Solana phenomenon)** — full text: pump.fun = 71.1% of Solana mints, 40–67.4% of DEX transactions, **<2% graduate**, DAU 60k→260k. Confirms graduation rarity (R4-P4-2) and why the graduation edge is the outlier bet.
 - **2601.22185 (MemeChain)** — full text: off-chain signals (functional website, logo presence, socials) are the persistence signal; low-effort deployments omit branding. Validates the R3-P2-8 metadata gate direction; no new code beyond the metadata refinements already planned.
 
+### Round-4 Addendum 3 — code-ground-truth check + reorganization (Oct 27)
+
+> The full plan was checked against the ACTUAL codebase (not assumptions)
+> and against primary internet sources (verified, not just searched). Result:
+> one item was already implemented (downgrade), one item's dependency
+> already exists (lower cost), two items need their "evidence" claims
+> corrected (the hour paper is non-confirmatory — already caught; the
+> top-sniper fee numbers must be scaled), and the priority ordering changed
+> so measurement infrastructure lands first.
+
+#### Code-ground-truth findings (each verified in src/)
+
+| Plan item | Code reality | Verdict |
+|-----------|--------------|---------|
+| R4-P0-2 (per-path CU budget) | **ALREADY IMPLEMENTED**: `bot_runner.py:268-269` wires `buy_priority_fee`/`sell_priority_fee`; `config_loader.py:278-289` validates both; `universal_trader.py:321` overrides fixed_amount. Only the YAML keys are commented out | **Downgrade**: uncomment YAML + one verifier; NOT a P0 build. |
+| R4-P3-2 (graduation-label validation) | `MigrateWatcher.on_logs` sets `migrated[mint]=True` from geyser log lines **alone**, zero pool-state verification | **REAL gap confirmed** — plan is accurate. |
+| R4-P1-7 (staged-then-trail) | `src/trading/staged_exit.py` EXISTS (`ShareRange`, `DueStep`, `build_steps`, `due_tp_steps`, `due_sl_steps`); `_tp_fired`/`_sl_fired` sets + partial-sell machinery present | Dependency already there — lower build cost, no new exit machinery needed. |
+| R4-P0-4 (landed-slot KPI) | `get_slot()` exists (`client.py:445`); listener dispatches `tx_slot` through `trade_callback` (`universal_geyser_listener.py:524-525`); `sim_open`/`sim_close` take `**extra` | Directly buildable; landed slot available at the fill. |
+| R4-P0-1 (reordering-slippage) | Shadow ledger writes `detect`/`sim_open`/`sim_close` rows with `**extra` passthrough | Additive at call sites (1356, 2176, 2398, 3136, 3252); no schema change. |
+| R4-P0-5 (second observer) | `src/backfill/transaction_crawler.py` EXISTS (`getSignaturesForAddress` cursor crawl) | Reuse it directly; no new crawler. |
+| R4-P4-3 (latency self-test) | No `getSlot` latency test anywhere in `bot_runner`/client | Confirmed new — build it. |
+| R4-P1-10 (Gini gate) | Holder refresher fills snapshot; `max_top10_concentration` gate at `universal_trader.py:1771` | Gini computes over the same snapshot — small add. |
+| R4-P2-3 (copy-leader score) | `copy_target_store.py` has `CREATE TABLE copy_targets` + `upsert`/`get_active_wallets`; no `quality_score` column | Add column + scoring pass — moderate. |
+
+#### Internet verification (primary sources, fetched not skimmed)
+
+| Claim | Source | Verdict |
+|-------|--------|---------|
+| 53-cohort exit numbers (fixed TP +11.2% vs momentum-fade +52.7%; hard SL −40.1%; stagnation +5.5%) | memeassist.com (primary, fetched) | **VERIFIED verbatim**, including the correction notice (paper-trade gross, no capital). |
+| Plain-fee landing rate collapses to 20–40% under launch competition | tierzero.dev (primary, fetched) | **VERIFIED verbatim** — and it's specifically about new pool launches. |
+| Top-sniper fee economics (79.6% deploy-slot, 21% gross in fees, +39.5K SOL net) | Kaggle competition writeup (fetched in first search) | Verified from the writeup; numbers are bot-specific, NOT generalizable to our size. |
+| Landing-rate collapse → Jito bundles "close to mandatory" for new pool launches | tierzero.dev | Verified — this argues R4-P0-3 (contention fee racing) should be a **Jito-enabled** contention path, not just a priority-fee bump. |
+
+#### Reorganized priority (new implementation order)
+
+1. **R4-P0-4 Landed-slot KPI FIRST** — the single cheapest, highest-information change: one field in the shadow row, one summary line. Every later fee/race decision reads it. (was P0-4, stays but explicitly first)
+2. **R4-P0-1 Reordering-slippage accounting** — additive `**extra` fields at the 5 call sites; gives the adversarial-slippage baseline (memecoins ~80% higher, 2309.13648).
+3. **R4-P0-2 Downgraded → config-only** — uncomment `buy_fixed_amount`/`sell_fixed_amount` in YAML, add one verifier; code already does the work.
+4. **R4-P0-5 Second observer** — reuse `transaction_crawler.py`; log mint sightings to sidecar; nightly Jaccard. (Upgraded: you cannot trade what you never see.)
+5. **R4-P0-3 Contention-mode fees** — with the Jito insight: contention detection + priority bump, PLUS optional Jito bundle tip escalation for new-pool launches (tierzero: "bundling ... close to mandatory" for pool launches). Cap fees as fraction of position.
+6. **R4-P1-10 Gini gate** — smallest strategy item, same snapshot as top-10.
+7. **R4-P1-1 Rug-score (features)** — bundle/dev features from the 2608.20271 column set; calibrate on replay before arming.
+8. **R4-P1-2 Factory filter + disposable-token history**
+9. **R4-P1-3 Insider-coordination gate**
+10. **R4-P1-7 Staged-then-trail** — builds directly on existing `staged_exit.py`; backtest both modes on replay.
+11. **R4-P1-8 Momentum-fade + R4-P1-9 Stagnation** — log-only first, then opt-in.
+12. **R4-P2-1 Ring vetting + R4-P2-2 jitter/split + R4-P2-3 leader score**
+13. **R4-P3-1 Fragility sizing (ME2F two-score trigger)**
+14. **R4-P3-2 Graduation-label verification** — real gap, moderate.
+15. **R4-P4-1/2/3 Research metrics** — coverage Jaccard, graduation replay report, latency self-test.
+
+#### Newly-added / corrected
+
+- **R4-P0-3 now includes a Jito tip-escalation leg** (was priority-fee-only): under new-pool-launch contention, optionally escalate the Jito tip toward `max_fee_fraction_of_position`. The tierzero verdict ("bundling ... close to mandatory for new pool launches") is the evidence.
+- **R4-P1-5 stays downgraded** (hour gating, non-confirmatory) — the R4-CORR-1 evidence is reaffirmed, not reversed.
+- **R4-P2-1 keeps the monthly label-audit** (R4-CORR-2) — our feed's labels are from our parser, but the paper's 43%-mislabels caution still applies to our own collection quality.
+
 ### Verification protocol (updated count)
 1. `uv run tests/regression/run_all.py` → 77/77 today; each R4 item adds a verifier; target stays green before any merge.
 2. Config dry-run (`load_bot_config` + `resolve_env_vars` + `validate_config`) every change.
