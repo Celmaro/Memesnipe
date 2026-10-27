@@ -455,6 +455,8 @@ class UniversalTrader:
         self.contention_window_s = contention_window_s
         self.max_fee_fraction_of_position = max_fee_fraction_of_position
         # R4-P1-4: graduation-band advisory (log-only; off default).
+        from screening.grad_timing import load_band_stats
+
         self.grad_timing_enabled = grad_timing_enabled
         self._grad_band_stats = load_band_stats(grad_band_stats_path)
         # R4-P0-3: rolling create-event timestamps for the launch-flood
