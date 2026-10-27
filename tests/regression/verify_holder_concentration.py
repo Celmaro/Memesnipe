@@ -32,6 +32,8 @@ def _trader(min_holders: int, max_top10: float) -> UniversalTrader:
     from screening.holder_snapshot import HolderSnapshotStore
 
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.min_unique_holders = min_holders
     t.max_top10_concentration = max_top10
     t._holder_store = HolderSnapshotStore()  # noqa: SLF001

@@ -30,6 +30,8 @@ def _trader(flag: bool) -> UniversalTrader:
     from interfaces.core import TokenInfo  # noqa: F401
 
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.exit_on_creator_sell = flag
     t.creator_pnl_store = None
     t.blocked_creators = set()

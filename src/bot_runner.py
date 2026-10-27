@@ -30,6 +30,7 @@ from config_loader import (
     validate_platform_listener_combination,
 )
 from research.shadow_capture import ShadowDataCapture
+from research.strategies_ledger import StrategiesLedger
 from trading.universal_trader import (
     DEFAULT_MAX_EXIT_SELL_ATTEMPTS,
     UniversalTrader,
@@ -138,6 +139,16 @@ async def start_bot(config_path: str):
             max_transfer_fee_bps=cfg["filters"].get("max_transfer_fee_bps"),
             # Exit strategy configuration
             exit_strategy=cfg["trade"].get("exit_strategy", "time_based"),
+            # R4-P1-7: exit mode (tp_sl default; staged_trail = asymmetric
+            # staged-then-trail exits) + trail knobs.
+            exit_mode=cfg["trade"].get("exit_mode", "tp_sl"),
+            trail_initial_tp_share=cfg["trade"].get(
+                "trail_initial_tp_share", 0.4
+            ),
+            trail_initial_tp_pct=cfg["trade"].get("trail_initial_tp_pct", 0.25),
+            trail_arm_pct=cfg["trade"].get("trail_arm_pct", 0.10),
+            trail_trail_pct=cfg["trade"].get("trail_trail_pct", 0.08),
+            trail_hard_stop_pct=cfg["trade"].get("trail_hard_stop_pct", 0.20),
             take_profit_percentage=cfg["trade"].get("take_profit_percentage"),
             stop_loss_percentage=cfg["trade"].get("stop_loss_percentage"),
             tp_ranges=cfg["trade"].get("tp_ranges") or [],
@@ -281,6 +292,28 @@ async def start_bot(config_path: str):
                 if (
                     cfg.get("trade", {}).get("shadow_mode", False)
                     and cfg.get("research", {}).get("shadow_capture_enabled", True)
+                )
+                else None
+            ),
+            # R4-P1-7: strategies ledger — shadow-only parallel exit-strategy
+            # testing (same hard guard as shadow_capture). Every open shadow
+            # position is evaluated against tp_sl AND staged_trail so one
+            # price path yields a per-strategy outcome row.
+            strategies_ledger=(
+                StrategiesLedger(
+                    dir_path=cfg.get("research", {}).get(
+                        "shadow_data_dir", "shadow_data"
+                    )
+                    + "/strategies",
+                    tp_pct=cfg["trade"].get("take_profit_percentage", 0.20) or 0.20,
+                    sl_pct=cfg["trade"].get("stop_loss_percentage", 0.20) or 0.20,
+                )
+                if (
+                    cfg.get("trade", {}).get("shadow_mode", False)
+                    and cfg.get("research", {}).get("shadow_capture_enabled", True)
+                    and cfg.get("research", {}).get(
+                        "strategies_ledger_enabled", True
+                    )
                 )
                 else None
             ),

@@ -10,7 +10,6 @@ from time import monotonic
 from typing import Any
 
 import aiohttp
-
 from solders.pubkey import Pubkey
 
 from backfill.transaction_crawler import TransactionCrawler
@@ -43,9 +42,10 @@ from monitoring.metrics import metrics
 from platforms import get_platform_implementations
 from screening.honeypot import honeypot_reason
 from trading.base import TradeResult
-from trading.staged_exit import ShareRange
 from trading.platform_aware import PlatformAwareBuyer, PlatformAwareSeller
 from trading.position import ExitReason, Position
+from trading.staged_exit import ShareRange
+from trading.trail_exit import TrailExitState
 from utils.logger import get_logger
 
 # Try to use uvloop on Unix or winloop on Windows for better performance
@@ -190,6 +190,12 @@ class UniversalTrader:
         # replayable data for backtesting. Belt-and-suspenders guard with
         # shadow_mode: capture only writes when BOTH are set.
         shadow_capture: Any = None,
+        # R4-P1-7: strategies ledger (off by default). Shadow-only parallel
+        # exit-strategy testing: every open shadow position is also evaluated
+        # against every registered strategy (default tp_sl + staged_trail) so
+        # one price path yields a per-strategy outcome row. Like
+        # shadow_capture it is hard-guarded: only constructed in shadow mode.
+        strategies_ledger: Any = None,
         # Platform configuration
         platform: Platform | str = Platform.PUMP_FUN,
         # Listener configuration
@@ -209,6 +215,19 @@ class UniversalTrader:
         max_transfer_fee_bps: int | None = None,
         # Exit strategy configuration
         exit_strategy: str = "time_based",
+        # R4-P1-7: exit mode select. "tp_sl" (default) = the production
+        # staged TP/SL path; "staged_trail" = asymmetric staged-then-trail
+        # (sell initial share at +25%, arm a break-even floor at +10%, trail
+        # the rest). Staged_trail uses the same partial-sell machinery as
+        # the staged ranges.
+        exit_mode: str = "tp_sl",
+        # R4-P1-7 staged-trail knobs (fractions; only read when exit_mode
+        # is "staged_trail" or the strategies ledger simulates it).
+        trail_initial_tp_share: float = 0.4,
+        trail_initial_tp_pct: float = 0.25,
+        trail_arm_pct: float = 0.10,
+        trail_trail_pct: float = 0.08,
+        trail_hard_stop_pct: float = 0.20,
         take_profit_percentage: float | None = None,
         stop_loss_percentage: float | None = None,
         # R3-P1-2: staged TP/SL ranges (off by default = current single
@@ -556,6 +575,8 @@ class UniversalTrader:
         # Uses the constructor param here: self.shadow_mode is assigned
         # later in __init__.
         self.shadow_capture = shadow_capture if shadow_mode else None
+        # R4-P1-7: strategies ledger — same hard guard as shadow_capture.
+        self.strategies_ledger = strategies_ledger if shadow_mode else None
         # mint -> set of buyer wallet strings observed via trade events.
         self._rug_buyers: dict[str, set[str]] = {}
         # mint -> (entry_slot, entry_real_quote_lamports)
@@ -566,6 +587,17 @@ class UniversalTrader:
 
         # Exit strategy parameters
         self.exit_strategy = exit_strategy.lower()
+        # R4-P1-7: exit mode + staged-trail knobs. Validated against the
+        # same VALID_VALUES list as exit_strategy at config load; here we
+        # keep a normalized lowercased copy plus the trail configuration.
+        self.exit_mode = exit_mode.lower()
+        self.trail_initial_tp_share = float(trail_initial_tp_share)
+        self.trail_initial_tp_pct = float(trail_initial_tp_pct)
+        self.trail_arm_pct = float(trail_arm_pct)
+        self.trail_trail_pct = float(trail_trail_pct)
+        self.trail_hard_stop_pct = float(trail_hard_stop_pct)
+        # Per-position trail state for exit_mode == "staged_trail".
+        self._trail_states: dict[str, Any] = {}
         self.take_profit_percentage = take_profit_percentage
         self.stop_loss_percentage = stop_loss_percentage
         # R3-P1-2: staged exits. Parse once at construction; [] = feature off
@@ -585,8 +617,8 @@ class UniversalTrader:
             ]
         # One-order state: per-step fired markers (band_index, trigger price)
         # so a partial sell does not repeat every price check.
-        self._tp_fired: set[tuple[int, float]] = set()  # noqa: SLF001
-        self._sl_fired: set[tuple[int, float]] = set()  # noqa: SLF001
+        self._tp_fired: set[tuple[int, float]] = set()
+        self._sl_fired: set[tuple[int, float]] = set()
         self.max_hold_time = max_hold_time
         # The attempt cap is clamped: below 1 would mean "never try to sell".
         self.price_check_interval, self.max_exit_sell_attempts = (
@@ -986,6 +1018,15 @@ class UniversalTrader:
                     )
                 except Exception:
                     logger.exception("Shadow summary capture failed")
+            if self.strategies_ledger is not None:
+                try:
+                    self.strategies_ledger.summary(
+                        shadow=True,
+                        exit_mode=self.exit_mode,
+                        exit_strategy=self.exit_strategy,
+                    )
+                except Exception:
+                    logger.exception("Strategies-ledger summary failed")
             # R3-P1-1: net-metrics report from the research ledger. Shadow
             # mode: summarize shadow_data/ (the sim trades just recorded).
             # Real mode: also fold in trades/ when present. Best-effort —
@@ -1916,7 +1957,7 @@ class UniversalTrader:
             executor = getattr(self, "executor", None)
             if executor is not None:
                 tip = getattr(executor, "tip_lamports", 0) or 0
-                tip_account = getattr(executor, "_tip_account", None)  # noqa: SLF001
+                tip_account = getattr(executor, "_tip_account", None)
                 if tip_account is not None:
                     tip_account = str(tip_account)
                 tip_lamports = int(tip)
@@ -2183,6 +2224,22 @@ class UniversalTrader:
                         pool_snapshot=await self._pool_snapshot(token_info),
                         **fee_fields,
                     )
+                    # R4-P1-7: register this position with the strategies
+                    # ledger so the same price path is evaluated against
+                    # every exit strategy in parallel (shadow only).
+                    if self.strategies_ledger is not None:
+                        self.strategies_ledger.open_position(
+                            mint=str(token_info.mint),
+                            symbol=token_info.symbol,
+                            platform=token_info.platform.value,
+                            entry_price=sim_price,
+                            amount_tokens=sim_amount,
+                            quote_spent=self.quote_amounts.get(
+                                token_quote_mint, 0.0
+                            ),
+                            pool_snapshot=await self._pool_snapshot(token_info),
+                            **fee_fields,
+                        )
             else:
                 # R3-P2-13: a buy never overlaps an in-flight sell (WSOL
                 # wrap/unwrap balance race). No-op without contention.
@@ -2409,6 +2466,16 @@ class UniversalTrader:
                         pool_snapshot=await self._pool_snapshot(token_info),
                         **fee_fields,
                     )
+                    # R4-P1-7: finalize the strategies-ledger entry (time-
+                    # based close; shadow only).
+                    if self.strategies_ledger is not None:
+                        self.strategies_ledger.close_position(
+                            mint=str(token_info.mint),
+                            close_price=price,
+                            exit_reason="time_based_sell",
+                            hold_seconds=self.wait_time_after_buy or 0.0,
+                            **fee_fields,
+                        )
             else:
                 # R3-P2-13: serialize the sell against any in-flight buy.
                 async with self._trade_serialization_lock:
@@ -2790,6 +2857,20 @@ class UniversalTrader:
                         # already; otherwise keep monitoring for more steps.
                         continue
 
+                # R4-P1-7: staged-then-trail exit mode. When exit_mode is
+                # "staged_trail", this runs INSTEAD of the single TP/SL
+                # check for the remainder of the position (the initial TP
+                # share + trailing floor). Disabled-first (tp_sl default).
+                if self.exit_mode == "staged_trail":
+                    trail_exit = await self._handle_staged_trail_exit(
+                        token_info, position, current_price
+                    )
+                    if trail_exit:
+                        break
+                    # Keep monitoring: the floor re-arms as the price runs.
+                    await asyncio.sleep(self.price_check_interval)
+                    continue
+
                 # Check if position should be exited
                 should_exit, exit_reason = position.should_exit(current_price)
 
@@ -2898,6 +2979,17 @@ class UniversalTrader:
                                 datetime.now() - position.entry_time
                             ).total_seconds(),
                         )
+                        # R4-P1-7: feed the same price mark to the strategies
+                        # ledger so every registered strategy evaluates the
+                        # live price path in parallel (shadow only).
+                        if self.strategies_ledger is not None:
+                            self.strategies_ledger.decide(
+                                mint=str(token_info.mint),
+                                current_price=current_price,
+                                hold_seconds=(
+                                    datetime.now() - position.entry_time
+                                ).total_seconds(),
+                            )
                     elif logger.isEnabledFor(10):
                         logger.debug(
                             f"Position status: {current_price:.8f} {quote_label} "
@@ -3057,6 +3149,77 @@ class UniversalTrader:
         except OSError:
             logger.exception("Failed to log attempt telemetry")
 
+    async def _handle_staged_trail_exit(
+        self,
+        token_info: TokenInfo,
+        position: Position,
+        current_price: float,
+    ) -> bool:
+        """One staged-then-trail evaluation (R4-P1-7, exit_mode staged_trail).
+
+        Creates the per-position TrailExitState on first sight, then feeds
+        every monitor tick through it. The returned decision is executed
+        through the SAME machinery as the staged ranges:
+
+        - ``sell_share`` (initial TP) -> ``_staged_partial_sell`` (partial
+          sell, position stays open with the floor armed).
+        - ``exit_all`` (trail floor / hard stop) -> full exit via
+          ``_run_exit_attempt`` with TRAIL_STOP / STOP_LOSS.
+
+        Returns True when the position is closed; False to keep monitoring.
+        """
+        mint_key = str(token_info.mint)
+        state = self._trail_states.get(mint_key)
+        if state is None:
+            state = TrailExitState(
+                entry_price=position.entry_price or 0.0,
+                initial_tp_share=self.trail_initial_tp_share,
+                initial_tp_pct=self.trail_initial_tp_pct,
+                arm_pct=self.trail_arm_pct,
+                trail_pct=self.trail_trail_pct,
+                hard_stop_pct=self.trail_hard_stop_pct,
+            )
+            self._trail_states[mint_key] = state
+
+        decision = state.on_tick(current_price)
+
+        if decision.action == "sell_share":
+            # Initial TP: sell the configured share of the REMAINING
+            # position at the trigger price (floored to the trigger if the
+            # re-read price is unreadable — same convention as staged).
+            await self._staged_partial_sell(
+                token_info,
+                position,
+                decision.share,
+                "trail_initial_tp",
+                decision.price,
+            )
+            return not position.is_active
+
+        if decision.action == "exit_all":
+            reason = (
+                ExitReason.TRAIL_STOP
+                if decision.reason == "trail_floor"
+                else ExitReason.STOP_LOSS
+            )
+            logger.info(
+                f"Trail exit for {token_info.symbol}: {reason.value} "
+                f"@ {decision.price:.3e}"
+            )
+            if await self._run_exit_attempt(
+                token_info,
+                position,
+                reason,
+                decision.price,
+                attempt=1,
+            ):
+                return True
+            # Exit sell failed: keep monitoring, the floor stays armed and
+            # the next tick will retry against a fresh price.
+            return False
+
+        return False
+
     async def _handle_staged_exit(
         self,
         token_info: TokenInfo,
@@ -3167,6 +3330,17 @@ class UniversalTrader:
         position.quantity = max(0.0, position.quantity - qty)
         if position.quantity <= 0:
             position.close_position(price, ExitReason.TAKE_PROFIT)
+            # R4-P1-7: a staged ladder that drains the position is also a
+            # close — finalize the strategies-ledger entry here (shadow).
+            if self.strategies_ledger is not None:
+                self.strategies_ledger.close_position(
+                    mint=str(token_info.mint),
+                    close_price=price,
+                    exit_reason="staged_drain",
+                    hold_seconds=(
+                        datetime.now() - position.entry_time
+                    ).total_seconds(),
+                )
 
     async def _run_exit_attempt(
         self,
@@ -3263,6 +3437,17 @@ class UniversalTrader:
                     pool_snapshot=await self._pool_snapshot(token_info),
                     **fee_fields,
                 )
+                # R4-P1-7: finalize the strategies-ledger entry at the same
+                # close so each registered strategy reports its would-be
+                # outcome for this position (shadow only).
+                if self.strategies_ledger is not None:
+                    self.strategies_ledger.close_position(
+                        mint=str(token_info.mint),
+                        close_price=sim_price,
+                        exit_reason=exit_reason.value,
+                        hold_seconds=hold_seconds,
+                        **fee_fields,
+                    )
         else:
             # R3-P2-13: serialize the exit sell against any in-flight buy.
             async with self._trade_serialization_lock:

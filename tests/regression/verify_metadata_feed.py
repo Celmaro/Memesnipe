@@ -24,6 +24,8 @@ import config_loader  # noqa: E402
 
 def _mk_trader(mint: str) -> UniversalTrader:
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.max_tracked_tokens = 50
     t._metadata_store = MetadataStore()  # noqa: SLF001
     t.processed_tokens = {mint}

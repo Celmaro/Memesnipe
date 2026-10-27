@@ -19,6 +19,8 @@ import config_loader  # noqa: E402
 
 def _trader(allow_mayhem_mode: bool) -> UniversalTrader:
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.allow_mayhem_mode = allow_mayhem_mode
     t.holder_reward_mode = "trade"  # R3-P0-3 default
     t.min_unique_holders = 0  # R3-P1-5 off in verifiers

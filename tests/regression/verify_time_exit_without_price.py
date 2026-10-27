@@ -168,6 +168,8 @@ def _make_trader(
         A UniversalTrader wired to the stubs
     """
     trader = object.__new__(UniversalTrader)
+    trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    trader.strategies_ledger = None  # R4-P1-7 mock default
     trader.price_check_interval = price_check_interval
     trader.max_exit_sell_attempts = MAX_EXIT_SELL_ATTEMPTS
     trader.shadow_mode = False

@@ -47,6 +47,8 @@ class StubSeller:
 
 def _trader(curve: StubCurve, min_depth: float) -> UniversalTrader:
     trader = object.__new__(UniversalTrader)
+    trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    trader.strategies_ledger = None  # R4-P1-7 mock default
     trader.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
     trader.min_pool_depth_sol = min_depth
     trader.platform_implementations = SimpleNamespace(

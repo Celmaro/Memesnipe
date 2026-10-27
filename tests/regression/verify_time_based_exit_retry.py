@@ -128,6 +128,8 @@ def _make_trader(
 ) -> UniversalTrader:
     """Build a trader carrying only what the time-based exit touches."""
     trader = object.__new__(UniversalTrader)
+    trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    trader.strategies_ledger = None  # R4-P1-7 mock default
     trader.wait_time_after_buy = 0  # no real waiting before the sell
     trader.max_exit_sell_attempts = max_exit_sell_attempts
     trader.platform_implementations = SimpleNamespace(

@@ -70,6 +70,8 @@ async def _shutdown_with(  # noqa: ANN202
         Tuple of (how the caller ended, WARNING+ records emitted)
     """
     trader = object.__new__(UniversalTrader)
+    trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    trader.strategies_ledger = None  # R4-P1-7 mock default
     trader.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
     trader._cleanup_resources = cleanup  # noqa: SLF001
     if budget is not None:

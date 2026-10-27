@@ -119,6 +119,8 @@ def _make_trader(
 ) -> UniversalTrader:
     """Build a trader carrying only what the monitor loop touches."""
     trader = object.__new__(UniversalTrader)
+    trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    trader.strategies_ledger = None  # R4-P1-7 mock default
     trader.price_check_interval = 0  # no real waiting between iterations
     trader.max_exit_sell_attempts = max_exit_sell_attempts
     trader.shadow_mode = False

@@ -44,6 +44,8 @@ def _trader() -> UniversalTrader:
     from screening.holder_snapshot import HolderSnapshotStore
 
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.blocked_creators = set()
     t.creator_pnl_store = None
     t.allow_mayhem_mode = True

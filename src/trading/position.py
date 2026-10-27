@@ -12,6 +12,7 @@ class ExitReason(Enum):
 
     TAKE_PROFIT = "take_profit"
     STOP_LOSS = "stop_loss"
+    TRAIL_STOP = "trail_stop"  # R4-P1-7: trailing floor touched after arming
     MAX_HOLD_TIME = "max_hold_time"
     MANUAL = "manual"
     LIQUIDITY = "liquidity_depth"  # P2-EXIT-1: pool too shallow to exit later

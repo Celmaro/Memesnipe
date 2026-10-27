@@ -81,6 +81,8 @@ def main() -> int:
     from trading.universal_trader import UniversalTrader
 
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.priority_fee_manager = SimpleNamespace2(
         calculate_priority_fee=_coro(5000)  # 5000 microlamports/CU
     )

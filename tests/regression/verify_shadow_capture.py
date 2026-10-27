@@ -113,11 +113,15 @@ def main() -> int:
     from trading.universal_trader import UniversalTrader
 
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
     t.shadow_mode = True
     t.shadow_capture = cap  # what __init__ sets when both on
     check("trader stores capture when shadow on", t.shadow_capture is cap)
     t2 = object.__new__(UniversalTrader)
+    t2.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t2.strategies_ledger = None  # R4-P1-7 mock default
     t2.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
     t2.shadow_mode = False
     t2.shadow_capture = None

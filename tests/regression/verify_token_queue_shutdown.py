@@ -67,6 +67,8 @@ def _make_trader() -> UniversalTrader:
     are set directly.
     """
     trader = object.__new__(UniversalTrader)
+    trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    trader.strategies_ledger = None  # R4-P1-7 mock default
     trader.allow_mayhem_mode = False  # R3-P2-0 off in verifiers
     from trading.risk_guard import RiskTracker
     trader.risk_tracker = RiskTracker()  # R3-P2-10 off

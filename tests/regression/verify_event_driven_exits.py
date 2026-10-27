@@ -39,6 +39,8 @@ class _Token:
 
 def _trader(flag: bool, own_wallet: str | None) -> UniversalTrader:
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.event_driven_exits_enabled = flag
     t._own_trade_prompt = set()  # noqa: SLF001
     t.wallet = SimpleNamespace(public_key=own_wallet) if own_wallet else None

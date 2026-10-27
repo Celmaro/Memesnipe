@@ -45,6 +45,11 @@ research:
   # filters without a reconnect gap; the continuity revision still bumps so
   # consumers invalidate pre-gap cache state.
   in_stream_updates_enabled: false
+  # R4-P1-7: strategies ledger (shadow-only, default ON for shadow runs).
+  # Every open shadow position is also evaluated against every registered
+  # exit strategy (default tp_sl + staged_trail) so one price path yields a
+  # per-strategy outcome row under shadow_data/strategies/.
+  strategies_ledger_enabled: true
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
@@ -90,6 +95,18 @@ trade:
 
   # Phase 4: hybrid TP/SL exit with coherent timing.
   exit_strategy: "tp_sl"
+  # R4-P1-7: exit shape within the tp_sl family. "tp_sl" (default) = current
+  # single/staged TP/SL unchanged. "staged_trail" = asymmetric staged-then-
+  # trail: sell 40% at +25%, arm a break-even floor at +10%, trail the rest
+  # 8% behind each new high, exit on the floor or the -20% hard stop. The
+  # same rule is shadow-tested in parallel via the strategies ledger
+  # (research.strategies_ledger_enabled) regardless of which mode is active.
+  exit_mode: "tp_sl"
+  trail_initial_tp_share: 0.4  # fraction of the position sold at first TP
+  trail_initial_tp_pct: 0.25  # +25% first take-profit level
+  trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
+  trail_trail_pct: 0.08  # floor trails 8% behind each new high
+  trail_hard_stop_pct: 0.20  # -20% hard stop before any profit is armed
   # R3-P2-12: event-driven sell-fill (off by default = current polling). When
   # on, a TradeEvent from the bot's own wallet prompts the monitor to evaluate
   # the exit immediately instead of waiting for the next price-check tick.

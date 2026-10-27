@@ -31,6 +31,8 @@ def _trader(min_ext: int) -> UniversalTrader:
     from screening.metadata_socials import MetadataStore
 
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.min_metadata_extensions = min_ext
     t._metadata_store = MetadataStore()  # noqa: SLF001
     # _skip_reason deps

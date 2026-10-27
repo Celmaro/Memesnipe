@@ -365,7 +365,7 @@ class UniversalGeyserListener(BaseTokenListener):
                 # consumer built from the previous stream generation is stale
                 # the moment we resume from _last_slot + 1. Bump the revision
                 # so cache-holding consumers drop pre-gap state.
-                self.continuity_revision += 1
+                self._bump_continuity()
                 logger.info(
                     f"Continuity revision -> {self.continuity_revision}"
                 )

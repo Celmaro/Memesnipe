@@ -58,6 +58,8 @@ def main() -> int:
     from trading.universal_trader import UniversalTrader
 
     t = object.__new__(UniversalTrader)
+    t.exit_mode = "tp_sl"  # R4-P1-7 mock default
+    t.strategies_ledger = None  # R4-P1-7 mock default
     t.migrate_watcher = None
     check("trader watcher None when disabled", t.migrate_watcher is None)
 

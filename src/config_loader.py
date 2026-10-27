@@ -308,6 +308,7 @@ BOOL_FIELDS = [
     "research.pumpswap_migrate_watcher",  # R3-P2-5
     "research.slot_ordered_feed_enabled",  # R3-P2-14
     "research.in_stream_updates_enabled",  # R3-P2-15
+    "research.strategies_ledger_enabled",  # R4-P1-7
     "trade.backfill.enabled",
     "trade.close_ata_on_sell",  # P2-EXIT-5
     "trade.aggregator_fallback",  # R3-P1-3
@@ -335,6 +336,8 @@ VALID_VALUES = {
     "filters.holder_reward_mode": ["trade", "skip"],  # R3-P0-3
     "cleanup.mode": ["disabled", "on_fail", "after_sell", "post_session"],
     "trade.exit_strategy": ["time_based", "tp_sl", "manual"],
+    # R4-P1-7: exit mode selects the exit SHAPE within tp_sl-family paths.
+    "trade.exit_mode": ["tp_sl", "staged_trail"],
     "platform": ["pump_fun", "lets_bonk", "stonk_fun"],
 }
 
