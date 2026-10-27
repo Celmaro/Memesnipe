@@ -155,8 +155,15 @@ class ReplayBacktester:
                 # entry: every fresh token gets bought by every strategy
                 # (one entry per token per strategy — entry filters are
                 # identical across strategies so they cancel out in A/B)
+                tok["_buys_seen"] = tok.get("_buys_seen", 0) + 1
                 age = ts - tok["created_ts"]
-                if tok["seen_events"] == 1 and age <= TOKEN_MAX_AGE_S * 60:
+                wait = ENTRY.get("min_entry_age_s", 0.0)
+                confirm = ENTRY.get("confirm_buys", 1)
+                if (
+                    tok["_buys_seen"] == confirm  # R5-P1-4: gate-wait/confirm
+                    and age <= TOKEN_MAX_AGE_S * 60
+                    and age >= wait
+                ):
                     self._try_entries(mint, tok, price, ts, sol_amount)
             self._check_exits(mint, tok, price, ts)
         # migrate/createPool: position exits on curve? keep simple: treat as

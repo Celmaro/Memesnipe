@@ -45,6 +45,10 @@ class Position:
     exit_price: float | None = None
     exit_time: datetime | None = None
 
+    # R5-P2-3: log-only advisory latch — set by the monitor when a post-entry
+    # protection advisory fires once for this position.
+    _advisory_fired: bool = False
+
     @classmethod
     def create_from_buy_result(
         cls,

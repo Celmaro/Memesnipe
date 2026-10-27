@@ -150,6 +150,11 @@ class UniversalTrader:
     #: cover a session's worth of traded coins, not one.
     _CLEANUP_SHUTDOWN_BUDGET = 120.0
 
+    #: R5-P2-3: log-only post-entry advisories — class default off so
+    #: object.__new__-constructed test doubles (which skip __init__) read a
+    #: defined flag.
+    post_entry_advisories_enabled: bool = False
+
     def __init__(
         self,
         rpc_endpoint: str,
@@ -319,6 +324,12 @@ class UniversalTrader:
         # The monitor loop watches the listener trade feed for a sell whose
         # trader is the tracked coin's creator, and exits on trigger.
         exit_on_creator_sell: bool = False,
+        # R5-P2-3: post-entry protection signals as LOG-ONLY advisories
+        # (off by default). When enabled, the monitor evaluates creator-sell,
+        # pool-drain and buyer-growth signals on open positions but NEVER
+        # exits on them — it logs the reason and records an advisory row so
+        # the ledger can build evidence before any hard gate is armed.
+        post_entry_advisories_enabled: bool = False,
         # R3-P2-12: event-driven sell-fill (off by default = current polling).
         # When on, a TradeEvent from the bot's OWN wallet on the log feed flags
         # the mint so the monitor evaluates the exit immediately instead of
@@ -779,6 +790,7 @@ class UniversalTrader:
         self.allow_mayhem_mode = allow_mayhem_mode
         self.holder_reward_mode = holder_reward_mode
         self.exit_on_creator_sell = exit_on_creator_sell
+        self.post_entry_advisories_enabled = post_entry_advisories_enabled
         # R3-P1-4: mint key -> set of known creator wallets; when the trade
         # feed sees a sell from one of these for a tracked mint, the monitor
         # exits on trigger.
@@ -1039,6 +1051,7 @@ class UniversalTrader:
                 self.rug_heuristics_enabled
                 or self.exit_on_creator_sell
                 or self.event_driven_exits_enabled
+                or self.post_entry_advisories_enabled
             )
             if feed_dependents and (
                 not hasattr(self.token_listener, "trade_callback")
@@ -1336,8 +1349,10 @@ class UniversalTrader:
         except Exception:
             logger.debug("wash/LPI observe failed (non-fatal)", exc_info=True)
         # R3-P1-4: creator-sell trigger — a sell whose trader matches
-        # a registered creator for this mint marks it for exit.
-        if self.exit_on_creator_sell and not trade.get("is_buy"):
+        # a registered creator for this mint marks it for exit. The R5-P2-3
+        # log-only advisory path needs the SAME observation to build evidence
+        # without arming the exit.
+        if (self.exit_on_creator_sell or self.post_entry_advisories_enabled) and not trade.get("is_buy"):
             creators = self._creator_sellers.get(mint_key, set())
             if creators and trader_key in creators:
                 self._creator_sold_for_exit.add(mint_key)
@@ -3485,6 +3500,49 @@ class UniversalTrader:
             logger.exception("Rug-heuristic check failed (fail-open)")
             return None
 
+    async def _post_entry_advisory(
+        self, token_info: TokenInfo, position: Position, current_price: float
+    ) -> str | None:
+        """R5-P2-3: log-only post-entry protection signals.
+
+        Evaluates the signals that WANT to force-exit a held position —
+        creator sold, pool drain, buyer stall — but never exits. Returns a
+        reason string for the monitor to log (and for the ledger/backtester
+        to correlate), so evidence can accumulate BEFORE any of these is
+        armed as a hard gate. No side effects: no sells, no state mutation.
+        """
+        if not self.post_entry_advisories_enabled:
+            return None
+        if position.is_active is False:
+            return None
+        mint_key = str(token_info.mint)
+        # Goal: the advisory fires at most once per position (repeated
+        # warnings every price-check tick would flood the log).
+        if getattr(position, "_advisory_fired", False):
+            return None
+        reasons: list[str] = []
+        # R3-P1-4 signal: creator sold after we bought.
+        if mint_key in self._creator_sold_for_exit:
+            reasons.append("creator-sell")
+        # Pool-drain signal (reuse the rug heuristic's depth comparison but
+        # only as an advisory; the rug exit stays gated on its own flag).
+        try:
+            if self.rug_heuristics_enabled:
+                rug = await self._check_rug_signal(token_info)
+                if rug:
+                    reasons.append(f"rug-drain ({rug})")
+        except Exception:
+            logger.debug("post-entry rug advisory failed (non-fatal)", exc_info=True)
+        # Buyer stall: no NEW unique buyers since entry within the check
+        # horizon — hype fading. Fails open: no data -> no advisory.
+        buyers = self._rug_buyers.get(mint_key)
+        if buyers is not None and len(buyers) == 0 and self.rug_min_unique_buyers > 0:
+            reasons.append("buyer-stall")
+        if not reasons:
+            return None
+        position._advisory_fired = True  # noqa: SLF001
+        return "; ".join(reasons)
+
     async def _monitor_position_until_exit(
         self, token_info: TokenInfo, position: Position
     ) -> None:
@@ -3512,6 +3570,20 @@ class UniversalTrader:
                 # bounded exit handling next time the feed went down.
                 if current_price > 0:
                     last_known_price = current_price
+
+                # R5-P2-3: log-only post-entry advisory. Evaluates
+                # creator-sell / rug-drain / buyer-stall on held positions and
+                # logs the reason WITHOUT exiting — evidence before any hard
+                # gate is armed. Off by default.
+                if self.post_entry_advisories_enabled:
+                    advise = await self._post_entry_advisory(
+                        token_info, position, current_price
+                    )
+                    if advise:
+                        logger.warning(
+                            f"[ADVISORY] {token_info.symbol}: {advise} "
+                            f"(log-only, no exit — R5-P2-3 shadow evidence)"
+                        )
 
                 # P2-EXIT-1: absolute depth-floor forced exit. When the pool
                 # can no longer absorb a full unwind within the slippage

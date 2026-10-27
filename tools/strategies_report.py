@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS strategy_events (
     mint TEXT NOT NULL,
     symbol TEXT,
     strategy TEXT,             -- NULL for strategy_open rows
-    pnl_pct REAL,              -- strategy_close rows only
+    pnl_pct REAL,              -- strategy_close rows only (gross)
+    net_pnl_pct REAL,          -- strategy_close rows only (R5-P1-3 net of fees)
     sell_price REAL,
     exit_reason TEXT,
     entry_price REAL,
@@ -48,6 +49,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_se_dedupe
 def ingest(conn: sqlite3.Connection) -> int:
     """Append-only ingest; returns rows added. Skips lines already in the DB."""
     conn.executescript(SCHEMA)
+    # R5-P4-1 migration: pre-net-column DBs lack net_pnl_pct.
+    cols = {
+        r[1]
+        for r in conn.execute("PRAGMA table_info(strategy_events)").fetchall()
+    }
+    if "net_pnl_pct" not in cols:
+        conn.execute("ALTER TABLE strategy_events ADD COLUMN net_pnl_pct REAL")
     known = {
         (ts, mint, strat or "", typ)
         for (ts, mint, strat, typ) in conn.execute(
@@ -72,13 +80,14 @@ def ingest(conn: sqlite3.Connection) -> int:
                 continue
             conn.execute(
                 "INSERT INTO strategy_events"
-                " (ts, type, mint, symbol, strategy, pnl_pct, sell_price,"
-                "  exit_reason, entry_price, quote_spent, raw)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " (ts, type, mint, symbol, strategy, pnl_pct, net_pnl_pct,"
+                "  sell_price, exit_reason, entry_price, quote_spent, raw)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     ts, typ, mint, r.get("symbol"),
                     strat,
-                    r.get("pnl_pct"), r.get("sell_price"), r.get("exit_reason"),
+                    r.get("pnl_pct"), r.get("net_pnl_pct"),
+                    r.get("sell_price"), r.get("exit_reason"),
                     r.get("entry_price"), r.get("quote_spent"),
                     line,
                 ),
@@ -100,18 +109,27 @@ def report(conn: sqlite3.Connection) -> None:
         print("no strategy_close rows yet — grid still accumulating")
         return
     by: dict[str, list[float]] = defaultdict(list)
-    for strat, pnl in rows:
+    net_by: dict[str, list[float]] = defaultdict(list)
+    for strat, pnl, net in conn.execute(
+        "SELECT strategy, pnl_pct, net_pnl_pct FROM strategy_events"
+        " WHERE type='strategy_close' AND pnl_pct IS NOT NULL"
+    ).fetchall():
         if pnl is not None and -99 < float(pnl) < 2000:
             by[strat].append(float(pnl))
-    print(f"{'strategy':<14}{'n':>5}{'wr':>6}{'med':>9}{'avg':>9}{'total':>10}")
+            if net is not None:
+                net_by[strat].append(float(net))
+    print(f"{'strategy':<14}{'n':>5}{'wr':>6}{'med':>9}{'avg':>9}{'total':>10}{'net_avg':>9}")
     for strat in sorted(by, key=lambda s: -statistics.median(by[s])):
         v = by[strat]
+        nv = net_by.get(strat)
+        net_avg = statistics.mean(nv) if nv else float("nan")
         print(
             f"{strat:<14}{len(v):>5}"
             f"{sum(1 for x in v if x > 0) / len(v) * 100:>5.0f}%"
             f"{statistics.median(v):>+8.1f}%"
             f"{sum(v) / len(v):>+8.1f}%"
             f"{sum(v):>+9.0f}%"
+            f"{net_avg:>+8.1f}%"
         )
 
 

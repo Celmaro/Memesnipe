@@ -268,6 +268,11 @@ filters:
   # R3-P1-4: exit when the coin's creator wallet sells (off by default).
   # The monitor loop watches the listener trade feed for a creator sell.
   exit_on_creator_sell: false
+  # R5-P2-3: post-entry protection signals as LOG-ONLY advisories (off).
+  # When on, the monitor evaluates creator-sell/rug-drain/buyer-stall on
+  # open positions, logs a warning, and NEVER exits — shadow evidence
+  # before any hard gate is armed.
+  post_entry_advisories_enabled: false
   # R3-P1-5: holder-concentration gates (0 = off). Background refresher
   # fills the holder snapshot; fail-open until it has data for a mint.
   min_unique_holders: 0

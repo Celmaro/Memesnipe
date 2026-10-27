@@ -274,6 +274,9 @@ async def start_bot(config_path: str):
             allow_mayhem_mode=cfg["filters"].get("allow_mayhem_mode", False),
             holder_reward_mode=cfg["filters"].get("holder_reward_mode", "trade"),
             exit_on_creator_sell=cfg["filters"].get("exit_on_creator_sell", False),
+            post_entry_advisories_enabled=cfg["filters"].get(
+                "post_entry_advisories_enabled", False
+            ),
             # R3-P2-12: event-driven sell-fill (off by default)
             event_driven_exits_enabled=cfg.get("trade", {}).get(
                 "event_driven_exits_enabled", False
