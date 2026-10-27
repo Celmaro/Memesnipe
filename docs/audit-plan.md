@@ -1,9 +1,10 @@
 # Implementation plan — external audit (staged_trail-tuned focus)
 
 Audit: 251-line review of Memesnipe (research + exit-experiment + copy-trader + fees).
-Status: plan only. No code changes beyond the two grid alignments already applied
-(ledger `staged_trail` initial_tp_pct 0.25→0.20; `trail10` spec renamed `trail8`).
-Shadow mode stays ON; every item ships disabled-first with a regression verifier.
+Status: **R5 fully implemented (commits f616794 → c7b33d3).** Shadow mode stays ON;
+every item shipped disabled-first with a regression verifier. The P1-4 sweep and
+P4-2 held-out validation are the two DATA deliverables run against replay archives
+(see README section below); the sweep tool lives in tools/gate_sweep.py.
 
 ## Verified-against-code notes (audit claims checked this session)
 
