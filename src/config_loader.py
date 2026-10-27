@@ -248,6 +248,37 @@ CONFIG_VALIDATION_RULES = [
         3600.0,
         "copy_trader.min_buy_interval must be between 0.1 and 3600 seconds",
     ),
+    # R4-P2-1: persistent-ring co-fire threshold (0 = off; launches).
+    (
+        "copy_trader.ring_cofire_threshold",
+        int,
+        0,
+        100_000,
+        "copy_trader.ring_cofire_threshold is a launch count (0 = off)",
+    ),
+    # R4-P2-2: mirror jitter (ms, 0 = off) and split quanta (>=1).
+    (
+        "copy_trader.mirror_jitter_ms",
+        (int, float),
+        0.0,
+        60_000.0,
+        "copy_trader.mirror_jitter_ms is milliseconds (0 = off)",
+    ),
+    (
+        "copy_trader.mirror_split_quanta",
+        int,
+        1,
+        10,
+        "copy_trader.mirror_split_quanta must be an integer >= 1",
+    ),
+    # R4-P2-3: leader quality gate (0 = off; 0..1).
+    (
+        "copy_trader.min_leader_score",
+        (int, float),
+        0.0,
+        1.0,
+        "copy_trader.min_leader_score must be a fraction between 0 and 1 (0 = off)",
+    ),
     (
         "trade.sell_slippage_inflation_bps",
         int,

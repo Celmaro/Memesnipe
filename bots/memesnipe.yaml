@@ -303,13 +303,30 @@ filters:
   marry_mode: false # MUST be false so the bot auto-sells
   yolo_mode: true # Phase 3: continuous sniping (freshness fix landed)
 
-  # T3.2: copy-trader engine (disabled by default; off = safe baseline).
-  # Mirrors leader buys only for wallets inserted into the targets DB.
-  copy_trader:
-    enabled: true # 5 targets loaded 2026-10-26 (Tier 1/3). Shadow-safe: mirror
-                  # buys simulate + record to shadow_data/ in shadow mode.
-    db: /home/agentuser/Memesnipe/state/copy_targets.db
-    min_buy_interval: 5.0 # seconds between mirrored buys (rate guard)
+# T3.2: copy-trader engine (disabled by default; off = safe baseline).
+# Mirrors leader buys only for wallets inserted into the targets DB.
+# NOTE: this block is TOP-LEVEL (not under filters:). bot_runner and
+# config_loader read it as ``copy_trader.enabled``; the previous nesting
+# under filters: silently disabled the engine despite enabled: true
+# (caught by verify_copy_hardening during R4-P2).
+copy_trader:
+  enabled: true # 5 targets loaded 2026-10-26 (Tier 1/3). Shadow-safe: mirror
+                # buys simulate + record to shadow_data/ in shadow mode.
+  db: /home/agentuser/Memesnipe/state/copy_targets.db
+  min_buy_interval: 5.0 # seconds between mirrored buys (rate guard)
+  # R4-P2-1: persistent-ring vetting (0 = off). Stop mirroring a leader
+  # whose buys co-fire with the same peer wallets across >= this many
+  # launches (2607.02795 method on our own feed).
+  ring_cofire_threshold: 0
+  # R4-P2-2: anti-front-run mirror jitter (ms, 0 = off) + split (1 = one
+  # fill). Jitter randomizes the mirror delay; split sends the mirrored
+  # size in N quanta so followers can't front-run the full amount.
+  mirror_jitter_ms: 0
+  mirror_split_quanta: 1
+  # R4-P2-3: leader quality gate (0 = off). When set, leaders scoring
+  # below this 0..1 composite are not mirrored (realized PnL, frequency,
+  # concentration, realization ratio).
+  min_leader_score: 0.0
 
 # Retry and timeout settings
 retries:

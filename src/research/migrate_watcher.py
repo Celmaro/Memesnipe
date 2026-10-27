@@ -29,10 +29,21 @@ COMPLETE_PUMP_AMM_MIGRATION_DISCRIMINATOR = bytes.fromhex("bde95db95c94ea94")
 
 @dataclass
 class MigrateWatcher:
-    """Tracks mints that migrated to PumpSwap, from geyser log lines."""
+    """Tracks mints that migrated to PumpSwap, from geyser log lines.
 
-    #: mint string -> True once a migration event was seen.
+    R4-P3-2: a geyser log line is a *signal*, not a verification. The
+    graduation-label audit (2607.02823) shows collector-generated labels
+    carry measurement error (dev AUROC 0.86 -> validation 0.46, coin
+    flip). Consumers that act on graduation (exit/leader logic) must
+    confirm the migration against a direct pool-state read first; this
+    watcher keeps the log-derived signal separate from the confirmed
+    verdict so no label is trusted before verification.
+    """
+
+    #: mint string -> True once a migration event was seen (log signal).
     migrated: dict[str, bool] = field(default_factory=dict)
+    #: mint string -> True once a DIRECT pool-state read confirmed it.
+    confirmed: dict[str, bool] = field(default_factory=dict)
 
     def on_logs(self, logs: list[str]) -> str | None:
         """Scan one batch of `Program data:` logs for a migration event.
@@ -60,8 +71,29 @@ class MigrateWatcher:
             return mint
         return None
 
-    def has_migrated(self, mint: str) -> bool:
-        return self.migrated.get(mint, False)
+    def confirm(self, mint: str, pool_exists: bool) -> None:
+        """Mark a migration verified (or refuted) by a direct pool-state read.
+
+        R4-P3-2: ``pool_exists=True`` confirms the mint's PumpSwap pool is
+        live on-chain; ``False`` (or a failed read) leaves the log signal
+        unconfirmed — callers may not treat it as a graduation.
+        """
+        self.confirmed[mint] = bool(pool_exists)
+
+    def has_migrated(self, mint: str, require_confirmed: bool = False) -> bool:
+        """Whether the mint migrated.
+
+        ``require_confirmed=False`` (legacy) trusts the log line alone;
+        ``True`` (R4-P3-2) requires a direct pool-state confirmation —
+        unverified labels return False (the fail-closed direction for
+        graduation-triggered actions).
+        """
+        if not self.migrated.get(mint, False):
+            return False
+        if require_confirmed:
+            return self.confirmed.get(mint, False)
+        return True
 
     def clear(self) -> None:
         self.migrated.clear()
+        self.confirmed.clear()

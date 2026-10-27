@@ -367,6 +367,11 @@ class UniversalTrader:
         copy_trader_enabled: bool = False,
         copy_trader_db: str | None = None,
         copy_trader_min_interval: float = 5.0,
+        # R4-P2-1/2/3: copy-hardening knobs (all 0/1 = off = current behavior).
+        copy_ring_cofire_threshold: int = 0,
+        copy_mirror_jitter_ms: float = 0.0,
+        copy_mirror_split_quanta: int = 1,
+        copy_min_leader_score: float = 0.0,
         # Split buy/sell priority fees: overrides for priority_fees.fixed_amount
         buy_priority_fee: int | None = None,
         sell_priority_fee: int | None = None,
@@ -781,6 +786,11 @@ class UniversalTrader:
         self.copy_trader_enabled = copy_trader_enabled
         self.copy_trader_db = copy_trader_db
         self.copy_trader_min_interval = copy_trader_min_interval
+        # R4-P2-1/2/3: copy-hardening knobs (off defaults).
+        self.copy_ring_cofire_threshold = copy_ring_cofire_threshold
+        self.copy_mirror_jitter_ms = copy_mirror_jitter_ms
+        self.copy_mirror_split_quanta = max(1, int(copy_mirror_split_quanta))
+        self.copy_min_leader_score = copy_min_leader_score
         self.copy_trader_engine = None
         self.buy_priority_fee = buy_priority_fee
         self.sell_priority_fee = sell_priority_fee
@@ -1118,6 +1128,10 @@ class UniversalTrader:
                 buy_mirror=self._mirror_buy,
                 min_buy_interval=self.copy_trader_min_interval,
                 profiler=WalletProfiler(),
+                ring_cofire_threshold=self.copy_ring_cofire_threshold,
+                mirror_jitter_ms=self.copy_mirror_jitter_ms,
+                mirror_split_quanta=self.copy_mirror_split_quanta,
+                min_leader_score=self.copy_min_leader_score,
             )
 
             async def on_trade_logs(

@@ -14,6 +14,7 @@ shared buyer, exactly like a normal snipe.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Callable
 
@@ -43,6 +44,26 @@ def _mirror_size(leader_sol: float, target: CopyTarget) -> float:
     return max(0.0, target.fixed_buy_sol or 0.0)
 
 
+def _profile_float(v: Any) -> float | None:
+    """Coerce a profile value to float; None when absent/unparseable."""
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _profile_int(v: Any) -> int | None:
+    """Coerce a profile value to int; None when absent/unparseable."""
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class CopyTraderEngine:
     """Decode TradeEvents and mirror leader buys for enabled targets.
 
@@ -64,14 +85,38 @@ class CopyTraderEngine:
         buy_mirror: Callable[[TokenInfo, CopyTarget, float], Any] | None = None,
         min_buy_interval: float = 5.0,
         profiler: Any | None = None,
+        # R4-P2-1: persistent-ring vetting (0 = off). When a target's buy
+        # co-fires with the same peer wallets across >= ring_cofire_threshold
+        # launches, the leader looks like part of a coordinated ring
+        # (2607.02795 union-find method, on our own feed) -> stop mirroring.
+        ring_cofire_threshold: int = 0,
+        # R4-P2-2: anti-front-run mirror jitter (0 = off) + split (1 = one
+        # fill). Jitter randomizes the mirror delay so followers can't front-
+        # run the full amount; split divides the mirrored size into quanta
+        # fills sent back-to-back (2601.08641 defensive mechanisms).
+        mirror_jitter_ms: float = 0.0,
+        mirror_split_quanta: int = 1,
+        # R4-P2-3: leader quality gate (0 = off). When the profiler returns a
+        # profile, score the leader (leader_score module); below this score
+        # the mirror is skipped. 0 keeps today's behavior (profile consulted,
+        # never a gate).
+        min_leader_score: float = 0.0,
     ):
         self.client = client
         self.store = store
         self.buy_mirror = buy_mirror
         self.min_buy_interval = min_buy_interval
         self.profiler = profiler
+        self.ring_cofire_threshold = ring_cofire_threshold
+        self.mirror_jitter_ms = mirror_jitter_ms
+        self.mirror_split_quanta = max(1, int(mirror_split_quanta))
+        self.min_leader_score = min_leader_score
         self._last_buy_ts: float = 0.0
         self._last_mirrored: dict[str, float] = {}  # "{trader}:{mint}" -> ts, dedupe
+        # R4-P2-1: co-fire tracker over the engine's own buy observations.
+        from screening.coordination import CoFireTracker
+
+        self._cofire = CoFireTracker()
 
     async def on_transaction_logs(self, logs: list[str]) -> None:
         """Feed geyser transaction logs; mirror any leader buy found."""
@@ -121,6 +166,31 @@ class CopyTraderEngine:
                 f"(rate guard {now - self._last_buy_ts:.1f}s < {self.min_buy_interval}s)"
             )
             return
+
+        # R4-P2-1: observe this buy in the ring tracker, then veto targets
+        # whose buys co-fire with persistent peer rings across too many
+        # launches (on OUR feed, where buy/sell labels are trustworthy).
+        self._cofire.observe_buy(mint, trader)
+        if self.ring_cofire_threshold > 0:
+            # A wallet is "ringy" when it has co-fired across >= threshold
+            # distinct launches with ANY single peer (counted via the
+            # tracker's per-wallet mint sets).
+            peer_overlap = 0
+            peer_mints = set(self._cofire._wallet_mints.get(trader, set()))  # noqa: SLF001
+            for w, wm in self._cofire._wallet_mints.items():  # noqa: SLF001
+                if w == trader:
+                    continue
+                common = len(peer_mints & set(wm))
+                if common > peer_overlap:
+                    peer_overlap = common
+                    if peer_overlap >= self.ring_cofire_threshold:
+                        logger.warning(
+                            f"Copy-trader: skipping {trader[:8]} buy on "
+                            f"{mint[:8]} — persistent ring co-fire "
+                            f"(peer {w[:8]} overlaps {peer_overlap} launches; "
+                            f"threshold {self.ring_cofire_threshold})"
+                        )
+                        return
 
         # Min notional gate.
         sol_amount = 0.0
@@ -183,6 +253,8 @@ class CopyTraderEngine:
         # hard gate. A fetch failure logs and proceeds (mirror is explicit opt-in).
         # R3-P2-7: the multi-window profile adds the 24h window so
         # keep-all-windows-positive qualification has the data it needs.
+        # R4-P2-3: when min_leader_score > 0, the profile BECOMES a gate —
+        # a leader scoring below the threshold is not mirrored.
         if self.profiler is not None:
             try:
                 profile = await self.profiler.profile_multiwindow(trader)
@@ -194,6 +266,44 @@ class CopyTraderEngine:
                         f"7d={windows.get('7d', {}).get('realized_pnl')} "
                         f"30d={windows.get('30d', {}).get('realized_pnl')}"
                     )
+                    if self.min_leader_score > 0:
+                        from screening.leader_score import (
+                            LeaderStats,
+                            score_leader,
+                        )
+
+                        stats = LeaderStats(
+                            realized_pnl_quote=_profile_float(
+                                windows.get("30d", {}).get("realized_pnl")
+                            ),
+                            tokens_30d=_profile_int(
+                                windows.get("30d", {}).get("tokens_traded")
+                            ),
+                            total_trades_30d=_profile_int(
+                                windows.get("30d", {}).get("trades")
+                            ),
+                            win_rate=_profile_float(
+                                windows.get("30d", {}).get("win_rate")
+                            ),
+                            pnl_concentration=_profile_float(
+                                windows.get("30d", {}).get("pnl_concentration")
+                            ),
+                            realization_ratio=_profile_float(
+                                windows.get("30d", {}).get("realization_ratio")
+                            ),
+                        )
+                        score = score_leader(stats)
+                        if score < self.min_leader_score:
+                            logger.warning(
+                                f"Copy-trader: skipping {trader[:8]} buy on "
+                                f"{mint[:8]} — leader score {score:.2f} < "
+                                f"min_leader_score {self.min_leader_score}"
+                            )
+                            return
+                        logger.info(
+                            f"Copy-trader: leader {trader[:8]} score "
+                            f"{score:.2f} >= {self.min_leader_score}"
+                        )
             except Exception:
                 logger.exception(
                     f"Copy-trader: profile lookup failed for {trader[:8]}; "
@@ -201,16 +311,40 @@ class CopyTraderEngine:
                 )
 
         if self.buy_mirror is not None:
-            try:
-                ok = await self.buy_mirror(token_info, target, size)
-                if ok:
-                    self._last_buy_ts = time.monotonic()
-                    self._last_mirrored[f"{trader}:{mint}"] = time.monotonic()
-                    logger.info(f"Copy-trader: mirrored buy on {mint[:8]}")
-                else:
-                    logger.warning(f"Copy-trader: mirror buy failed on {mint[:8]}")
-            except Exception:
-                logger.exception(f"Copy-trader: mirror buy raised on {mint[:8]}")
+            # R4-P2-2: anti-front-run jitter — randomize the mirror delay so
+            # a follower of the leader cannot front-run the full amount
+            # (2601.08641 defensive mechanism; 0 = off).
+            if self.mirror_jitter_ms > 0:
+                import random
+
+                delay = random.uniform(0.0, self.mirror_jitter_ms / 1000.0)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            # R4-P2-2: split the mirror into quanta fills (1 = single fill).
+            # Total size preserved; each quanta is a separate mirror call.
+            quanta = self.mirror_split_quanta
+            per_quantum = size / quanta
+            ok = False
+            for q in range(quanta):
+                try:
+                    result = await self.buy_mirror(token_info, target, per_quantum)
+                    ok = ok or bool(result)
+                    if q < quanta - 1 and self.mirror_jitter_ms > 0:
+                        await asyncio.sleep(delay)  # same jitter between quanta
+                except Exception:
+                    logger.exception(
+                        f"Copy-trader: mirror quanta {q + 1}/{quanta} raised "
+                        f"on {mint[:8]}"
+                    )
+            if ok:
+                self._last_buy_ts = time.monotonic()
+                self._last_mirrored[f"{trader}:{mint}"] = time.monotonic()
+                logger.info(
+                    f"Copy-trader: mirrored buy on {mint[:8]} "
+                    f"({quanta} quanta x {per_quantum:.6f} SOL)"
+                )
+            else:
+                logger.warning(f"Copy-trader: mirror buy failed on {mint[:8]}")
 
     def _is_duplicate(self, trader: str, mint: str) -> bool:
         last = self._last_mirrored.get(f"{trader}:{mint}", 0.0)

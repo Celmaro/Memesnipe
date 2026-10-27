@@ -328,6 +328,19 @@ async def start_bot(config_path: str):
             copy_trader_min_interval=cfg.get("copy_trader", {}).get(
                 "min_buy_interval", 5.0
             ),
+            # R4-P2-1/2/3: copy-hardening knobs (off defaults).
+            copy_ring_cofire_threshold=cfg.get("copy_trader", {}).get(
+                "ring_cofire_threshold", 0
+            ),
+            copy_mirror_jitter_ms=cfg.get("copy_trader", {}).get(
+                "mirror_jitter_ms", 0.0
+            ),
+            copy_mirror_split_quanta=cfg.get("copy_trader", {}).get(
+                "mirror_split_quanta", 1
+            ),
+            copy_min_leader_score=cfg.get("copy_trader", {}).get(
+                "min_leader_score", 0.0
+            ),
             buy_priority_fee=cfg.get("priority_fees", {}).get("buy_fixed_amount"),
             sell_priority_fee=cfg.get("priority_fees", {}).get("sell_fixed_amount"),
             stuck_sweep_interval=cfg.get("trade", {}).get("stuck_sweep_interval", 0),
