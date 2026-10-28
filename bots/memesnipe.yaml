@@ -56,36 +56,19 @@ research:
   strategies_ledger_enabled: true
   # Parallel exit-strategy grid — every open shadow position is evaluated
   # against each spec (kind: tp_sl | staged_trail | hold). "hold" is the
-  # no-exit baseline. tp_sl variants probe tighter/looser stops; trail
-  # variants come from the hour-11 backtest + param sweep (trail8 = pure
-  # trail with the sweep-tuned 8% distance).
+  # no-exit baseline. Pruned to 4 cells 2026-10-28 (user: too many strategies):
+  # poison/duplicate cells removed (tp20_sl10 -2360%, holds -957/-1219%,
+  # pure-trail family live-disproven in trail10 era -373%, sl20 duplicates).
+  # Keep: fixed baseline, live config (must match trade.exit_mode knobs),
+  # sweep winner (trail6/sl25), runner-capture probe (trail10/sl25).
   strategies:
     - {name: tp_sl, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.20}}
-    - {name: tp20_sl10, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.10}}
-    - {name: tp30_sl20, kind: tp_sl, config: {take_profit_pct: 0.30, stop_loss_pct: 0.20}}
-    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
-    - {name: st_tp20_sl10, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.10}}
-    - {name: st_tp30_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.30, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
-    - {name: trail8, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
-    - {name: trail10, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
-    # A2-loop-1: param sweep winners (tools/param_sweep.py, 6h net-of-fee).
-    # st trail6/sl25 = staged-family replay winner; t10_15_* = pure trail
-    # replay winner (arm 15, trail 6/8) — needs live first-fire proof before
-    # it can displace the staged mode (trail10 live era lost -375%).
+    # live exit config — keep in sync with trade.trail_* knobs (sl25, trail8)
+    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.25}}
+    # 6-hour param-sweep winner (net-of-fee, tuning +10.35 / held-out +15.07)
     - {name: st_trail6_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.06, hard_stop_pct: 0.25}}
-    - {name: st_trail6_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.06, hard_stop_pct: 0.20}}
-    - {name: t10_15_6, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.15, trail_pct: 0.06, hard_stop_pct: 0.20}}
-    - {name: t10_15_8, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.15, trail_pct: 0.08, hard_stop_pct: 0.20}}
-    # A2-loop-4 (user: runner capture in staged trail): wide-trail staged cells
-    # so the post-TP 60% rides runners instead of shaking out on pullbacks.
+    # runner capture: post-TP 60% rides through normal pullbacks (user focus)
     - {name: st_trail10_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
-    - {name: st_trail12_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.12, hard_stop_pct: 0.25}}
-    - {name: st_trail10_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
-    - {name: st_50@25p_trail10_sl25, kind: staged_trail, config: {initial_tp_share: 0.5, initial_tp_pct: 0.25, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
-    - {name: hold_120s, kind: time_exit, config: {max_hold_s: 120}}
-    - {name: hold_300s, kind: time_exit, config: {max_hold_s: 300}}
-    - {name: stagn_600s, kind: time_exit, config: {max_hold_s: 600, stagnation_band_pct: 0.02}}
-    - {name: hold, kind: hold, config: {}}
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
