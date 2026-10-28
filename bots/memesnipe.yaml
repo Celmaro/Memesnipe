@@ -58,19 +58,19 @@ research:
   strategies_ledger_enabled: true
   # Parallel exit-strategy grid — every open shadow position is evaluated
   # against each spec (kind: tp_sl | staged_trail | hold). "hold" is the
-  # no-exit baseline. Pruned to 4 cells 2026-10-28 (user: too many strategies):
+  # no-exit baseline. Pruned to 3 cells 2026-10-29 (user: too many strategies):
   # poison/duplicate cells removed (tp20_sl10 -2360%, holds -957/-1219%,
   # pure-trail family live-disproven in trail10 era -373%, sl20 duplicates).
+  # st_trail10_sl25 graduated INTO the live config (corrected-sweep runner
+  # winner) so its probe cell was dropped rather than duplicated.
   # Keep: fixed baseline, live config (must match trade.exit_mode knobs),
-  # sweep winner (trail6/sl25), runner-capture probe (trail10/sl25).
+  # tuning-average winner (trail6/sl25).
   strategies:
     - {name: tp_sl, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.20}}
-    # live exit config — keep in sync with trade.trail_* knobs (sl25, trail8)
-    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.25}}
-    # 6-hour param-sweep winner (net-of-fee, tuning +10.35 / held-out +15.07)
+    # live exit config — keep in sync with trade.trail_* knobs (sl25, trail10)
+    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
+    # 6-hour param-sweep tuning winner (net-of-fee, tuning +11.36 / held-out +15.35)
     - {name: st_trail6_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.06, hard_stop_pct: 0.25}}
-    # runner capture: post-TP 60% rides through normal pullbacks (user focus)
-    - {name: st_trail10_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
@@ -119,14 +119,19 @@ trade:
   # R4-P1-7: exit shape within the tp_sl family. "tp_sl" (default) = current
   # single/staged TP/SL unchanged. "staged_trail" = asymmetric staged-then-
   # trail: sell 40% at +20%, arm a break-even floor at +10%, trail the rest
-  # 8% behind each new high, exit on the floor or the -20% hard stop. The
+  # 10% behind each new high, exit on the floor or the -25% hard stop. The
   # same rule is shadow-tested in parallel via the strategies ledger
   # (research.strategies_ledger_enabled) regardless of which mode is active.
+  # trail_pct 0.10 = corrected-sweep runner-capture winner (2026-10-29):
+  # best held-out +18.50/PF 2.8 and best runner capture on tuning AND
+  # held-out (44%/41% legs >+50, 16%/17% >+100) vs trail8's 42%/39% and
+  # +14.77/PF 2.4 (which never topped any metric). NOT the pure-trail
+  # trail10 mode below (that bled -353% live); 40% banks at +20% first.
   exit_mode: "staged_trail"
   trail_initial_tp_share: 0.4  # fraction of the position sold at first TP
   trail_initial_tp_pct: 0.20  # +20% first take-profit level (sweep-tuned)
   trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
-  trail_trail_pct: 0.08  # runner capture: 8% trail keeps the 60% through normal pullbacks (6% shakes runners out)
+  trail_trail_pct: 0.10  # runner capture: 10% trail keeps the 60% riding pullbacks (corrected-sweep winner; 8% shook out runners in the trail10-vs-trail8 A/B)
   trail_hard_stop_pct: 0.25  # A2-loop-1: sweep winner sl25 (equal-best held-out +15.08%)
   # trail10 (exit_mode "trail10"): pure trailing stop, backtest winner
   # (5h replay, 2420 trades: +25.1% avg vs +16.7% tp_sl, 67.8% WR)
