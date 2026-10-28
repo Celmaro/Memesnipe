@@ -386,9 +386,9 @@ cleanup:
 
 # Node provider configuration
 node:
-  max_rps: 25 # publicnode/mainnet-beta free tiers tolerate bursts better than
-              # sustained 25/s; Tatum needs <=2/s if re-enabled (its plan caps
-              # at 3 req/s). burst_size defaults to ceil(max_rps).
+  max_rps: 8 # gentler burst profile for free tiers (25/burst-25 burned our IP
+             # on mainnet-beta/publicnode; 8/burst-4 keeps shadow flow alive).
+  burst_size: 4
   # R4-P4-3: startup RPC latency self-test (off by default). Three get_slot
   # round trips at boot; warns when avg > 200 ms (snipe races are lost on
   # latency before fees ever matter).
