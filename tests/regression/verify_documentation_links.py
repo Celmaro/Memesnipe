@@ -19,6 +19,7 @@ Usage:
     uv run tests/regression/verify_documentation_links.py --live
 """
 
+import ipaddress
 import re
 import sys
 import urllib.error
@@ -44,6 +45,10 @@ STUB_HOSTS = {
     "offline.invalid",
     "stub.invalid",
     "example.com",
+    # Deliberate negative-test fixtures in the C10.2 SSRF verifier: localhost
+    # (non-https, must be refused) and the hostless URL. Never meant to
+    # resolve; the SSRF verifier itself asserts they are blocked.
+    "localhost",
 }
 
 # Endpoints that used to be cited here and no longer exist. Keeping them listed
@@ -101,7 +106,33 @@ def is_checkable(url: str) -> bool:
     """
     if "{" in url:  # f-string template, e.g. an explorer link
         return False
-    host = urlparse(url).hostname or ""
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        # Unparseable URL (e.g. a bare IPv6 literal in a docstring/verifier
+        # fixture). It is not a checkable live address; treat as stub.
+        return False
+    if not host:
+        # Hostless URL (e.g. https:///no-host negative fixture) — nothing to
+        # resolve, hence not checkable.
+        return False
+    try:
+        addr = ipaddress.ip_address(host.split("%")[0])
+    except ValueError:
+        addr = None
+    if addr is not None and (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_unspecified
+        # RFC 6598 shared address space (CGNAT): Python < 3.13 does not
+        # classify 100.64.0.0/10 as private.
+        or addr in ipaddress.ip_network("100.64.0.0/10")
+    ):
+        # Private/reserved IP fixtures (C10.2 SSRF verifier, unroutable
+        # stub clients) are never checkable live addresses.
+        return False
     return not any(host == stub or host.endswith(f".{stub}") for stub in STUB_HOSTS)
 
 

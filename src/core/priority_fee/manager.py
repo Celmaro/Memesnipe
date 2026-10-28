@@ -40,8 +40,9 @@ class PriorityFeeManager:
             bid_multiplier: Auction bid (T1.4): multiply the sampled base fee
                 by this before the extra_fee percentage. >1.0 raises the bid
                 above the observed top fee to win the race; 1.0 = match the
-                sample exactly. Applied to the dynamic sample; ignored for
-                fixed-fee mode.
+                sample exactly. C2.5: applied uniformly to whatever base fee
+                came back (dynamic sample, fixed fallback, or pure fixed
+                mode) so the auction bid is never silently dropped.
             fee_cache_ttl: How long the dynamic sampler reuses one RPC sample
                 (seconds), so the auction re-prices without a hot-path RPC.
             contention_multiplier: R4-P0-3 — extra multiplier applied on top
@@ -95,26 +96,28 @@ class PriorityFeeManager:
         if base_fee is None:
             return None
 
-        if self.enable_dynamic_fee:
-            # Auction bid (T1.4): raise the sampled base above the observed
-            # top before applying the extra percentage. R4-P0-3: contention
-            # racing (armed via set_contention) escalates the bid further
-            # during a launch flood.
-            multiplier = self.bid_multiplier
-            if self._contention_armed:
-                multiplier = self.bid_multiplier * self.contention_multiplier
-                logger.warning(
-                    f"Fee auction CONTENTION: multiplier {multiplier:.2f} "
-                    f"(bid {self.bid_multiplier} x contention "
-                    f"{self.contention_multiplier})"
-                )
-            auctioned = int(base_fee * multiplier)
-            if multiplier != 1.0:
-                logger.debug(
-                    f"Fee auction: sampled={base_fee} bid={auctioned} "
-                    f"(multiplier {multiplier})"
-                )
-            base_fee = auctioned
+        # Auction bid (T1.4): raise the sampled base above the observed
+        # top before applying the extra percentage. R4-P0-3: contention
+        # racing (armed via set_contention) escalates the bid further
+        # during a launch flood. C2.5: applied to whichever base fee came
+        # back — dynamic sample, fixed fallback, or pure fixed mode — so a
+        # non-1.0 bid_multiplier is honored uniformly instead of silently
+        # dropping on the fixed path.
+        multiplier = self.bid_multiplier
+        if self._contention_armed:
+            multiplier = self.bid_multiplier * self.contention_multiplier
+            logger.warning(
+                f"Fee auction CONTENTION: multiplier {multiplier:.2f} "
+                f"(bid {self.bid_multiplier} x contention "
+                f"{self.contention_multiplier})"
+            )
+        auctioned = int(base_fee * multiplier)
+        if multiplier != 1.0:
+            logger.debug(
+                f"Fee auction: sampled={base_fee} bid={auctioned} "
+                f"(multiplier {multiplier})"
+            )
+        base_fee = auctioned
 
         # Apply extra fee (percentage increase)
         final_fee = int(base_fee * (1 + self.extra_fee))

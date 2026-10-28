@@ -11,7 +11,10 @@ from time import monotonic
 from typing import Any
 
 import aiohttp
+import ipaddress
+import socket as _socket
 from solders.pubkey import Pubkey
+from urllib.parse import urlparse
 
 from backfill.transaction_crawler import TransactionCrawler
 from cleanup.modes import (
@@ -65,6 +68,76 @@ except ImportError:
     pass
 
 logger = get_logger(__name__)
+
+# C10.2 (SSRF): scheme + host allowlist for off-chain metadata URIs. The
+# URI is attacker-controlled (set by the token creator), so a bare GET is a
+# server-side-request-forgery primitive: `http://169.254.169.254/latest/...`
+# hits the cloud metadata service, `http://127.0.0.1:...` hits local
+# services, `file://` etc. reads local files. ipfs:// and ar:// are the two
+# legitimate non-http schemes seen on-chain; both are mapped to public
+# gateways. Everything else must be https/http with a public resolved host.
+_METADATA_ALLOWED_SCHEMES = {"https", "http"}
+_IPFS_GATEWAY = "https://ipfs.io/ipfs/{path}"
+_ARWEAVE_GATEWAY = "https://arweave.net/{path}"
+# RFC 6598 shared address space (CGNAT). Python < 3.13 does not classify
+# 100.64.0.0/10 as private, so check it explicitly.
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _safe_metadata_uri(uri: str) -> str | None:
+    """Return a fetchable, SSRF-safe URL for a metadata URI, or None.
+
+    Refuses non-http(s) schemes (except mapped ipfs/ar) before any network
+    work, and refuses any host that resolves to a loopback, link-local,
+    private, reserved, or unspecified address (covers 127.0.0.0/8,
+    ::1/128, 169.254.0.0/16 incl. cloud metadata, 10/8, 172.16/12,
+    192.168/16, CGNAT 100.64/10, and ::ffff: mapped IPv4). Failed/hostless
+    parses also return None. The caller treats None as \"no snapshot\".
+    """
+    if not uri:
+        return None
+    uri = uri.strip()
+    if not uri:
+        return None
+
+    # IPFS / Arweave native URIs -> public gateway URLs.
+    if uri.startswith("ipfs://"):
+        return _IPFS_GATEWAY.format(path=uri[len("ipfs://") :].lstrip("/"))
+    if uri.startswith("ar://"):
+        return _ARWEAVE_GATEWAY.format(path=uri[len("ar://") :].lstrip("/"))
+
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return None
+    if parsed.scheme not in _METADATA_ALLOWED_SCHEMES or not parsed.hostname:
+        return None
+
+    # Resolve and reject private/reserved addresses. Port is kept only when
+    # explicitly present in the URI (aiohttp treats "https://host" as 443).
+    try:
+        infos = _socket.getaddrinfo(
+            parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=_socket.SOCK_STREAM,
+        )
+    except _socket.gaierror:
+        return None
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        host = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if (
+            ip.is_loopback
+            or ip.is_link_local
+            or ip.is_private
+            or ip.is_reserved
+            or ip.is_unspecified
+            or ip in _CGNAT_NET
+        ):
+            return None
+    return uri
 
 # Default for trade.max_exit_sell_attempts. The seller's own max_retries covers
 # submission only, so a revert is retried in the monitor loop, where the price is
@@ -792,6 +865,10 @@ class UniversalTrader:
         # early-buyer set already tracked by the rug heuristics (_rug_buyers).
         self.rug_score_threshold = rug_score_threshold
         self._creator_launch_ts: dict[str, list[float]] = {}
+        # C4.3: per-mint guard so a single detected launch records its
+        # creator's cadence exactly ONCE, no matter how many times gates
+        # re-evaluate the mint (detection, backfill, pre-buy recheck).
+        self._cadence_recorded_mints: set[str] = set()
         self.factory_deploy_rate = factory_deploy_rate
         self.min_market_cap_sol = min_market_cap_sol
         self.allow_mayhem_mode = allow_mayhem_mode
@@ -1079,15 +1156,22 @@ class UniversalTrader:
             # T3.2: optional copy-trader engine (disabled by default).
             await self._init_copy_trader()
 
-            # P2-EXIT-4 / R3-P1-4 / R3-P2-12: rug-buyer tracking, creator-sell
-            # exits, and event-driven exits all consume the listener's trade
-            # feed — wire it whenever ANY of them is on (and the copy engine
-            # hasn't claimed the callback first).
+            # P2-EXIT-4 / R3-P1-4 / R3-P2-12 / C4.2: rug-buyer tracking,
+            # creator-sell exits, event-driven exits, and the wash/cofire/
+            # rug-score gates all consume the listener's trade feed — wire
+            # it whenever ANY of them is on (and the copy engine hasn't
+            # claimed the callback first). The gates' thresholds are the
+            # enablers: a non-zero max_wash_share / rug_score_threshold /
+            # copy_ring_cofire_threshold only means anything when the feed
+            # is observed.
             feed_dependents = (
                 self.rug_heuristics_enabled
                 or self.exit_on_creator_sell
                 or self.event_driven_exits_enabled
                 or self.post_entry_advisories_enabled
+                or self.max_wash_share > 0  # C4.2
+                or self.rug_score_threshold > 0  # C4.2
+                or self.copy_ring_cofire_threshold > 0  # C4.2
             )
             if feed_dependents and (
                 not hasattr(self.token_listener, "trade_callback")
@@ -1578,16 +1662,45 @@ class UniversalTrader:
             return ""
 
     async def _fetch_metadata_json(self, uri: str) -> str:
-        """GET the metadata URI (off hot path, short timeout, fail-open)."""
+        """GET the metadata URI (off hot path, short timeout, fail-open).
+
+        C10.2 (SSRF): the URI is attacker-controlled — it is set by the
+        token creator in the on-chain metadata account — so it is validated
+        against an allowlist before any connection is attempted:
+
+        * schemes: https/http only (ipfs:// and ar:// mapped to their public
+          gateways), everything else refused before DNS resolution;
+        * hosts: the name is resolved and every address is checked against
+          loopback / link-local / private / reserved ranges (blocks
+          `169.254.169.254` cloud metadata, localhost, CGNAT, RFC1918);
+        * body: streamed with an explicit 64 KiB cap instead of buffering
+          the whole response.
+
+        Fail-open: any validation failure or fetch error returns "" (the
+        caller treats a missing snapshot as gate-pass when the gate is off).
+        """
+        target = _safe_metadata_uri(uri)
+        if target is None:
+            logger.debug(f"Metadata URI blocked by SSRF allowlist: {uri!r}")
+            return ""
         try:
             timeout = aiohttp.ClientTimeout(total=4.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(
-                    uri, headers={"User-Agent": "Mozilla/5.0"}
+                    target, headers={"User-Agent": "Mozilla/5.0"}
                 ) as resp:
                     if resp.status != 200:
                         return ""
-                    return (await resp.text())[:65_536]
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(8192):
+                        total += len(chunk)
+                        if total > 65_536:
+                            return b"".join(chunks).decode(
+                                "utf-8", errors="replace"
+                            )[:65_536]
+                        chunks.append(chunk)
+                    return b"".join(chunks).decode("utf-8", errors="replace")
         except Exception:
             return ""
 
@@ -2133,7 +2246,6 @@ class UniversalTrader:
             token_key = str(token_info.mint)
             self._queued_mints.discard(token_key)  # C3.3 enqueue dedupe
             try:
-                token_key = str(token_info.mint)
                 token_age = monotonic() - self.token_timestamps.get(
                     token_key, monotonic()
                 )
@@ -2150,6 +2262,33 @@ class UniversalTrader:
                 await self._handle_token(token_info)
             finally:
                 self.token_queue.task_done()
+
+    def _record_creator_launch(self, token_info: TokenInfo) -> None:
+        """C4.3: record one creator launch cadence observation (idempotent).
+
+        Called exactly once per detected mint (guarded by
+        `_cadence_recorded_mints`) from `_skip_reason`, so a mint that is
+        re-evaluated — detection, backfill, pre-buy recheck — never
+        double-counts its creator's launch rate. The factory gate and the
+        rug score both read the same trailing-hour window. Gate-off path
+        (both gates 0) returns before touching any state, so verifier stubs
+        and the default config skip this hook entirely.
+        """
+        if not (self.factory_deploy_rate > 0 or self.rug_score_threshold > 0):
+            return
+        creator_key = str(token_info.creator or "") or (
+            str(token_info.user) if token_info.user else ""
+        )
+        mint_key = str(token_info.mint)
+        if not creator_key or mint_key in self._cadence_recorded_mints:
+            return
+        self._cadence_recorded_mints.add(mint_key)
+        now = monotonic()
+        window = self._creator_launch_ts.setdefault(creator_key, [])
+        window.append(now)
+        # Keep only the trailing hour (bounded memory).
+        cutoff = now - 3600.0
+        window[:] = [t for t in window if t >= cutoff]
 
     def _skip_reason(self, token_info: TokenInfo) -> str | None:
         """Why the configured filters refuse this coin, or None to trade it.
@@ -2188,29 +2327,22 @@ class UniversalTrader:
         creator_key = str(token_info.creator or "") or (
             str(token_info.user) if token_info.user else ""
         )
-        # Record launch cadence when EITHER the factory filter OR the rug
-        # score reads it (both consume the same trailing-hour window).
-        if creator_key and (
-            self.factory_deploy_rate > 0 or self.rug_score_threshold > 0
-        ):
-            now = monotonic()
-            window = self._creator_launch_ts.setdefault(creator_key, [])
-            window.append(now)
-            # Keep only the trailing hour (bounded memory).
-            cutoff = now - 3600.0
-            window[:] = [t for t in window if t >= cutoff]
-            # Launches/hour over the observed window. R5-P2-2: a lone observation is
-            # not a rate — a single launch used to read exactly 60/h (span
-            # floored at 1/60h) and could trigger the factory gate on a
-            # creator's first launch. Require >= 2 launches before cadence.
+        # C4.3: the launch observation is recorded HERE via the idempotent
+        # per-mint hook — never in the dynamic pre-buy recheck — so a mint
+        # that is re-evaluated (detection, backfill, pre-buy) can never
+        # double-count its creator's cadence. Called on the class so
+        # verifier stubs (SimpleNamespace doubles) run the real hook.
+        UniversalTrader._record_creator_launch(self, token_info)
+        # Factory gate read: the trailing-hour window was just fed by the
+        # hook. A lone observation is still None (R5-P2-2 requires >= 2
+        # launches before a rate), so a creator's first launch never trips
+        # this gate.
+        if self.factory_deploy_rate > 0:
             from screening.rug_score import cadence_mints_per_hour
 
-            cadence = cadence_mints_per_hour(window, now)
-            if (
-                cadence is not None
-                and self.factory_deploy_rate > 0
-                and cadence > self.factory_deploy_rate
-            ):
+            window = self._creator_launch_ts.get(creator_key, [])
+            cadence = cadence_mints_per_hour(window, monotonic())
+            if cadence is not None and cadence > self.factory_deploy_rate:
                 return (
                     f"creator {creator_key[:12]}... is a factory "
                     f"({cadence:.1f} mints/hr > {self.factory_deploy_rate})"
@@ -2333,9 +2465,90 @@ class UniversalTrader:
 
         Parent controls it: the cadence bookkeeping in the factory/rug block
         lives ONLY in `_skip_reason()` so re-evaluation never double-counts.
+        C4.3: the pre-buy recheck also re-runs the factory/creator-PnL/
+        rug-score gates (fresh cadence window, fresh holder snapshot and
+        buyer set, refreshed blacklist) with the same fail-closed contracts.
         """
         if quote_mint is None:
             quote_mint = normalize_quote_mint(token_info.quote_mint)
+        # R4-P1-2: creator "factory" recheck (C4.3) — cadence can only
+        # grow, so a creator whose rate was under the fence at detection may
+        # have crossed it by pre-buy (a sibling launch landed meanwhile).
+        # getattr off-defaults so verifier stubs without the attr read as 0.
+        if getattr(self, "factory_deploy_rate", 0.0) > 0:
+            creator_key = str(token_info.creator or "") or (
+                str(token_info.user) if token_info.user else ""
+            )
+            from screening.rug_score import cadence_mints_per_hour
+
+            window = self._creator_launch_ts.get(creator_key, [])
+            cadence = cadence_mints_per_hour(window, monotonic())
+            if cadence is not None and cadence > self.factory_deploy_rate:
+                return (
+                    f"creator {creator_key[:12]}... is a factory "
+                    f"({cadence:.1f} mints/hr > {self.factory_deploy_rate})"
+                )
+        # C4.3: pre-buy recheck of the PnL blacklist — a sibling close may
+        # have pushed the creator net-negative since detection.
+        if getattr(self, "creator_pnl_store", None) is not None:
+            creator = str(token_info.creator or "") or (
+                str(token_info.user) if token_info.user else ""
+            )
+            if creator and getattr(self, "creator_pnl_min_trades", 0):
+                trades_now, net_now = self.creator_pnl_store.get_stats(creator)
+                if self.creator_pnl_store.is_blacklisted(
+                    creator,
+                    min_trades=self.creator_pnl_min_trades,
+                    max_net_sol=(
+                        getattr(self, "creator_pnl_max_net_sol", 0.0) or 0.0
+                    ),
+                ):
+                    return (
+                        f"creator {creator} on PnL blacklist "
+                        f"({trades_now} trades, net {net_now:.4f} SOL)"
+                    )
+        # C4.3: pre-buy rug-score recheck with the freshest holder snapshot
+        # and buyer set (the same C4.7 fail-closed contract: insufficient
+        # coverage refuses rather than waves through).
+        if getattr(self, "rug_score_threshold", 0.0) > 0:
+            from screening.rug_score import (
+                RugScoreInput,
+                compute_rug_score,
+                rug_score_reason,
+            )
+
+            creator_key = str(token_info.creator or "") or (
+                str(token_info.user) if token_info.user else ""
+            )
+            snap = self._holder_store.get(str(token_info.mint))
+            buyers = self._rug_buyers.get(str(token_info.mint))
+            from screening.rug_score import cadence_mints_per_hour
+
+            window = self._creator_launch_ts.get(creator_key, [])
+            cadence_hr = cadence_mints_per_hour(window, monotonic())
+            score = compute_rug_score(
+                RugScoreInput(
+                    creator_cadence_mints_per_hour=cadence_hr,
+                    holder_gini=snap.gini if snap else None,
+                    top10_fraction=snap.top10_fraction if snap else None,
+                    unique_buyers=len(buyers) if buyers else None,
+                ),
+                min_coverage=0.6,
+            )
+            if score is None:
+                return (
+                    "rug score refused (feature coverage below 4/6: "
+                    f"cadence {cadence_hr if cadence_hr is not None else 0:.1f}/hr, "
+                    f"holders {snap.unique_holders if snap else 0}, "
+                    f"buyers {len(buyers) if buyers else 0})"
+                )
+            reason = rug_score_reason(score, self.rug_score_threshold)
+            if reason:
+                return (
+                    f"{reason} (cadence {cadence_hr if cadence_hr is not None else 0:.1f}/hr, "
+                    f"holders {snap.unique_holders if snap else 0}, "
+                    f"buyers {len(buyers) if buyers else 0})"
+                )
         # R4-P1-3: insider-coordination supply gate (0 = off). Fraction of
         # the mint's early buyers that co-fire across >= 3 OTHER launches is
         # a coordination signal (MELT 36.5% average). Fail-open: no
@@ -2430,6 +2643,13 @@ class UniversalTrader:
                 or token_info.associated_bonding_curve
             )
             if pool_address is None:
+                # C4.1: data-missing branch — curve filters are on (we only
+                # reach here with one of the SOL gates configured) but there
+                # is no pool to evaluate, so the gate cannot verify the
+                # coin. Fail closed under the fail_closed_gates policy,
+                # matching the RPC-error branch below.
+                if getattr(self, "fail_closed_gates", True):
+                    return "curve gate check failed (no pool address) - fail-closed"
                 return None
             state = await curve_manager.get_pool_state(pool_address)
             if not state.get("is_sol_paired", False):
@@ -2439,6 +2659,15 @@ class UniversalTrader:
             price = state.get("price_per_token")
             total_supply = state.get("token_total_supply", 0)
             if price is None or total_supply <= 0:
+                # C4.1: data-missing branch — the gate cannot compute a
+                # market cap from a missing price/supply, so it cannot
+                # verify the configured filters. Fail closed under the
+                # fail_closed_gates policy.
+                if getattr(self, "fail_closed_gates", True):
+                    return (
+                        "curve gate check failed (missing price/supply) - "
+                        "fail-closed"
+                    )
                 return None
             mc_sol = price * (total_supply / 1e6)
             # Improvement #4: breakout mode — buy only after the market cap
@@ -4113,6 +4342,9 @@ class UniversalTrader:
                     "stop_loss_price": position.stop_loss_price,
                     "max_hold_time": position.max_hold_time,
                     "position_id": position.position_id,
+                    # C4.8: persist banked leg PnL so a restart mid-ladder
+                    # keeps the blended position result.
+                    "realized_pnl_quote": position.realized_pnl_quote,
                     "entered_watcher_at": time.time(),
                 }
             )
@@ -4261,6 +4493,10 @@ class UniversalTrader:
                         exit_price=None,
                         exit_time=None,
                         position_id=row.get("position_id", ""),
+                        # C4.8: restore banked leg PnL (0.0 for pre-C4.8 rows).
+                        realized_pnl_quote=float(
+                            row.get("realized_pnl_quote", 0.0) or 0.0
+                        ),
                     )
                     if position.quantity <= 0:
                         logger.warning(
@@ -4579,6 +4815,10 @@ class UniversalTrader:
                 )
                 return
         # Reduce position quantity by the sold share (keep entry price).
+        # C4.8: bank the leg's realized PnL BEFORE shrinking quantity so the
+        # final close (here for a draining leg, or via _attempt_position_exit
+        # for a tail leg) can report the whole position's blended result.
+        position.realized_pnl_quote += (price - position.entry_price) * qty
         position.quantity = max(0.0, remaining_after)
         if drained:
             position.close_position(price, ExitReason.TAKE_PROFIT)
@@ -4593,6 +4833,11 @@ class UniversalTrader:
                         datetime.utcnow() - position.entry_time
                     ).total_seconds(),
                 )
+            # C4.8: a draining staged leg IS the final close — feed the
+            # creator-PnL ledger with the whole position's blended PnL
+            # (banked legs + this one), same guarded contract as the
+            # tail-leg close in _attempt_position_exit.
+            await self._record_creator_pnl(token_info, position)
 
     async def _run_exit_attempt(
         self,
@@ -4741,28 +4986,19 @@ class UniversalTrader:
             )
 
             final_pnl = position.get_pnl()
+            total_pnl_quote = position.realized_pnl_quote + float(
+                final_pnl.get("unrealized_pnl_quote", 0.0)
+            )
             logger.info(
                 f"Final PnL: {final_pnl['price_change_pct']:.2f}% "
-                f"({final_pnl['unrealized_pnl_quote']:.6f} "
-                f"{quote_symbol(normalize_quote_mint(token_info.quote_mint))})"
+                f"({total_pnl_quote:.6f} "
+                f"{quote_symbol(normalize_quote_mint(token_info.quote_mint))}, "
+                f"incl. {position.realized_pnl_quote:.6f} banked legs)"
             )
 
-            # P2-STRUC-2: feed the creator-PnL ledger. Recorded only for
-            # SOL-paired coins (the ledger's PnL is SOL-denominated) and only
-            # when the store exists (feature enabled). A missing creator
-            # (fails the trade ledger too) is skipped, never fatal.
-            if self.creator_pnl_store is not None:
-                creator = str(token_info.creator or "") or (
-                    str(token_info.user) if token_info.user else ""
-                )
-                if creator and normalize_quote_mint(token_info.quote_mint) == WSOL_MINT:
-                    try:
-                        self.creator_pnl_store.record_trade(
-                            creator,
-                            float(final_pnl.get("unrealized_pnl_quote", 0.0)),
-                        )
-                    except Exception:
-                        logger.exception("creator PnL record failed")
+            # C4.8: feed the creator-PnL ledger the whole position's blended
+            # result (banked legs + tail leg), guarded by the helper.
+            await self._record_creator_pnl(token_info, position)
             await self._cleanup_after_exit(token_info)
             return ExitSellVerdict.SOLD
 
@@ -4789,6 +5025,32 @@ class UniversalTrader:
                 f"longer monitored."
             )
         return verdict
+
+    async def _record_creator_pnl(self, token_info: TokenInfo, position: Position) -> None:
+        """C4.8: feed the creator-PnL ledger with a position's BLENDED result.
+
+        Staged partial legs bank their realized PnL into
+        ``position.realized_pnl_quote`` and shrink ``quantity``; a tail close
+        therefore reports ``banked + get_pnl()`` — the whole position,
+        not just the last leg. Recorded only for SOL-paired coins (the
+        ledger's PnL is SOL-denominated) and only when the store exists
+        (feature enabled). A missing creator is skipped, never fatal.
+        """
+        if self.creator_pnl_store is None:
+            return
+        creator = str(token_info.creator or "") or (
+            str(token_info.user) if token_info.user else ""
+        )
+        if not creator or normalize_quote_mint(token_info.quote_mint) != WSOL_MINT:
+            return
+        final_pnl = position.get_pnl()
+        total_pnl_quote = position.realized_pnl_quote + float(
+            final_pnl.get("unrealized_pnl_quote", 0.0)
+        )
+        try:
+            self.creator_pnl_store.record_trade(creator, total_pnl_quote)
+        except Exception:
+            logger.exception("creator PnL record failed")
 
     async def _cleanup_after_exit(self, token_info: TokenInfo) -> None:
         """Run the configured post-sell cleanup for a closed position.

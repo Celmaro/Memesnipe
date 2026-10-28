@@ -50,6 +50,12 @@ class Position:
     # grouped with their final close (net_metrics / rug_memory / zombies).
     position_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
 
+    # C4.8: realized PnL (quote units) banked by staged partial legs already
+    # sold. `quantity` shrinks on every leg, so `get_pnl()` alone would
+    # undercount at final close — the creator-PnL ledger needs the whole
+    # position's blended result, not just the tail leg.
+    realized_pnl_quote: float = 0.0
+
     # R5-P2-3: log-only advisory latch — set by the monitor when a post-entry
     # protection advisory fires once for this position.
     _advisory_fired: bool = False

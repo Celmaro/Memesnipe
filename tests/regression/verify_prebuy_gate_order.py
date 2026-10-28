@@ -60,6 +60,7 @@ def _trader(factory_on: bool = True) -> SimpleNamespace:
         max_coordinated_supply_share=0.0,
         max_wash_share=0.0,
         _creator_launch_ts={},
+        _cadence_recorded_mints=set(),  # noqa: SLF001 - C4.3 per-mint guard
         _wash_lpi=None,
         _cofire=None,
         _holder_store=None,
