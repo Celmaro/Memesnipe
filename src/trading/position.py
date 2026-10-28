@@ -1,8 +1,9 @@
 """Position management for take-profit / stop-loss exits."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import uuid
 
 from solders.pubkey import Pubkey
 
@@ -44,6 +45,10 @@ class Position:
     exit_reason: ExitReason | None = None
     exit_price: float | None = None
     exit_time: datetime | None = None
+
+    # P0-2: stable per-position identity so shadow partial legs can be
+    # grouped with their final close (net_metrics / rug_memory / zombies).
+    position_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
 
     # R5-P2-3: log-only advisory latch — set by the monitor when a post-entry
     # protection advisory fires once for this position.

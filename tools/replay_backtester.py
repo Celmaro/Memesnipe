@@ -79,6 +79,9 @@ EXIT_GRID = [
 
 MAX_OPEN_POSITIONS = 40  # cap concurrent positions per strategy (bot realism)
 TOKEN_MAX_AGE_S = 1.0  # entries only within 1s of create (bot freshness gate)
+# C8.1 fix: the live bot's freshness gate is the age in seconds compared
+# directly; the old `* 60` multiplied the 1s constant into a 60s window,
+# admitting launches that were a minute old. Keep the constant as seconds.
 MAX_TOKEN_LIFETIME_S = 3600  # stop tracking a token after 1h
 
 
@@ -107,9 +110,17 @@ class StrategyState:
 
 
 class ReplayBacktester:
-    def __init__(self, strategies: list[dict], out_dir: Path):
+    def __init__(
+        self,
+        strategies: list[dict],
+        out_dir: Path,
+        max_open_positions: int = MAX_OPEN_POSITIONS,
+    ):
         self.strategies = {s["name"]: StrategyState(s) for s in strategies}
         self.out_dir = out_dir
+        # C8.1 fix: thread the CLI --max-open cap down (was a module global
+        # that ignored the parsed argument).
+        self.max_open_positions = max_open_positions
         # per-token curve state
         self.tokens: dict[str, dict] = {}
         self.trades_out: list = []
@@ -130,6 +141,10 @@ class ReplayBacktester:
                 "symbol": ev.get("symbol") or "?",
                 "price": price,
                 "mc_sol": mc,
+                # C8.1: real curve progress = SOL actually in the pool.
+                # pumpapi create events carry quoteInPool (SOL already);
+                # buy/sell events update it below.
+                "real_quote_sol": ev.get("quoteInPool") or 0.0,
                 "created_ts": _ev_ts(ev),
                 "buys_1m": deque(),
                 "seen_events": 0,
@@ -147,6 +162,9 @@ class ReplayBacktester:
             sol_amount = ev.get("solAmount") or ev.get("quoteAmount") or 0.0
             tok["price"] = price
             tok["mc_sol"] = ev.get("marketCapQuote") or tok["mc_sol"]
+            # C8.1: keep real curve progress (SOL in pool) current.
+            if ev.get("quoteInPool") is not None:
+                tok["real_quote_sol"] = ev["quoteInPool"]
             tok["seen_events"] += 1
             if action == "buy":
                 tok["buys_1m"].append((ts, sol_amount))
@@ -178,11 +196,18 @@ class ReplayBacktester:
     def _try_entries(
         self, mint: str, tok: dict, price: float, ts: float, sol_amount: float
     ) -> None:
-        curve_progress = tok["mc_sol"]  # MC in SOL ≈ curve progress
+        # C8.1 fix: the LIVE curve gate (universal_trader._curve_gate_reason)
+        # measures curve progress as the SOL actually paid into the curve
+        # (real_quote_reserves / 1e9), not market cap. pumpapi's quoteInPool
+        # is that real SOL figure directly; fall back to MC only for
+        # archives that predate the field.
+        curve_progress = tok.get("real_quote_sol", 0.0) or 0.0
+        if curve_progress <= 0:
+            curve_progress = tok["mc_sol"]  # legacy fallback (MC in SOL)
         if curve_progress < ENTRY["min_curve_progress_sol"]:
             return
         for name, st in self.strategies.items():
-            if len(st.open) >= MAX_OPEN_POSITIONS:
+            if len(st.open) >= self.max_open_positions:
                 continue
             tokens_out = ENTRY["position_sol"] / price if price else 0.0
             st.open[mint] = Position(
@@ -458,7 +483,7 @@ async def main() -> int:
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     if args.local:
         stamp = Path(args.local).stem
-        bt = ReplayBacktester(EXIT_GRID, OUT_DIR)
+        bt = ReplayBacktester(EXIT_GRID, OUT_DIR, max_open_positions=args.max_open)
         t0 = time.time()
         for ev in load_local(Path(args.local)):
             bt.on_event(ev)
@@ -478,7 +503,7 @@ async def main() -> int:
         print("aiohttp required: uv run (has it)", file=sys.stderr)
         return 1
 
-    bt = ReplayBacktester(EXIT_GRID, OUT_DIR)
+    bt = ReplayBacktester(EXIT_GRID, OUT_DIR, max_open_positions=args.max_open)
     stamp = f"{hours[0]:%Y%m%d_%H}-{hours[-1]:%H}"
     t0 = time.time()
     async with aiohttp.ClientSession() as session:

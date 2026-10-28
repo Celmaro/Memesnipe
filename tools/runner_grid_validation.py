@@ -129,7 +129,8 @@ def run_hour(hour: str) -> dict[str, list[dict]]:
         mint = ev.get("mint")
         if a == "create":
             if mint:
-                tokens[mint] = [ev.get("price") or 0, ev.get("marketCapQuote") or 0, False]
+                # [price, marketCap, real_quote_sol, armed]
+                tokens[mint] = [ev.get("price") or 0, ev.get("marketCapQuote") or 0, ev.get("quoteInPool") or 0.0, False]
         elif a in ("buy", "sell"):
             t = tokens.get(mint)
             if not t:
@@ -140,13 +141,20 @@ def run_hour(hour: str) -> dict[str, list[dict]]:
             t[0] = price
             mc = ev.get("marketCapQuote") or t[1]
             t[1] = mc
-            if a == "buy" and not t[2] and t[1] >= 0.25:
-                t[2] = True  # curve progress baseline
+            # C8.1 fix: the live curve gate measures curve progress by the SOL
+            # actually paid into the pool (quoteInPool / real quote reserves),
+            # not market cap. Mirror that: arm on quoteInPool >= 0.25 instead
+            # of MC >= 0.25 — the loop-5 sweep used MC and was contaminated.
+            rq = ev.get("quoteInPool")
+            if rq is not None:
+                t[2] = rq
+            if not t[3] and t[2] >= 0.25:
+                t[3] = True  # curve progress baseline (real SOL in pool)
             for name, (kind, cfg) in SETS.items():
                 key = (name, mint)
                 pobj = pos.get(key)
                 if pobj is None:
-                    if a == "buy" and t[2] and not done.get(key) and mc <= MC_GATE:
+                    if a == "buy" and t[3] and not done.get(key) and mc <= MC_GATE:
                         pos[key] = P(price)
                         done[key] = True
                     continue

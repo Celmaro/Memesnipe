@@ -4125,6 +4125,10 @@ class UniversalTrader:
         price = await self._read_price(token_info)
         if price <= 0:
             price = trigger_price  # floor the partial at the trigger level
+        # P0-2: a leg that drains the position to zero IS the final close —
+        # only non-draining legs are "partial" for downstream aggregation.
+        remaining_after = position.quantity - qty
+        drained = remaining_after <= 0.0
         if self.shadow_mode and self.shadow_capture is not None:
             fee_fields = await self._fee_estimate_fields()
             self.shadow_capture.sim_close(
@@ -4143,6 +4147,13 @@ class UniversalTrader:
                 pool_snapshot=await self._pool_snapshot(token_info),
                 **fee_fields,
                 reordering_bps=0,  # R4-P0-1: shadow fills at observed price
+                # C8.1/P0-2: a staged partial leg must not be counted as a
+                # full close downstream (net_metrics / sweep_zombies /
+                # rug_memory). Tag it with the shared position identity and
+                # mark non-draining legs as partial so aggregators can group.
+                is_partial=not drained,
+                position_id=position.position_id,
+                leg_exit_reason=exit_reason,
             )
             logger.info(
                 f"[SHADOW] staged {exit_reason} sell {qty:.6f} {token_info.symbol} "
@@ -4159,8 +4170,8 @@ class UniversalTrader:
                 )
                 return
         # Reduce position quantity by the sold share (keep entry price).
-        position.quantity = max(0.0, position.quantity - qty)
-        if position.quantity <= 0:
+        position.quantity = max(0.0, remaining_after)
+        if drained:
             position.close_position(price, ExitReason.TAKE_PROFIT)
             # R4-P1-7: a staged ladder that drains the position is also a
             # close — finalize the strategies-ledger entry here (shadow).
@@ -4269,6 +4280,9 @@ class UniversalTrader:
                     pool_snapshot=await self._pool_snapshot(token_info),
                     **fee_fields,
                     reordering_bps=0,  # R4-P0-1: shadow fills at observed price
+                    # P0-2: final close of this position; carries the same
+                    # position_id as any staged partial legs (no is_partial).
+                    position_id=position.position_id,
                 )
                 # R4-P1-7: finalize the strategies-ledger entry at the same
                 # close so each registered strategy reports its would-be

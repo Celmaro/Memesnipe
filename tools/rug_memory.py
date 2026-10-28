@@ -69,18 +69,32 @@ def ingest_shadow(ledger_glob: str = "2026-*.jsonl") -> int:
                 m2c[r["mint"]] = r["creator"]
             elif r.get("type") == "sim_close":
                 closes.append(r)
+        # P0-2: group staged partial legs into ONE creator trade per
+        # position. New rows carry position_id + is_partial; a non-partial
+        # close finalizes the accumulated leg pnl. Legacy rows (no
+        # position_id) keep the per-row behavior.
+        legs: dict[str, float] = {}
+        final_rows: list[tuple[str, dict, float]] = []
         for c in closes:
+            pkey = c.get("position_id") or f"{c.get('ts')}:{c['mint']}"
+            leg = float(c.get("pnl_quote") or 0.0)
+            if c.get("is_partial"):
+                legs[pkey] = legs.get(pkey, 0.0) + leg
+                continue
+            final_rows.append((pkey, c, legs.pop(pkey, 0.0) + leg))
+        for pkey, c, pnl_total in final_rows:
             creator = m2c.get(c["mint"])
             if not creator:
                 continue
-            mark = f"shadow:{c['ts']}:{c['mint']}"
+            mark = f"shadow:{c['ts']}:{c['mint']}:{pkey}"
             if mark in seen:
                 continue
             # bot's realized PnL on 0.01 SOL sims, scaled to SOL
             # R5-P0-3: net of modeled fees — gross shadow pnl overstates the
             # creator's true result; blacklist evidence is cost-adjusted with
-            # the same model the strategy ledger uses for ranking.
-            pnl_sol = (c.get("pnl_quote") or 0.0)
+            # the same model the strategy ledger uses for ranking. Applied to
+            # the position-total pnl (all legs), not per leg.
+            pnl_sol = pnl_total
             try:
                 from research.cost_model import net_round_trip
 

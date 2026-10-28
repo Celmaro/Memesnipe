@@ -185,6 +185,12 @@ def compute_metrics(
     opened: dict[str, float] = {}  # mint -> quote_spent at open
     hold_start: dict[str, float] = {}
     equity = 0.0
+    # P0-2: per-position partial-leg accumulation. Keyed by position_id when
+    # present, else mint (legacy rows). A partial leg must not count as a
+    # full close; only the final close of a position (no is_partial flag or
+    # is_partial falsy) increments closed and pops opened.
+    leg_pnl: dict[str, float] = {}
+    leg_hold: dict[str, float] = {}
 
     files: list[Path] = []
     if ledgers is not None:
@@ -220,12 +226,30 @@ def compute_metrics(
                     # sentinel rather than crashing the metrics report.
                     hold_start[mint] = 0.0
             elif etype == "sim_close" or etype == "close":
+                # P0-2: identify the position. New rows carry position_id;
+                # legacy rows fall back to mint (mint-unique per position in
+                # the common case).
+                pkey = row.get("position_id") or mint
+                is_partial = bool(row.get("is_partial", False))
+                leg = float(row.get("pnl_quote", 0.0) or 0.0)
+                if is_partial:
+                    # Accumulate the leg; do NOT count as a close yet.
+                    leg_pnl[pkey] = leg_pnl.get(pkey, 0.0) + leg
+                    hs = row.get("hold_seconds")
+                    if hs is not None:
+                        try:
+                            leg_hold[pkey] = float(hs)
+                        except (TypeError, ValueError):
+                            pass
+                    continue
+                # Final close: realize accumulated partial legs + this leg.
+                pnl = leg_pnl.pop(pkey, 0.0) + leg
+                leg_hold.pop(pkey, None)
                 m.closed += 1
                 # R4-P0-1: reordering-slippage basis on the close row.
                 rb = row.get("reordering_bps")
                 if isinstance(rb, (int, float)):
                     m.reordering_bps_values.append(float(rb))
-                pnl = float(row.get("pnl_quote", 0.0) or 0.0)
                 m.total_pnl_quote += pnl
                 if pnl >= 0:
                     m.gross_wins += pnl

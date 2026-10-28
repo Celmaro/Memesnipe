@@ -191,7 +191,11 @@ class ShadowDataCapture:
                             open_counts[row["mint"]] += 1
                             symbols[row["mint"]] = row.get("symbol", "?")
                         elif t == "sim_close":
-                            open_counts[row["mint"]] -= 1
+                            # P0-2: a partial leg leaves the position open —
+                            # only a final (non-partial) close decrements, so
+                            # a partial-only orphan is still swept below.
+                            if not row.get("is_partial"):
+                                open_counts[row["mint"]] -= 1
             swept = 0
             for mint, n in open_counts.items():
                 for _ in range(max(0, n)):
