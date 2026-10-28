@@ -259,7 +259,7 @@ filters:
   rug_min_unique_buyers: 2
   rug_check_slots: 12
   rug_early_drain_ratio: 0.5
-  max_market_cap_sol: 40.0 # above pump.fun launch MC (~28 SOL): rejects already-pumped, passes normal launches
+  max_market_cap_sol: 35.0 # A2-loop-2: gate sweep winner mc<35 (90.8% WR, PF 10.5, ~4x fewer entries)
   min_curve_progress_sol: 0.25 # Phase 5 trial: skip dead launches
   # Improvement #4: buy-on-breakout — buy only after MC rises through this.
   # Leave null to keep pure launch sniping (max cap only).
