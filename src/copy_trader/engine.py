@@ -15,7 +15,9 @@ shared buyer, exactly like a normal snipe.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from solders.pubkey import Pubkey
@@ -34,14 +36,19 @@ def _mirror_size(leader_sol: float, target: CopyTarget) -> float:
     Fixed mode: the target's ``fixed_buy_sol`` (0 = use the default). Percent
     mode: ``percent_of_leader`` (>0) mirrors that fraction of the leader's
     notional, clamped by ``max_position_sol`` when set. Returns <= 0 when no
-    size is configured.
+    size is configured. C5.2: the per-token ``max_position_sol`` cap now
+    applies to FIXED mode too (previously only percentage mode honored it),
+    so a wallet row cannot push a position past its stated risk bound.
     """
     if target.percent_of_leader and target.percent_of_leader > 0:
         size = leader_sol * target.percent_of_leader / 100.0
         if target.max_position_sol and target.max_position_sol > 0:
             size = min(size, target.max_position_sol)
         return max(0.0, size)
-    return max(0.0, target.fixed_buy_sol or 0.0)
+    size = target.fixed_buy_sol or 0.0
+    if target.max_position_sol and target.max_position_sol > 0:
+        size = min(size, target.max_position_sol)
+    return max(0.0, size)
 
 
 def _profile_float(v: Any) -> float | None:
@@ -105,6 +112,9 @@ class CopyTraderEngine:
         # the mirror is skipped. 0 keeps today's behavior (profile consulted,
         # never a gate).
         min_leader_score: float = 0.0,
+        # C5.3: persist the mirrored-position ledger to this JSON path so a
+        # restart does not strand open copies (None = legacy in-memory only).
+        persist_path: str | None = None,
     ):
         self.client = client
         self.store = store
@@ -118,13 +128,62 @@ class CopyTraderEngine:
         self.min_leader_score = min_leader_score
         self._last_buy_ts: float = 0.0
         self._last_mirrored: dict[str, float] = {}  # "{trader}:{mint}" -> ts, dedupe
-        # R5-P0-4: open mirrored positions keyed "{trader}:{mint}" -> SOL
-        # size, so a leader sell event reconciles and exits the copy.
-        self._mirror_positions: dict[str, float] = {}
+        # R5-P0-4: open mirrored positions keyed "{trader}:{mint}" -> dict
+        # with size (SOL), entry_price, entry_time, so a leader sell event
+        # reconciles and exits the copy AND the close can report real PnL.
+        # C5.3: persisted to disk (JSON) so a restart does not lose the
+        # ledger — an in-memory-only registry stranded positions forever.
+        self._mirror_positions: dict[str, dict] = {}
+        self._persist_path = Path(persist_path) if persist_path else None
+        if self._persist_path is not None:
+            self._load_positions()
         # R4-P2-1: co-fire tracker over the engine's own buy observations.
         from screening.coordination import CoFireTracker
 
         self._cofire = CoFireTracker()
+
+    # ---- C5.3: durable mirror-position ledger ----
+
+    def _load_positions(self) -> None:
+        """Restore the mirror ledger from disk (best-effort)."""
+        if not self._persist_path:
+            return
+        try:
+            if not self._persist_path.exists():
+                return
+            data = json.loads(self._persist_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            cleaned: dict[str, dict] = {}
+            for k, v in data.items():
+                if isinstance(v, dict) and "size" in v:
+                    cleaned[str(k)] = {
+                        "size": float(v.get("size", 0.0) or 0.0),
+                        "entry_price": float(v.get("entry_price", 0.0) or 0.0),
+                        "entry_time": float(v.get("entry_time", 0.0) or 0.0),
+                    }
+            self._mirror_positions = cleaned
+            if cleaned:
+                logger.info(
+                    f"Copy-trader: restored {len(cleaned)} open mirror "
+                    f"position(s) from {self._persist_path}"
+                )
+        except Exception:
+            logger.exception("Copy-trader: failed to load mirror ledger")
+
+    def _save_positions(self) -> None:
+        """Persist the mirror ledger (best-effort, never raises)."""
+        if not self._persist_path:
+            return
+        try:
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._persist_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._mirror_positions, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self._persist_path)
+        except Exception:
+            logger.exception("Copy-trader: failed to save mirror ledger")
 
     async def on_transaction_logs(self, logs: list[str]) -> None:
         """Feed geyser transaction logs; mirror any leader buy found."""
@@ -159,17 +218,34 @@ class CopyTraderEngine:
         # exit the copy (was previously ignored, stranding positions).
         if not trade.get("is_buy"):
             if key in self._mirror_positions and self.sell_mirror is not None:
-                size = self._mirror_positions.pop(key)
+                pos = self._mirror_positions.pop(key)
+                size = float(pos.get("size", 0.0) or 0.0)
                 target = self._target_for(trader)
+                # C5.2: honor the target's mode — buy_only targets accumulate
+                # the leader's picks and never inherit their exits, so a
+                # leader sell must NOT close the mirrored position.
+                if target is not None and target.mode == "buy_only":
+                    logger.info(
+                        f"Copy-trader: {trader[:8]} sell on {mint[:8]} ignored "
+                        f"(target mode buy_only; position stays)"
+                    )
+                    self._mirror_positions[key] = pos
+                    self._save_positions()
+                    return
                 try:
                     ok = await self.sell_mirror(
-                        self._token_info_from_trade(trade), target, size, "leader_sell"
+                        self._token_info_from_trade(trade),
+                        target,
+                        size,
+                        "leader_sell",
+                        entry=pos,
                     )
                 except Exception:
                     logger.exception(
                         f"Copy-trader: sell mirror raised on {mint[:8]}"
                     )
-                    self._mirror_positions[key] = size  # retry next event
+                    self._mirror_positions[key] = pos  # retry next event
+                    self._save_positions()
                     return
                 if ok:
                     logger.info(
@@ -181,7 +257,8 @@ class CopyTraderEngine:
                         f"Copy-trader: mirror sell failed on {mint[:8]}; "
                         f"position stays open"
                     )
-                    self._mirror_positions[key] = size
+                    self._mirror_positions[key] = pos
+                    self._save_positions()
             return
 
         if self._is_duplicate(trader, mint):
@@ -356,12 +433,25 @@ class CopyTraderEngine:
                             qualify_leader,
                         )
 
+                        # C5.1: the profiler emits period keys as '1d'/'7d'/'30d',
+                        # but TradeSummary expects integer day windows. Normalize
+                        # here so qualification actually runs instead of raising
+                        # int('1d') and silently failing open.
+                        def _window_days(k: str) -> int:
+                            k = str(k).strip()
+                            if k.endswith("d") and k[:-1].isdigit():
+                                return int(k[:-1])
+                            try:
+                                return int(k)
+                            except (TypeError, ValueError):
+                                return 0
+
                         lp = LeaderProfile(
                             address=trader,
                             last_seen_days_ago=0.0,
                             windows={
-                                int(k): TradeSummary(
-                                    window_days=int(k),
+                                _window_days(k): TradeSummary(
+                                    window_days=_window_days(k),
                                     closed_trades=_profile_int(
                                         w.get("trades")
                                     )
@@ -383,10 +473,15 @@ class CopyTraderEngine:
                             )
                             return
                     except Exception:
-                        logger.debug(
-                            "Copy-trader: qualification unavailable; "
-                            "proceeding on profile"
+                        # C5.1: fail CLOSED — a broken profile must not turn
+                        # the vetting into a pass. Qualification is off when
+                        # no windows came back; construction errors are a
+                        # signal, not a reason to mirror.
+                        logger.exception(
+                            "Copy-trader: qualification failed; refusing "
+                            "mirror (fail-closed)"
                         )
+                        return
             except Exception:
                 logger.exception(
                     f"Copy-trader: profile lookup failed for {trader[:8]}; "
@@ -424,8 +519,34 @@ class CopyTraderEngine:
                 self._last_mirrored[f"{trader}:{mint}"] = time.monotonic()
                 # R5-P0-4: track the open copy so a later leader sell can
                 # reconcile it (per-leader/mint size; add-on buys keep the
-                # position open at the accumulated size).
-                self._mirror_positions[key] = self._mirror_positions.get(key, 0.0) + size
+                # position open at the accumulated size). C5.3: carry entry
+                # metadata (price/time) so the close can report real PnL and
+                # hold duration instead of zeroed shadow rows.
+                now = time.monotonic()
+                prev = self._mirror_positions.get(key)
+                prev_size = 0.0
+                entry_price = 0.0
+                entry_time = now
+                if isinstance(prev, dict):
+                    prev_size = float(prev.get("size", 0.0) or 0.0)
+                    entry_price = float(prev.get("entry_price", 0.0) or 0.0)
+                    entry_time = float(prev.get("entry_time", now) or now)
+                elif isinstance(prev, (int, float)):  # legacy float rows
+                    prev_size = float(prev)
+                # Prefer the trade's own price when the feed carries it;
+                # keep the older entry_price on add-on buys.
+                trade_price = trade.get("price") or trade.get("token_price")
+                if trade_price:
+                    try:
+                        entry_price = float(trade_price)
+                    except (TypeError, ValueError):
+                        pass
+                self._mirror_positions[key] = {
+                    "size": prev_size + size,
+                    "entry_price": entry_price,
+                    "entry_time": entry_time,
+                }
+                self._save_positions()
                 logger.info(
                     f"Copy-trader: mirrored buy on {mint[:8]} "
                     f"({quanta} quanta x {per_quantum:.6f} SOL)"

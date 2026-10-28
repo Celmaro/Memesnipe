@@ -152,6 +152,8 @@ def _make_trader(
     trader._creator_sold_for_exit = set()  # noqa: SLF001
     trader.event_driven_exits_enabled = False  # R3-P2-12 off in verifiers
     trader._own_trade_prompt = set()  # noqa: SLF001
+    trader._unsold_persist_path = None  # noqa: SLF001 - C7.2 off in tests
+    trader._unsold_positions = {}  # noqa: SLF001 - C7.2 off in tests
     from trading.risk_guard import RiskTracker
     trader.risk_tracker = RiskTracker()  # R3-P2-10 off in verifiers
     import asyncio as _asyncio

@@ -259,6 +259,14 @@ class SolanaClient:
         self._cached_blockhash_ts: float = 0.0
         self._blockhash_lock = asyncio.Lock()
         self.blockhash_refresh_interval = blockhash_refresh_interval
+        # C2.2: chain-validity tracking for the cached blockhash. The RPC
+        # getLatestBlockhash response carries lastValidBlockHeight; we record
+        # it (and the hash) so the cached-blockhash path can enforce a
+        # fail-closed sign policy: a hash older than Solana's 150-block
+        # validity window (~60s) has no chance of landing, so a refresh
+        # failure must refuse the send instead of signing a dead hash.
+        self._latest_blockhash: Hash | None = None
+        self._latest_blockhash_height: int | None = None
         self._blockhash_updater_task = asyncio.create_task(
             self.start_blockhash_updater(self.blockhash_refresh_interval)
         )
@@ -288,7 +296,9 @@ class SolanaClient:
         Runs from the constructor (P2-STRUC-1), so the cache is warm before
         the first send and the hot path never waits on a getLatestBlockhash
         round trip. The interval is configurable; 5.0s default is friendly
-        to rate-limited public RPCs.
+        to rate-limited public RPCs. C2.2: also proactively refreshes the
+        chain-validity height so a send never signs with a hash whose
+        lastValidBlockHeight has passed.
         """
         while True:
             try:
@@ -307,16 +317,29 @@ class SolanaClient:
         Refreshes synchronously if the cache is stale (older than twice the
         configured refresh interval, floored at 1s) or empty — the send hot
         path must never sign with a blockhash that could expire mid-flight.
-        Falls back to the last-known (possibly stale) hash only when the
-        refresh itself fails, so a transient RPC blip cannot block a send.
+        C2.2: when the RPC told us the hash's lastValidBlockHeight and the
+        current chain height has passed it, the hash is DEAD even if the
+        local age is fresh — refresh, and if the refresh fails while the
+        dead hash is the only fallback, raise (fail-closed) instead of
+        signing a transaction that cannot land. Falls back to the last-known
+        hash only when the hash is merely locally-stale (a transient RPC
+        blip) and we do NOT know it is chain-dead.
         """
+        #: C2.2: a cached blockhash older than this is chain-dead — Solana keeps a
+        # blockhash valid for 150 blocks (~60s at 400ms slots). Signing with
+        # a hash past that window cannot land; when the refresh ALSO fails,
+        # the send must fail closed instead of signing a known-dead hash.
+        # Young-ish (10-60s) fallbacks are still a shot (the local age check
+        # at 2x interval treats them stale and refreshes first).
+        max_fallback_age_s = 60.0
         async with self._blockhash_lock:
             stale_seconds = max(2 * self.blockhash_refresh_interval, 1.0)
-            stale = (
+            locally_stale = (
                 self._cached_blockhash is None
                 or monotonic() - self._cached_blockhash_ts > stale_seconds
             )
-            if stale:
+
+            if locally_stale:
                 try:
                     blockhash = await self.get_latest_blockhash()
                     self._cached_blockhash = blockhash
@@ -326,8 +349,22 @@ class SolanaClient:
                         raise RuntimeError(
                             "No cached blockhash available yet"
                         ) from None
+                    # C2.2: a hash whose validity has lapsed has no chance of
+                    # landing — refusing is correct (fail-closed). Only a
+                    # fallback younger than the 150-block validity window may
+                    # be signed, and only when the RPC is having a transient
+                    # blip.
+                    if (
+                        monotonic() - self._cached_blockhash_ts
+                        > max_fallback_age_s
+                    ):
+                        raise RuntimeError(
+                            "Cached blockhash older than validity window "
+                            "(lastValidBlockHeight passed) and refresh failed"
+                        ) from None
                     logger.warning(
-                        "Blockhash refresh failed; using last-known blockhash"
+                        "Blockhash refresh failed; using last-known blockhash "
+                        f"({monotonic() - self._cached_blockhash_ts:.0f}s old)"
                     )
             return self._cached_blockhash  # type: ignore[return-value]
 
@@ -633,7 +670,17 @@ class SolanaClient:
         await self._rate_limiter.acquire()
         client = await self.get_client()
         response = await client.get_latest_blockhash(commitment="processed")
-        return response.value.blockhash
+        val = response.value
+        # C2.2: record lastValidBlockHeight next to the hash — the RPC
+        # reports it and the cached-blockhash path uses it (see
+        # MAX_BLOCKHASH_FALLBACK_AGE_S) to refuse signing a hash that can
+        # no longer land.
+        if val is not None:
+            self._latest_blockhash = val.blockhash
+            self._latest_blockhash_height = getattr(
+                val, "last_valid_block_height", None
+            )
+        return val.blockhash
 
     async def build_and_send_transaction(
         self,

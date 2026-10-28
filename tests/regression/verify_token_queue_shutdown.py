@@ -92,6 +92,7 @@ def _make_trader() -> UniversalTrader:
     trader.processed_tokens = set()
     trader.token_timestamps = {}
     trader.token_launch_timestamps = {}
+    trader._queued_mints = set()  # noqa: SLF001 - C3.3 enqueue dedupe
     trader.max_token_age = MAX_TOKEN_AGE
     trader._handle_token = lambda _token_info: asyncio.sleep(0)  # noqa: SLF001
     return trader

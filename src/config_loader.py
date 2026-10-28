@@ -448,7 +448,7 @@ BOOL_FIELDS = [
     "research.slot_ordered_feed_enabled",  # R3-P2-14
     "research.in_stream_updates_enabled",  # R3-P2-15
     "research.strategies_ledger_enabled",  # R4-P1-7
-    "trade.backfill.enabled",
+    "backfill.enabled",  # T2.6 (top-level block, audit C12.2)
     "trade.close_ata_on_sell",  # P2-EXIT-5
     "trade.aggregator_fallback",  # R3-P1-3
     "filters.creator_pnl_blacklist_enabled",  # P2-STRUC-2
@@ -512,7 +512,7 @@ _KNOWN_SECTION_KEYS: dict[str, set[str]] = {
         "sell_slippage_inflation_bps", "blockhash_refresh_interval",
         "aggregator_max_price_impact_pct", "trail10_arm_pct",
         "trail10_trail_pct", "trail10_hard_stop_pct", "grad_timing_enabled",
-        "grad_band_stats_path", "persistent_exit_interval", "backfill",
+        "grad_band_stats_path", "persistent_exit_interval",
     },
     "priority_fees": {
         "enable_dynamic", "enable_fixed", "fixed_amount", "buy_fixed_amount",
@@ -547,7 +547,11 @@ _KNOWN_SECTION_KEYS: dict[str, set[str]] = {
         "max_fee_fraction_of_position", "creator_pnl_db_path",
         "rug_min_unique_buyers", "rug_check_slots", "rug_early_drain_ratio",
         "holder_reward_mode", "honeypot_freeze_authority",
-        "min_curve_hold_fraction", "risk",
+        # NOTE: NO "risk" here on purpose (audit C12.1) — the bot reads the
+        # risk guards from the TOP-LEVEL ``risk:`` block (bot_runner.py
+        # cfg.get("risk", ...)); a nested filters.risk is dead config and
+        # must be flagged by the unknown-key lint, not silently accepted.
+        "min_curve_hold_fraction",
     },
     "copy_trader": {
         "enabled", "db", "min_leader_score", "min_buy_interval",
@@ -559,7 +563,9 @@ _KNOWN_SECTION_KEYS: dict[str, set[str]] = {
     },
     "cleanup": {"mode", "force_close_with_burn", "with_priority_fee"},
     "node": {"max_rps", "burst_size", "startup_latency_test"},
-    "backfill": {"enabled", "checkpoint", "max_pages", "page_size"},
+    "backfill": {
+        "enabled", "checkpoint", "max_pages", "page_size", "fetch_concurrency",
+    },
     "timing": {"token_wait_timeout"},
 }
 _KNOWN_TOP_KEYS = {
@@ -614,6 +620,58 @@ def warn_unknown_config_keys(config: dict) -> None:
             "exit_mode defaults to 'tp_sl' and staged_trail/trail10 knobs are "
             "ignored. Set trade.exit_mode explicitly."
         )
+
+
+def _walk_mapping_for_duplicates(
+    node: yaml.MappingNode, prefix: str, dupes: list[str]
+) -> None:
+    """Record every repeated key inside one mapping as a dotted path."""
+    seen: dict[str, str] = {}
+    for key_node, _ in node.value:
+        key = str(key_node.value)
+        path = f"{prefix}.{key}" if prefix else key
+        if key in seen:
+            dupes.append(path)
+        seen[key] = path
+    for key_node, val_node in node.value:
+        if isinstance(val_node, yaml.MappingNode):
+            key = str(key_node.value)
+            path = f"{prefix}.{key}" if prefix else key
+            _walk_mapping_for_duplicates(val_node, path, dupes)
+
+
+def collect_duplicate_keys(yaml_text: str) -> list[str]:
+    """Return dotted paths of mapping keys repeated within one mapping.
+
+    yaml.safe_load silently keeps only the LAST occurrence of a duplicated
+    key, so a block written twice (e.g. a copy-pasted top-level ``risk:``)
+    has the first copy silently dropped — dead config that reads as live
+    (audit C12.1). This walks the raw compose tree, where both copies still
+    exist, and reports each repeated key's dotted path. Top-level duplicates
+    (the same section key twice) are the dangerous case; nested duplicates
+    are reported too because they are equally silent-ignored.
+    """
+    dupes: list[str] = []
+    for doc in yaml.compose_all(yaml_text):
+        if isinstance(doc, yaml.MappingNode):
+            _walk_mapping_for_duplicates(doc, "", dupes)
+    return dupes
+
+
+def warn_duplicate_keys(yaml_text: str) -> None:
+    """Log a warning per duplicated mapping key (raw-text lint).
+
+    Must run on the raw YAML text before safe_load collapses the copies.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    for path in collect_duplicate_keys(yaml_text):
+        logger.warning(
+            f"[config-lint] duplicate key '{path}': YAML keeps only the LAST "
+            f"occurrence — the earlier block is dead config (audit C12.1). "
+            f"Merge the blocks into one."
+        )
     # Platform-specific listener compatibility
 PLATFORM_LISTENER_COMPATIBILITY = {
     Platform.PUMP_FUN: ["logs", "blocks", "geyser", "shreds"],
@@ -625,8 +683,8 @@ PLATFORM_LISTENER_COMPATIBILITY = {
 def load_bot_config(path: str) -> dict:
     """Load and validate a bot configuration from a YAML file."""
     config_path = Path(path)
-    with config_path.open() as f:
-        config = yaml.safe_load(f)
+    text = config_path.read_text()
+    config = yaml.safe_load(text)
 
     env_file = config.get("env_file")
     if env_file:
@@ -644,6 +702,9 @@ def load_bot_config(path: str) -> dict:
         config["platform"] = "pump_fun"
 
     validate_config(config)
+    # Raw-text lint first: yaml.safe_load already collapsed duplicate keys,
+    # so the duplicate-top-level-block check must see the unparsed YAML.
+    warn_duplicate_keys(text)  # C12.1: duplicate keys = dead config
     warn_unknown_config_keys(config)  # A2-P0-1: surface ignored keys loudly
     return config
 

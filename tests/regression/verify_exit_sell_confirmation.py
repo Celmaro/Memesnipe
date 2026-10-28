@@ -222,6 +222,8 @@ def _make_trader(seller: StubSeller, client: StubClient) -> UniversalTrader:
     )
     trader.seller = seller
     trader.solana_client = client
+    trader._unsold_persist_path = None  # noqa: SLF001 - C7.2 off in tests
+    trader._unsold_positions = {}  # noqa: SLF001 - C7.2 off in tests
     trader.wallet = None
     trader.priority_fee_manager = None
     trader.cleanup_mode = "disabled"  # keeps handle_cleanup_after_sell a no-op

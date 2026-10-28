@@ -14,10 +14,15 @@ heuristics already consume (buy trade events). It maintains:
 - mint -> early-buyer wallets (bounded recency)
 - wallet -> number of mints it bought into (co-fire count, bounded)
 
-``coordinated_share(mint, min_co_fire)`` returns the fraction of the
-mint's early buyers that have also bought into >= min_co_fire OTHER recent
-launches — a wallet acting alone on one coin is normal; one that co-fires
-everywhere is likely part of a coordinated cohort.
+``coordinated_wallet_share(mint, min_co_fire)`` returns the fraction of
+the mint's early buyers that have also bought into >= min_co_fire OTHER
+recent launches — a wallet acting alone on one coin is normal; one that
+co-fires everywhere is likely part of a coordinated cohort. NOTE the
+units: this is a WALLET-COUNT fraction (coordinated wallets / observed
+early-buyer wallets), NOT a token-supply fraction — MELT's 36.5% is a
+supply statistic and should only be compared against
+``coordinated_supply_share`` (see its docstring for when holdings are
+available).
 
 Pure state machine: no RPC, no trader dependency. The caller decides how
 to gate on the share.
@@ -78,10 +83,16 @@ class CoFireTracker:
         """How many distinct mints this wallet has bought into recently."""
         return len(self._wallet_mints.get(wallet, set()))
 
-    def coordinated_share(
+    def coordinated_wallet_share(
         self, mint: str, min_co_fire: int = 3
     ) -> float:
-        """Fraction of the mint's early buyers that co-fire elsewhere.
+        """Fraction of the mint's early-buyer WALLETS that co-fire elsewhere.
+
+        UNITS: wallet-count fraction — ``# coordinated wallets / # observed
+        early-buyer wallets`` — NOT a token-supply share. Compare this
+        against a wallet-share threshold (e.g. ``max_coordinated_wallet_
+        share``); do NOT compare it to MELT's 36.5% supply statistic, which
+        is computed by :meth:`coordinated_supply_share` instead.
 
         A buyer is "coordinated" when it has bought into at least
         ``min_co_fire`` OTHER recent mints (the default 3 is conservative:
@@ -95,3 +106,51 @@ class CoFireTracker:
             1 for w in buyers if self.co_fire_count(w) >= min_co_fire
         )
         return coordinated / len(buyers)
+
+    def coordinated_share(
+        self, mint: str, min_co_fire: int = 3
+    ) -> float:
+        """Deprecated alias of :meth:`coordinated_wallet_share`.
+
+        Kept so existing callers (trader gate reads, regression verifiers)
+        keep working while the wallet-vs-supply rename propagates. Same
+        behavior, same WALLET-COUNT units — do not confuse with the supply
+        share from :meth:`coordinated_supply_share`.
+        """
+        return self.coordinated_wallet_share(mint, min_co_fire=min_co_fire)
+
+    def coordinated_supply_share(
+        self,
+        mint: str,
+        balances: dict[str, int | float] | None = None,
+        min_co_fire: int = 3,
+    ) -> float | None:
+        """Token-SUPPLY share held by the mint's coordinated wallets.
+
+        The true supply statistic matching MELT (2602.13480: 36.5% of
+        supply held by coordinated accounts on average): sum of holdings
+        of wallets that co-fire across >= ``min_co_fire`` OTHER mints,
+        divided by total supply.
+
+        Returns None when balances are NOT available — the early-buyer
+        observation feed (``observe_buy(mint, wallet)``) carries wallet
+        identities only, never per-wallet holdings, so the tracker cannot
+        see supply. Callers that DO hold balances (e.g. a holder snapshot)
+        must pass ``balances={wallet: raw_balance}``; without them the
+        supply share is unknowable and None (cannot score) is returned
+        instead of a misleading 0.0.
+        """
+        if balances is None:
+            return None
+        buyers = self._mint_buyers.get(mint)
+        if not buyers:
+            return 0.0
+        total = sum(balances.values())
+        if total <= 0:
+            return 0.0
+        held = sum(
+            balances.get(w, 0)
+            for w in buyers
+            if self.co_fire_count(w) >= min_co_fire
+        )
+        return min(1.0, held / total)

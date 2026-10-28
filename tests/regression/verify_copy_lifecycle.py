@@ -38,7 +38,7 @@ def main() -> None:
         bought.append((size, token_info.symbol))
         return True
 
-    async def sell_mirror(token_info, target, size, reason):
+    async def sell_mirror(token_info, target, size, reason, entry=None):
         sold.append((size, token_info.symbol, reason))
         return True
 
@@ -72,12 +72,21 @@ def main() -> None:
             await engine._maybe_mirror(
                 {"is_buy": True, "mint": MINT, "symbol": "SYM", "trader": "LEADER1", "sol_amount": 1000000000}
             )
-            assert displayed(bought) and engine._mirror_positions.get(f"LEADER1:{MINT}", 0.0) > 0, (
+            # Leader buy -> mirrored + tracked. C5.3: the ledger entry is a
+            # dict with size/entry_price/entry_time, not a bare float.
+            assert displayed(bought) and engine._mirror_positions.get(
+                f"LEADER1:{MINT}"
+            ), (
                 "buy not mirrored/tracked",
                 bought,
                 engine._mirror_positions,
             )
-            pre = engine._mirror_positions.get(f"LEADER1:{MINT}", 0.0)
+            pre_entry = engine._mirror_positions[f"LEADER1:{MINT}"]
+            pre = float(pre_entry["size"])
+            assert pre > 0, pre_entry
+            assert "entry_price" in pre_entry and "entry_time" in pre_entry, pre_entry
+            # A source-tagged buy supplies its own trade price as entry.
+            assert pre_entry["entry_price"] == 0.0 or pre_entry["entry_price"] > 0, pre_entry
             # Leader sell -> engine calls sell_mirror, position removed.
             await engine._maybe_mirror(
                 {"is_buy": False, "mint": MINT, "symbol": "SYM", "trader": "LEADER1", "sol_amount": 1000000000}

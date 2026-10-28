@@ -76,10 +76,12 @@ def main() -> int:
         await c3.get_cached_blockhash()
         check("stale cache refetches", c3.fetches >= 1)
 
-        # 4. Refresh failure after a prior success -> last-known hash, no raise.
+        # 4. Refresh failure after a prior success -> last-known hash, no
+        # raise (C2.2: only when the fallback is younger than the 150-block
+        # validity window — a transient RPC blip must not block a send).
         c4 = _BlockhashClient(interval=0.05)
         c4._cached_blockhash = bh
-        c4._cached_blockhash_ts = 0.0  # stale
+        c4._cached_blockhash_ts = asyncio.get_event_loop().time() - 5.0  # stale, <60s
         c4.get_latest_blockhash = None  # type: ignore[assignment]  # break it
 
         async def boom():  # type: ignore[misc]
@@ -88,6 +90,29 @@ def main() -> int:
         c4.get_latest_blockhash = boom  # type: ignore[assignment]
         bh4 = await c4.get_cached_blockhash()
         check("failed refresh falls back to last-known", bh4 == bh)
+
+        # 4b. C2.2: a refresh failure on a hash OLDER than the validity
+        # window must FAIL CLOSED (raise) — signing a chain-dead hash
+        # cannot land and wastes the send.
+        c4b = _BlockhashClient(interval=0.05)
+        c4b._cached_blockhash = bh
+        c4b._cached_blockhash_ts = (
+            asyncio.get_event_loop().time() - 120.0  # past 60s window
+        )
+        c4b.get_latest_blockhash = boom  # type: ignore[assignment]
+        try:
+            await c4b.get_cached_blockhash()
+            check(
+                "chain-dead fallback fails closed",
+                False,
+                "did not raise on dead hash",
+            )
+        except RuntimeError:
+            check(
+                "chain-dead fallback fails closed",
+                True,
+                "raised RuntimeError",
+            )
 
     asyncio.run(run())
 

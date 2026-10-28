@@ -9,6 +9,7 @@ JitoExecutor is built but disabled until a config enables it.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import random
 import time
@@ -150,6 +151,15 @@ class JitoExecutor:
         timeout_s: float = 10.0,
         auth_keypairs: list[Keypair] | None = None,
         dontfront: bool = False,
+        # C2.4: getBundleStatuses polling after an accepted sendBundle.
+        # Off by default: the accepted-bundle trust model (block engine
+        # took the bundle; landing is its promise) remains authoritative.
+        # When on, an accepted bundle is polled via getBundleStatuses so a
+        # "processed but dropped" bundle surfaces as a failed send instead
+        # of a silent success. Only meaningful when Jito is enabled.
+        poll_bundle_status: bool = False,
+        bundle_poll_attempts: int = 10,
+        bundle_poll_interval_s: float = 1.0,
     ):
         self.client = client
         # R3-P2-6: DontFront route. The DontFront-compatible block-engine
@@ -177,6 +187,10 @@ class JitoExecutor:
         self.timeout_s = timeout_s
         self.auth_keypairs = auth_keypairs or []
         self._auth_round_robin = 0
+        # C2.4: bundle-status polling configuration (see ctor docstring).
+        self.poll_bundle_status = poll_bundle_status
+        self.bundle_poll_attempts = bundle_poll_attempts
+        self.bundle_poll_interval_s = bundle_poll_interval_s
 
     def set_contention_tip_scale(self, scale: float) -> None:
         """R4-P0-3: escalate the Jito tip during a launch flood.
@@ -259,6 +273,54 @@ class JitoExecutor:
             return "rejected"
         return "unknown"
 
+    async def _poll_bundle_status(self, bundle_id: str) -> str | None:
+        """C2.4: poll getBundleStatuses for an accepted bundle.
+
+        Returns the final bundle state ("confirmed" | "failed" | "invalid")
+        once the block engine reports a terminal state, or None when every
+        endpoint errored / answered malformed / timed out. The block
+        engine's ``getBundleStatuses`` returns a state per bundle:
+        "pending" while the window is open, then "confirmed" (landed),
+        "failed" (rejected by validators), or "invalid" (never accepted).
+        Polls up to ``bundle_poll_attempts`` at ``bundle_poll_interval_s``.
+        """
+        session = await self.client._get_session()  # noqa: SLF001
+        last_state: str | None = None
+        for attempt in range(max(1, self.bundle_poll_attempts)):
+            for endpoint in self.endpoints:
+                try:
+                    body = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getBundleStatuses",
+                        "params": [[bundle_id]],
+                    }
+                    async with session.post(
+                        endpoint,
+                        json=body,
+                        headers=self._auth_headers(body),
+                        timeout=aiohttp.ClientTimeout(total=self.timeout_s),
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        payload = await resp.json()
+                        result = (payload or {}).get("result")
+                        if not isinstance(result, dict):
+                            continue
+                        values = result.get("value") or []
+                        for item in values:
+                            state = (item or {}).get("confirmation_status")
+                            if state in ("confirmed", "failed", "invalid"):
+                                return state
+                            if state:
+                                last_state = state
+                except Exception:
+                    logger.exception(f"Jito getBundleStatuses failed on {endpoint}")
+                if attempt < self.bundle_poll_attempts - 1:
+                    await asyncio.sleep(self.bundle_poll_interval_s)
+        # No terminal state observed in the window. Report what we saw.
+        return last_state if last_state else None
+
     async def execute(
         self,
         instructions: list[Instruction],
@@ -312,6 +374,32 @@ class JitoExecutor:
             # bundle must not be retried by the fallback chain as if it never
             # reached the chain. Only an unreadable payload falls back to RPC.
             if classification == "accepted":
+                bundle_id = payload.get("result")
+                # C2.4: when enabled, poll getBundleStatuses so a bundle the
+                # engine accepted but validators dropped surfaces as a failed
+                # send instead of a silent success. Off (default): the
+                # accepted-bundle trust model stands (engine took it, landing
+                # is its promise). Poll timeout keeps SUCCESS + a warning —
+                # the bundle WAS accepted; only terminal failures downgrade.
+                if self.poll_bundle_status and bundle_id:
+                    state = await self._poll_bundle_status(str(bundle_id))
+                    if state == "failed" or state == "invalid":
+                        logger.warning(
+                            f"Jito bundle {bundle_id} reported {state}"
+                        )
+                        return ExecResult(
+                            success=False,
+                            signature=signature,
+                            error_message=f"jito bundle {state} after accept",
+                            via="jito",
+                            confirmation_status=ConfirmationStatus.REVERTED,
+                        )
+                    if state is None:
+                        logger.warning(
+                            f"Jito bundle {bundle_id} status unknown after "
+                            f"{self.bundle_poll_attempts} polls; treating as "
+                            "accepted"
+                        )
                 return ExecResult(
                     success=True,
                     signature=signature,

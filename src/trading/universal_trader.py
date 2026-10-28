@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+import time
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -373,6 +374,10 @@ class UniversalTrader:
         # rejects them) but keep trading, so they are never gated here.
         holder_reward_mode: str = "trade",
         max_tracked_tokens: int = 500,
+        token_queue_maxsize: int = 256,
+        # C7.2: where the durable unsold registry is persisted. Relative to
+        # the bot's cwd (state/ dir); None disables persistence (tests).
+        unsold_persist_path: str | None = "state/unsold_positions.json",
         # T2.4 confirmation window: require this many consecutive curve-gate
         # passes (1 = single check, current behavior) before buying.
         consecutive_match_count: int = 1,
@@ -847,6 +852,7 @@ class UniversalTrader:
         else:
             self.migrate_watcher = None
         self.max_tracked_tokens = max_tracked_tokens
+        self.token_queue_maxsize = max(1, int(token_queue_maxsize))
         self.consecutive_match_count = max(1, consecutive_match_count)
         self.gate_recheck_interval = max(0.1, gate_recheck_interval)
         self.honeypot_freeze_authority = honeypot_freeze_authority
@@ -884,9 +890,18 @@ class UniversalTrader:
         self.traded_token_programs: dict[
             str, Pubkey
         ] = {}  # Maps mint (as string) to token_program_id
-        self.token_queue: asyncio.Queue = asyncio.Queue()
+        self.token_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=self.token_queue_maxsize
+        )
         self.processing: bool = False
         self.processed_tokens: set[str] = set()
+        # C3.3: mints currently sitting in the queue (enqueue-time dedupe).
+        # The listener can fire the same mint repeatedly; without this a
+        # duplicate slips past the processed_tokens check and is processed
+        # twice (seen live: duplicate entries in the queue for one mint).
+        # Removed when the processor/drain dequeues the token, so the set
+        # stays bounded by the queue size, not by lifetime events.
+        self._queued_mints: set[str] = set()
         # Coins whose graduation has been logged, so it is said once.
         self._graduated_mints: set[Pubkey] = set()
         self.token_timestamps: dict[str, float] = {}
@@ -896,8 +911,21 @@ class UniversalTrader:
         # until they clear or the TTL expires, instead of abandoning them
         # ("no longer monitored" from the pre-persistent code).
         self._unsold_positions: dict[str, tuple[TokenInfo, Position]] = {}
+        # C7.2: durable unsold registry — the unsold set survives a restart
+        # (crash/upgrade) instead of stranding tokens with no watcher. On boot
+        # we rehydrate from state/unsold_positions.json and re-arm the TTL
+        # watcher so a process restart cannot lose a position that the hot
+        # path already gave up on. Saved on every mutation.
+        self._unsold_persist_path = unsold_persist_path
         # mints with a live TP/SL exit monitor; guards against duplicate buys
         self._active_exit_mints: set[str] = set()
+        # C3.4: pre-buy mint reservation (duplicate-buy race). A mint is
+        # reserved BEFORE the buyer executes so a second detect of the same
+        # mint cannot slip a second order in while the first buy is in
+        # flight (the existing per-mint check only fires after a successful
+        # position setup, which is too late — the duplicate buy is already
+        # signed). Released in the finally of the buy path.
+        self._buy_reservations: set[str] = set()
         self._unsold_watcher_task: asyncio.Task | None = None
         # Orphaned-token sweeper task (improvement #3), started when
         # stuck_sweep_interval > 0.
@@ -1037,6 +1065,12 @@ class UniversalTrader:
                 logger.info(
                     f"Stuck-token sweeper started (interval {self.stuck_sweep_interval}s)"
                 )
+
+            # C7.2: rehydrate the durable unsold registry from the previous
+            # process run BEFORE the listener starts, so tokens that lost
+            # their watcher to a restart get re-armed now. Re-arms the TTL
+            # watcher when anything was recovered.
+            self._rehydrate_unsold()
 
             # T2.6: replay missed launches/events after a geyser gap. Best-effort:
             # failures are logged, never fatal.
@@ -1214,6 +1248,9 @@ class UniversalTrader:
                 mirror_jitter_ms=self.copy_mirror_jitter_ms,
                 mirror_split_quanta=self.copy_mirror_split_quanta,
                 min_leader_score=self.copy_min_leader_score,
+                # C5.3: durable mirror ledger — a restart must not strand
+                # open copies (engine falls back to in-memory on error).
+                persist_path="state/copy_positions.json",
             )
 
             async def on_trade_logs(
@@ -1626,7 +1663,12 @@ class UniversalTrader:
             return False
 
     async def _mirror_sell(
-        self, token_info: TokenInfo, target: Any, size_sol: float, reason: str
+        self,
+        token_info: TokenInfo,
+        target: Any,
+        size_sol: float,
+        reason: str,
+        entry: dict | None = None,  # C5.3: entry metadata from the engine
     ) -> bool:
         """Close a mirrored position when the leader sells (R5-P0-4).
 
@@ -1638,23 +1680,46 @@ class UniversalTrader:
         try:
             if self.shadow_mode:
                 price = await self._read_price(token_info)
+                entry_price = (
+                    float(entry.get("entry_price", 0.0) or 0.0)
+                    if entry
+                    else 0.0
+                )
+                entry_ts = float(entry.get("entry_time", 0.0) or 0.0) if entry else 0.0
+                # C5.5: real amount/pnl/hold instead of zeroed shadow rows.
+                # If we restored an entry_price with no live price (stale
+                # position), price <= 0 → fall back to the entry price so the
+                # pnl is 0 rather than nonsense.
+                fill_price = price if price and price > 0 else entry_price or 0.0
+                amount_tokens = size_sol / fill_price if fill_price > 0 else 0.0
+                pnl_quote = 0.0
+                pnl_pct = 0.0
+                hold_seconds = 0.0
+                if entry_price > 0 and fill_price > 0 and amount_tokens > 0:
+                    pnl_quote = (fill_price - entry_price) * amount_tokens
+                    pnl_pct = (fill_price / entry_price - 1.0) * 100.0
+                if entry_ts > 0:
+                    hold_seconds = max(0.0, time.time() - entry_ts)
                 logger.info(
                     f"[SHADOW] would mirror-sell {target.alias or target.wallet[:8]} "
                     f"{token_info.symbol} for {size_sol:.6f} SOL "
-                    f"at {price:.3e} SOL/token (no tx sent, {reason})"
+                    f"at {fill_price:.3e} SOL/token (no tx sent, {reason})"
                 )
                 if self.shadow_capture is not None:
+                    copy_open_ts = int(entry_ts) if entry_ts > 0 else 0
                     self.shadow_capture.sim_close(
                         mint=str(token_info.mint),
                         symbol=token_info.symbol,
                         platform=token_info.platform.value,
-                        price=price,
-                        amount_tokens=0.0,
+                        price=fill_price,
+                        amount_tokens=amount_tokens,
                         quote_received=size_sol,
                         exit_reason=f"mirror_{reason}",
-                        pnl_quote=0.0,
-                        pnl_pct=0.0,
-                        hold_seconds=0.0,
+                        pnl_quote=pnl_quote,
+                        pnl_pct=pnl_pct,
+                        hold_seconds=hold_seconds,
+                        # C5.5: link the shadow close to the copy position.
+                        position_id=f"copy:{target.wallet}:{token_info.mint}:{copy_open_ts}",
                     )
                 return True
             # Live path: real sell through the platform-aware seller.
@@ -1668,8 +1733,19 @@ class UniversalTrader:
                 max_retries=self.max_retries,
                 executor=self.executor,
             )
+            # C5.3: the seller now REQUIRES token_amount + token_price —
+            # calling execute(token_info) alone is a TypeError no-op. Derive
+            # the amount from the mirrored SOL size at the current price.
+            price = await self._read_price(token_info)
+            if not price or price <= 0:
+                logger.error(
+                    f"Copy-trader mirror sell: cannot read price for "
+                    f"{token_info.mint}; refusing (fail-closed)"
+                )
+                return False
+            token_amount = size_sol / price
             async with self._trade_serialization_lock:
-                result = await seller.execute(token_info)
+                result = await seller.execute(token_info, token_amount, price)
             return bool(result and result.success)
         except Exception:
             logger.exception("Copy-trader mirror sell raised")
@@ -1753,6 +1829,7 @@ class UniversalTrader:
                     return
                 self.processed_tokens.add(token_key)
                 self.token_timestamps[token_key] = monotonic()
+                self._queued_mints.add(token_key)  # C3.3 enqueue dedupe
                 await self.token_queue.put(token_info)
                 logger.info(
                     f"Backfill: replayed {token_info.symbol} ({token_info.mint})"
@@ -1889,12 +1966,42 @@ class UniversalTrader:
         await self.solana_client.close()
 
     async def _queue_token(self, token_info: TokenInfo) -> None:
-        """Queue a token for processing if not already processed."""
+        """Queue a token for processing if not already processed/queued.
+
+        C3.3: dedupes at ENQUEUE time (a duplicate detect of a mint already
+        sitting in the queue is dropped here, before it ever reaches the
+        processor) and enforces a hard queue bound — when the queue is full,
+        the OLDEST queued token is evicted to make room for the newest launch
+        (the freshness gate in the processor would reject the evicted one
+        anyway once it was behind a backed-up queue).
+        """
         token_key = str(token_info.mint)
 
         if token_key in self.processed_tokens:
             logger.debug(f"Token {token_info.symbol} already processed. Skipping...")
             return
+        if token_key in self._queued_mints:
+            logger.debug(
+                f"Token {token_info.symbol} already queued. Skipping... (C3.3 enqueue dedupe)"
+            )
+            return
+
+        # Bounded queue: evict the OLDEST queued token when full, so the
+        # newest launch is never dropped by a flood backlog.
+        if self.token_queue.full():
+            try:
+                evicted = self.token_queue.get_nowait()
+                self.token_queue.task_done()
+                evicted_key = str(evicted.mint)
+                self._queued_mints.discard(evicted_key)
+                metrics.incr("tokens.queue_evictions")
+                logger.info(
+                    f"Token queue full ({self.token_queue_maxsize}); "
+                    f"evicted oldest queued {evicted.symbol} ({evicted_key[:8]}...) "
+                    f"to make room for {token_info.symbol}"
+                )
+            except asyncio.QueueEmpty:
+                pass  # raced with the processor; just enqueue below
 
         # Improvement #5: cap the tracked set. Under a launch flood the
         # listener can queue far more than the processor can drain; drop the
@@ -1922,6 +2029,7 @@ class UniversalTrader:
         if token_info.creation_timestamp is not None:
             self.token_launch_timestamps[token_key] = token_info.creation_timestamp
 
+        self._queued_mints.add(token_key)
         await self.token_queue.put(token_info)
         logger.info(
             f"Queued new token: {token_info.symbol} ({token_info.mint}) on {token_info.platform.value}"
@@ -1942,6 +2050,7 @@ class UniversalTrader:
                 token_info = await self.token_queue.get()
                 took_item = True
                 token_key = str(token_info.mint)
+                self._queued_mints.discard(token_key)  # C3.3 enqueue dedupe
                 metrics.set_gauge("token_queue.depth", self.token_queue.qsize())
                 metrics.incr("tokens.dequeued")
 
@@ -2021,6 +2130,8 @@ class UniversalTrader:
         """
         while not self.token_queue.empty():
             token_info = await self.token_queue.get()
+            token_key = str(token_info.mint)
+            self._queued_mints.discard(token_key)  # C3.3 enqueue dedupe
             try:
                 token_key = str(token_info.mint)
                 token_age = monotonic() - self.token_timestamps.get(
@@ -2107,8 +2218,13 @@ class UniversalTrader:
         # R4-P1-1: multi-dimensional rug-risk score (0 = off). Weighted sum
         # over the features this path already has locally (creator cadence,
         # holder snapshot, early-buyer set) — NO new RPC on the hot path.
-        # Unknown dimensions (curve progress, dev balance) contribute a
-        # benign 0 until a caller feeds them. Calibrated on replay; ships off.
+        # C4.7: the score refuses (None) when feature coverage is below
+        # min_coverage instead of treating unknowns as benign 0 — missing
+        # data must NOT read as a pass. This path observes 4 of 6
+        # dimensions (cadence, holder gini/top10, buyer set); curve
+        # progress and dev balance are not fed here, so the coverage bar
+        # is 0.6 (4/6): a coin it cannot score is REFUSED, never waved
+        # through. Calibrated on replay; ships off.
         if self.rug_score_threshold > 0:
             from screening.rug_score import (
                 RugScoreInput,
@@ -2131,9 +2247,17 @@ class UniversalTrader:
                     top10_fraction=snap.top10_fraction if snap else None,
                     unique_buyers=len(buyers) if buyers else None,
                     # curve progress + dev balance unknown on this path:
-                    # pass None (benign) until callers feed them.
-                )
+                    # pass None (excluded from coverage; see C4.7 note).
+                ),
+                min_coverage=0.6,
             )
+            if score is None:
+                return (
+                    "rug score refused (feature coverage below 4/6: "
+                    f"cadence {cadence_hr if cadence_hr is not None else 0:.1f}/hr, "
+                    f"holders {snap.unique_holders if snap else 0}, "
+                    f"buyers {len(buyers) if buyers else 0})"
+                )
             reason = rug_score_reason(score, self.rug_score_threshold)
             if reason:
                 return (
@@ -2753,119 +2877,145 @@ class UniversalTrader:
                 logger.warning(f"Skipping {token_info.symbol} - {reason}")
                 self._capture_detect(token_info, reason)
                 return
-            logger.info(
-                f"Buying {self.quote_amounts[token_quote_mint]:.6f} of quote "
-                f"{token_quote_mint} worth of {token_info.symbol} "
-                f"on {token_info.platform.value}..."
-            )
-            # R4-P3-1: ME2F fragility size multiplier (1.0 = off). Applied
-            # to the quote spent in shadow and to a per-trade scaled buyer
-            # in real mode (the shared buyer keeps the configured size).
-            frag_scale = await self._fragility_buy_scale(token_info)
-            eff_quote = self.quote_amounts[token_quote_mint] * frag_scale
-            # R4-P0-3: arm contention racing BEFORE sending (off default).
-            await self._update_contention_arms(
-                float(self.quote_amounts.get(token_quote_mint, 0.0))
-            )
-            if frag_scale < 1.0:
+            # C3.4: reserve the mint BEFORE executing the buy. A second
+            # detect of the same mint racing the queue processor must not
+            # start a duplicate order while this one is in flight. Released
+            # in the finally below (failure, position setup, or exception).
+            mint_str = str(token_info.mint)
+            if (
+                mint_str in self._buy_reservations
+                or mint_str in self._active_exit_mints
+            ):
+                logger.warning(
+                    f"Skipping {token_info.symbol} - buy/position already "
+                    f"in flight for this mint"
+                )
+                self._capture_detect(token_info, "position_already_open")
+                return
+            self._buy_reservations.add(mint_str)
+            try:
                 logger.info(
-                    f"[FRAGILITY] {token_info.symbol} scaled to "
-                    f"{frag_scale:.2f}x ({eff_quote:.6f} "
-                    f"quote vs {self.quote_amounts[token_quote_mint]:.6f})"
+                    f"Buying {self.quote_amounts[token_quote_mint]:.6f} of quote "
+                    f"{token_quote_mint} worth of {token_info.symbol} "
+                    f"on {token_info.platform.value}..."
                 )
-            if self.shadow_mode:
-                # Shadow/paper mode (#8): simulate the fill at the current
-                # curve price (like the normal path would price it) and run
-                # the exit machinery against the simulated position. No
-                # transaction is sent and nothing is logged as spent.
-                sim_price = await self._read_price(token_info)
-                sim_quote = eff_quote
-                sim_amount = sim_quote / sim_price if sim_price > 0 else 0.0
-                logger.info(
-                    f"[SHADOW] would buy {sim_amount:.4f} {token_info.symbol} "
-                    f"at {sim_price:.3e} SOL/token (no tx sent)"
+                # R4-P3-1: ME2F fragility size multiplier (1.0 = off). Applied
+                # to the quote spent in shadow and to a per-trade scaled buyer
+                # in real mode (the shared buyer keeps the configured size).
+                frag_scale = await self._fragility_buy_scale(token_info)
+                eff_quote = self.quote_amounts[token_quote_mint] * frag_scale
+                # R4-P0-3: arm contention racing BEFORE sending (off default).
+                await self._update_contention_arms(
+                    float(self.quote_amounts.get(token_quote_mint, 0.0))
                 )
-                buy_result = TradeResult(
-                    success=True,
-                    platform=token_info.platform,
-                    tx_signature=None,
-                    amount=sim_amount,
-                    price=sim_price,
-                )
-                if self.shadow_capture is not None:
-                    fee_fields = await self._fee_estimate_fields()
-                    race_fields = await self._race_kpi_fields(token_info)
-                    self.shadow_capture.sim_open(
-                        mint=str(token_info.mint),
-                        symbol=token_info.symbol,
-                        platform=token_info.platform.value,
-                        price=sim_price,
-                        amount_tokens=sim_amount,
-                        quote_spent=sim_quote,
-                        pool_snapshot=await self._pool_snapshot(token_info),
-                        **fee_fields,
-                        **race_fields,
+                if frag_scale < 1.0:
+                    logger.info(
+                        f"[FRAGILITY] {token_info.symbol} scaled to "
+                        f"{frag_scale:.2f}x ({eff_quote:.6f} "
+                        f"quote vs {self.quote_amounts[token_quote_mint]:.6f})"
                     )
-                    # R4-P1-7: register this position with the strategies
-                    # ledger so the same price path is evaluated against
-                    # every exit strategy in parallel (shadow only).
-                    if self.strategies_ledger is not None:
-                        self.strategies_ledger.open_position(
+                if self.shadow_mode:
+                    # Shadow/paper mode (#8): simulate the fill at the current
+                    # curve price (like the normal path would price it) and run
+                    # the exit machinery against the simulated position. No
+                    # transaction is sent and nothing is logged as spent.
+                    sim_price = await self._read_price(token_info)
+                    sim_quote = eff_quote
+                    sim_amount = sim_quote / sim_price if sim_price > 0 else 0.0
+                    logger.info(
+                        f"[SHADOW] would buy {sim_amount:.4f} {token_info.symbol} "
+                        f"at {sim_price:.3e} SOL/token (no tx sent)"
+                    )
+                    buy_result = TradeResult(
+                        success=True,
+                        platform=token_info.platform,
+                        tx_signature=None,
+                        amount=sim_amount,
+                        price=sim_price,
+                    )
+                    if self.shadow_capture is not None:
+                        fee_fields = await self._fee_estimate_fields()
+                        race_fields = await self._race_kpi_fields(token_info)
+                        self.shadow_capture.sim_open(
                             mint=str(token_info.mint),
                             symbol=token_info.symbol,
                             platform=token_info.platform.value,
-                            entry_price=sim_price,
+                            price=sim_price,
                             amount_tokens=sim_amount,
                             quote_spent=sim_quote,
                             pool_snapshot=await self._pool_snapshot(token_info),
                             **fee_fields,
                             **race_fields,
                         )
-            else:
-                # R3-P2-13: a buy never overlaps an in-flight sell (WSOL
-                # wrap/unwrap balance race). No-op without contention.
-                async with self._trade_serialization_lock:
-                    if frag_scale < 1.0:
-                        # R4-P3-1: a fragile coin gets a per-trade SCALED
-                        # buyer (same pattern as _mirror_buy); the shared
-                        # buyer keeps the configured size for stable coins.
-                        from trading.platform_aware import PlatformAwareBuyer
+                        # R4-P1-7: register this position with the strategies
+                        # ledger so the same price path is evaluated against
+                        # every exit strategy in parallel (shadow only).
+                        if self.strategies_ledger is not None:
+                            self.strategies_ledger.open_position(
+                                mint=str(token_info.mint),
+                                symbol=token_info.symbol,
+                                platform=token_info.platform.value,
+                                entry_price=sim_price,
+                                amount_tokens=sim_amount,
+                                quote_spent=sim_quote,
+                                pool_snapshot=await self._pool_snapshot(token_info),
+                                **fee_fields,
+                                **race_fields,
+                            )
+                else:
+                    # R3-P2-13: a buy never overlaps an in-flight sell (WSOL
+                    # wrap/unwrap balance race). No-op without contention.
+                    async with self._trade_serialization_lock:
+                        if frag_scale < 1.0:
+                            # R4-P3-1: a fragile coin gets a per-trade SCALED
+                            # buyer (same pattern as _mirror_buy); the shared
+                            # buyer keeps the configured size for stable coins.
+                            from trading.platform_aware import PlatformAwareBuyer
 
-                        scaled_buyer = PlatformAwareBuyer(
-                            self.solana_client,
-                            self.wallet,
-                            self.priority_fee_manager,
-                            self.buy_amount * frag_scale,
-                            self.buy_slippage,
-                            self.max_retries,
-                            self.extreme_fast_token_amount,
-                            self.extreme_fast_mode,
-                            compute_units=self.compute_units,
-                            quote_amounts={
-                                q: v * frag_scale for q, v in self.quote_amounts.items()
-                            },
-                            curve_refresh_budget=2.0,
-                            trust_create_event=True,
-                            executor=self.executor,
-                        )
-                        buy_result: TradeResult = await scaled_buyer.execute(token_info)
-                    else:
-                        buy_result: TradeResult = await self.buyer.execute(token_info)
+                            scaled_buyer = PlatformAwareBuyer(
+                                self.solana_client,
+                                self.wallet,
+                                self.priority_fee_manager,
+                                self.buy_amount * frag_scale,
+                                self.buy_slippage,
+                                self.max_retries,
+                                self.extreme_fast_token_amount,
+                                self.extreme_fast_mode,
+                                compute_units=self.compute_units,
+                                quote_amounts={
+                                    q: v * frag_scale for q, v in self.quote_amounts.items()
+                                },
+                                curve_refresh_budget=2.0,
+                                trust_create_event=True,
+                                executor=self.executor,
+                            )
+                            buy_result: TradeResult = await scaled_buyer.execute(token_info)
+                        else:
+                            buy_result: TradeResult = await self.buyer.execute(token_info)
 
-            if buy_result.success:
-                # R3-P2-10: track the buy for concurrency/budget accounting
-                # using the EFFECTIVE quote spent (fragility-scaled).
-                self.risk_tracker.record_buy(float(eff_quote))
-                await self._handle_successful_buy(token_info, buy_result)
-            else:
-                await self._handle_failed_buy(token_info, buy_result)
+                if buy_result.success:
+                    # R3-P2-10: track the buy for concurrency/budget accounting
+                    # using the EFFECTIVE quote spent (fragility-scaled).
+                    self.risk_tracker.record_buy(float(eff_quote))
+                    await self._handle_successful_buy(token_info, buy_result)
+                else:
+                    await self._handle_failed_buy(token_info, buy_result)
 
-            # Only wait for next token in yolo mode
-            if self.yolo_mode:
-                logger.info(
-                    f"YOLO mode enabled. Waiting {self.wait_time_before_new_token} seconds before looking for next token..."
-                )
-                await asyncio.sleep(self.wait_time_before_new_token)
+                # Only wait for next token in yolo mode
+                if self.yolo_mode:
+                    logger.info(
+                        f"YOLO mode enabled. Waiting {self.wait_time_before_new_token} seconds before looking for next token..."
+                    )
+                    await asyncio.sleep(self.wait_time_before_new_token)
+            finally:
+                # C3.4: release the pre-buy reservation. Failure, position
+                # setup, and exceptions all land here; an exception cannot
+                # strand a permanently-reserved mint (which would silently
+                # exclude every later detect of the same launch). The
+                # tp_sl path separately holds _active_exit_mints for the
+                # open position's life, so the in-flight window and the
+                # open-position window are both guarded.
+                self._buy_reservations.discard(mint_str)
 
         except Exception:
             logger.exception(f"Error handling token {token_info.symbol}")
@@ -3871,6 +4021,7 @@ class UniversalTrader:
             )
             return
         self._unsold_positions[key] = (token_info, position)
+        self._persist_unsold()  # C7.2: durable on every mutation
         logger.warning(
             f"{token_info.symbol}: bounded exit retries spent; "
             f"registering with persistent exit watcher "
@@ -3880,6 +4031,262 @@ class UniversalTrader:
             self._unsold_watcher_task = asyncio.create_task(
                 self._unsold_position_watcher()
             )
+
+    # ------------------------------------------------------------------
+    # C7.2: durable unsold registry — serialize/rehydrate/persist helpers.
+    # ------------------------------------------------------------------
+    def _serialize_unsold(self) -> list[dict]:
+        """Serialize the unsold registry for JSON persistence.
+
+        Pubkey and datetime are not JSON-native; both are losslessly
+        stringified here (and parsed back in `_rehydrate_unsold`). TokenInfo
+        carries everything a restart needs to re-derive the ATA and sell:
+        platform, bonding-curve/pool addresses, token program, quote mint.
+        """
+        rows: list[dict] = []
+        for key, (token_info, position) in self._unsold_positions.items():
+            rows.append(
+                {
+                    "mint": key,
+                    "symbol": token_info.symbol,
+                    "platform": token_info.platform.value,
+                    "bonding_curve": (
+                        str(token_info.bonding_curve)
+                        if token_info.bonding_curve
+                        else None
+                    ),
+                    "associated_bonding_curve": (
+                        str(token_info.associated_bonding_curve)
+                        if token_info.associated_bonding_curve
+                        else None
+                    ),
+                    "pool_state": (
+                        str(token_info.pool_state) if token_info.pool_state else None
+                    ),
+                    "base_vault": (
+                        str(token_info.base_vault) if token_info.base_vault else None
+                    ),
+                    "quote_vault": (
+                        str(token_info.quote_vault) if token_info.quote_vault else None
+                    ),
+                    "global_config": (
+                        str(token_info.global_config)
+                        if token_info.global_config
+                        else None
+                    ),
+                    "platform_config": (
+                        str(token_info.platform_config)
+                        if token_info.platform_config
+                        else None
+                    ),
+                    "user": str(token_info.user) if token_info.user else None,
+                    "creator": (
+                        str(token_info.creator) if token_info.creator else None
+                    ),
+                    "creator_vault": (
+                        str(token_info.creator_vault)
+                        if token_info.creator_vault
+                        else None
+                    ),
+                    "token_program_id": (
+                        str(token_info.token_program_id)
+                        if token_info.token_program_id
+                        else None
+                    ),
+                    "quote_mint": (
+                        str(token_info.quote_mint) if token_info.quote_mint else None
+                    ),
+                    "quote_token_program_id": (
+                        str(token_info.quote_token_program_id)
+                        if token_info.quote_token_program_id
+                        else None
+                    ),
+                    "is_mayhem_mode": token_info.is_mayhem_mode,
+                    "is_cashback_coin": token_info.is_cashback_coin,
+                    "is_holder_reward": token_info.is_holder_reward,
+                    "creator_fee_bps": token_info.creator_fee_bps,
+                    "create_slot": token_info.create_slot,
+                    "entry_price": position.entry_price,
+                    "quantity": position.quantity,
+                    "entry_time": position.entry_time.isoformat(),
+                    "take_profit_price": position.take_profit_price,
+                    "stop_loss_price": position.stop_loss_price,
+                    "max_hold_time": position.max_hold_time,
+                    "position_id": position.position_id,
+                    "entered_watcher_at": time.time(),
+                }
+            )
+        return rows
+
+    def _persist_unsold(self) -> None:
+        """Write the unsold registry to disk (best-effort, non-fatal)."""
+        if not self._unsold_persist_path:
+            return
+        try:
+            p = Path(self._unsold_persist_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".json.tmp")
+            with tmp.open("w") as f:
+                json.dump(
+                    {"schema": 1, "updated_at": time.time(), "positions": self._serialize_unsold()},
+                    f,
+                )
+            tmp.replace(p)
+        except Exception:
+            logger.exception("Failed to persist unsold registry")
+
+    def _rehydrate_unsold(self) -> None:
+        """Load the durable unsold registry from disk into the live dict.
+
+        Best-effort: corrupt/absent files log a warning and leave the set
+        empty (the stuck-token sweeper is the safety net for tokens a bad
+        file would drop). Re-arms the TTL watcher when positions were
+        recovered so the 10-minute deadline is not lost to the restart.
+        """
+        if not self._unsold_persist_path:
+            return
+        try:
+            p = Path(self._unsold_persist_path)
+            if not p.exists():
+                return
+            with p.open() as f:
+                data = json.load(f)
+            rows = data.get("positions", []) if isinstance(data, dict) else []
+            recovered = 0
+            for row in rows:
+                try:
+                    mint = row["mint"]
+                    platform_name = row["platform"]
+                    platform = Platform(platform_name)
+                    info = TokenInfo(
+                        name=row.get("symbol", ""),
+                        symbol=row.get("symbol", ""),
+                        uri="",
+                        mint=Pubkey.from_string(mint),
+                        platform=platform,
+                        bonding_curve=(
+                            Pubkey.from_string(row["bonding_curve"])
+                            if row.get("bonding_curve")
+                            else None
+                        ),
+                        associated_bonding_curve=(
+                            Pubkey.from_string(row["associated_bonding_curve"])
+                            if row.get("associated_bonding_curve")
+                            else None
+                        ),
+                        pool_state=(
+                            Pubkey.from_string(row["pool_state"])
+                            if row.get("pool_state")
+                            else None
+                        ),
+                        base_vault=(
+                            Pubkey.from_string(row["base_vault"])
+                            if row.get("base_vault")
+                            else None
+                        ),
+                        quote_vault=(
+                            Pubkey.from_string(row["quote_vault"])
+                            if row.get("quote_vault")
+                            else None
+                        ),
+                        global_config=(
+                            Pubkey.from_string(row["global_config"])
+                            if row.get("global_config")
+                            else None
+                        ),
+                        platform_config=(
+                            Pubkey.from_string(row["platform_config"])
+                            if row.get("platform_config")
+                            else None
+                        ),
+                        user=(
+                            Pubkey.from_string(row["user"]) if row.get("user") else None
+                        ),
+                        creator=(
+                            Pubkey.from_string(row["creator"])
+                            if row.get("creator")
+                            else None
+                        ),
+                        creator_vault=(
+                            Pubkey.from_string(row["creator_vault"])
+                            if row.get("creator_vault")
+                            else None
+                        ),
+                        token_program_id=(
+                            Pubkey.from_string(row["token_program_id"])
+                            if row.get("token_program_id")
+                            else None
+                        ),
+                        quote_mint=(
+                            Pubkey.from_string(row["quote_mint"])
+                            if row.get("quote_mint")
+                            else None
+                        ),
+                        quote_token_program_id=(
+                            Pubkey.from_string(row["quote_token_program_id"])
+                            if row.get("quote_token_program_id")
+                            else None
+                        ),
+                        is_mayhem_mode=bool(row.get("is_mayhem_mode", False)),
+                        is_cashback_coin=bool(row.get("is_cashback_coin", False)),
+                        is_holder_reward=bool(row.get("is_holder_reward", False)),
+                        creator_fee_bps=int(row.get("creator_fee_bps", 0) or 0),
+                        create_slot=(
+                            int(row["create_slot"]) if row.get("create_slot") else None
+                        ),
+                    )
+                    position = Position(
+                        mint=info.mint,
+                        symbol=info.symbol,
+                        entry_price=float(row["entry_price"]),
+                        quantity=float(row["quantity"]),
+                        entry_time=datetime.fromisoformat(row["entry_time"]),
+                        take_profit_price=(
+                            float(row["take_profit_price"])
+                            if row.get("take_profit_price") is not None
+                            else None
+                        ),
+                        stop_loss_price=(
+                            float(row["stop_loss_price"])
+                            if row.get("stop_loss_price") is not None
+                            else None
+                        ),
+                        max_hold_time=(
+                            int(row["max_hold_time"])
+                            if row.get("max_hold_time") is not None
+                            else None
+                        ),
+                        is_active=True,
+                        exit_reason=None,
+                        exit_price=None,
+                        exit_time=None,
+                        position_id=row.get("position_id", ""),
+                    )
+                    if position.quantity <= 0:
+                        logger.warning(
+                            f"Unsold rehydrate: skipping {info.symbol} "
+                            f"(quantity {position.quantity})"
+                        )
+                        continue
+                    self._unsold_positions[mint] = (info, position)
+                    recovered += 1
+                except Exception:
+                    logger.exception(
+                        f"Unsold rehydrate: skipped malformed row {row.get('mint')}"
+                    )
+            if recovered:
+                logger.warning(
+                    f"Rehydrated {recovered} unsold position(s) from "
+                    f"{self._unsold_persist_path}; re-arming persistent watcher"
+                )
+                if self._unsold_watcher_task is None or self._unsold_watcher_task.done():
+                    self._unsold_watcher_task = asyncio.create_task(
+                        self._unsold_position_watcher()
+                    )
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.exception("Failed to rehydrate unsold registry")
 
     async def _unsold_position_watcher(self) -> None:
         """Continuously attempt to clear unsold positions until TTL expiry."""
@@ -3904,6 +4311,7 @@ class UniversalTrader:
                         f"Reclaim with tools/cleanup_accounts.py {token_info.mint}"
                     )
                     del self._unsold_positions[key]
+                    self._persist_unsold()  # C7.2
                     continue
                 try:
                     price = await self._read_price(token_info)
@@ -3931,6 +4339,7 @@ class UniversalTrader:
                     )
                 else:
                     del self._unsold_positions[key]
+                    self._persist_unsold()  # C7.2
                     entered.pop(key, None)
             if self._unsold_positions:
                 await asyncio.sleep(self.persistent_exit_interval)

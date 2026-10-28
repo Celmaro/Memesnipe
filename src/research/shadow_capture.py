@@ -33,6 +33,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from research.async_jsonl import AsyncJsonlWriter
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -48,36 +50,48 @@ class ShadowDataCapture:
             byte-identical to no capture at all).
     """
 
-    def __init__(self, dir_path: str | Path = "shadow_data", enabled: bool = True):
+    def __init__(
+        self,
+        dir_path: str | Path = "shadow_data",
+        enabled: bool = True,
+        *,
+        flush_every_rows: int = 100,
+        flush_every_ms: int = 1000,
+    ) -> None:
         self.dir_path = Path(dir_path)
         self.enabled = enabled
-        self._file: Path | None = None
+        # C8.5: buffered persistent-handle writer (one open fd per UTC day,
+        # flushed every N rows or 1s) instead of open-per-emit writes on the
+        # asyncio loop.
+        self._writer = AsyncJsonlWriter(
+            dir_path=dir_path,
+            enabled=enabled,
+            flush_every_rows=flush_every_rows,
+            flush_every_ms=flush_every_ms,
+        )
 
     def _check(self) -> bool:
         return self.enabled
 
-    def _writer(self):
-        """Yield a text-mode file handle for today's JSONL (create parents)."""
-        if not self._check():
-            return None
-        self.dir_path.mkdir(parents=True, exist_ok=True)
-        self._file = self.dir_path / f"{datetime.now(UTC):%Y-%m-%d}.jsonl"
-        return self._file.open("a", encoding="utf-8")
-
     def _emit(self, event_type: str, **fields: Any) -> None:
+        """Buffer one row; flush policy handled inside the writer."""
         if not self._check():
             return
-        try:
-            fh = self._writer()
-            if fh is None:
-                return
-            row = {"type": event_type, "ts": _now(), **fields}
-            with fh:
-                fh.write(json.dumps(row, default=str) + "\n")
-        except Exception:
-            # Capture is research data; a disk/JSON failure must never break
-            # the shadow trade itself.
-            return
+        # Capture is research data; the writer swallows write failures so a
+        # disk/JSON failure must never break the shadow trade itself.
+        self._writer.write(event_type, ts=_now(), **fields)
+
+    def flush(self) -> None:
+        """Persist buffered rows now (never raises)."""
+        self._writer.flush()
+
+    def close(self) -> None:
+        """Flush and release the daily file handle (idempotent)."""
+        self._writer.close()
+
+    def rotate(self) -> None:
+        """Force a daily-file rotation boundary (rows flushed first)."""
+        self._writer.rotate()
 
     def detect(
         self,

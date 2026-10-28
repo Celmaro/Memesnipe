@@ -11,8 +11,10 @@ path (`_skip_reason`) reads only the immutable snapshot — never RPC.
 Fail-open contract (mirrors the plan's pre-buy risk gate): a mint with NO
 snapshot entry (refresher not run / RPC down / mint unknown) is ALLOWED.
 The gate only refuses on positive evidence of bad distribution. The
-background refresher stamps each entry with the slot it read; callers can
-reject stale entries if they choose (the trader keeps a max-age window).
+background refresher stamps each entry with the slot it read, and the
+store additionally stamps a per-mint monotonic record time; callers can
+reject stale entries via ``is_stale(mint, max_age_s)`` (the trader keeps
+a max-age window). A mint with no snapshot is never stale (fail-open).
 
 Largest-account semantics: `getTokenLargestAccounts` returns up to 20
 accounts by balance. Unique-holder count is NOT the number of returned
@@ -22,6 +24,7 @@ The math here treats the returned list as the observed set (documented).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 #: Cap on the top-N considered when computing concentration.
@@ -68,15 +71,62 @@ class HolderSnapshot:
 
 @dataclass
 class HolderSnapshotStore:
-    """mint -> HolderSnapshot, refreshed by a background loop."""
+    """mint -> HolderSnapshot, refreshed by a background loop.
+
+    Every store write stamps the per-mint monotonic record time so the
+    gate read can enforce a max-age window (the age checks live here, not
+    on the frozen snapshot, because ``compute_snapshot`` callers never
+    pass a wall time). No snapshot = no age = never stale (fail-open).
+    """
 
     snapshots: dict[str, HolderSnapshot] = field(default_factory=dict)
+    #: mint -> time.monotonic() at the latest record (per-mint timestamp).
+    _recorded_at: dict[str, float] = field(default_factory=dict)
 
     def get(self, mint: str) -> HolderSnapshot | None:
         return self.snapshots.get(mint)
 
     def put(self, snapshot: HolderSnapshot) -> None:
+        """Backward-compatible alias of :meth:`record` (kept for existing
+        refresher call sites; identical behavior, also stamps the clock)."""
+        self.record(snapshot)
+
+    def record(self, snapshot: HolderSnapshot) -> None:
+        """Store the snapshot and stamp its per-mint monotonic record time.
+
+        The snapshots themselves are immutable; the timestamp is tracked
+        per mint here so ``is_stale`` can reject old reads on the hot path.
+        """
         self.snapshots[snapshot.mint] = snapshot
+        self._recorded_at[snapshot.mint] = time.monotonic()
+
+    def last_recorded_at(self, mint: str) -> float | None:
+        """Monotonic-clock time of the latest snapshot for mint; None when
+        the mint has no snapshot (never recorded)."""
+        return self._recorded_at.get(mint)
+
+    def age_seconds(self, mint: str) -> float | None:
+        """Seconds since the latest snapshot for mint; None when the mint
+        has no snapshot (nothing to age). Never negative."""
+        t = self._recorded_at.get(mint)
+        if t is None:
+            return None
+        return max(0.0, time.monotonic() - t)
+
+    def is_stale(self, mint: str, max_age_s: float) -> bool:
+        """True when the mint HAS a snapshot older than ``max_age_s``.
+
+        Fail-open contract: a mint with NO snapshot is never stale (the
+        refresher may simply not have run). ``max_age_s <= 0`` disables
+        the check entirely (never stale) — same off-switch convention as
+        the other gates.
+        """
+        if max_age_s <= 0:
+            return False
+        age = self.age_seconds(mint)
+        if age is None:
+            return False
+        return age > max_age_s
 
 
 def gini_coefficient(balances: list[int]) -> float:

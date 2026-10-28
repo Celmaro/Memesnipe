@@ -152,6 +152,8 @@ def _make_trader(
         curve_manager=curve_manager, address_provider=None
     )
     trader.seller = seller
+    trader._unsold_persist_path = None  # noqa: SLF001 - C7.2 off in tests
+    trader._unsold_positions = {}  # noqa: SLF001 - C7.2 off in tests
     trader.solana_client = None
     trader.wallet = None
     trader.priority_fee_manager = None

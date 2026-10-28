@@ -61,6 +61,13 @@ def _trader(**kw):
         solana_client=None,
         grad_timing_enabled=False,  # R4-P1-4 mock
         _grad_band_stats={},  # R4-P1-4 mock
+        # C3.3: enqueue-dedupe set + bounded queue so _queue_token works.
+        _queued_mints=set(),  # noqa: SLF001
+        token_queue=asyncio.Queue(maxsize=256),  # noqa: SLF001
+        token_timestamps={},  # noqa: SLF001
+        token_launch_timestamps={},  # noqa: SLF001
+        processed_tokens=set(),  # noqa: SLF001
+        _unsold_persist_path=None,  # noqa: SLF001 — C7.2 off in tests
     )
 
     async def gate(_self, token):

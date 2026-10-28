@@ -357,7 +357,12 @@ async def start_bot(config_path: str):
             min_curve_hold_fraction=cfg.get("filters", {}).get(
                 "min_curve_hold_fraction", 0.0
             ),
-            # T2.6: RPC catch-up backfill (off by default)
+            # T2.6: RPC catch-up backfill (off by default). Read from the
+            # TOP-LEVEL `backfill:` block (audit C12.2 — the values used to
+            # live under trade:, where nothing read them). Checkpoint path is
+            # repo-relative ('state/...', audit C10.1) and resolves against
+            # the process cwd (repo root), the same way copy_trader.db and
+            # filters.creator_pnl_db_path already resolve.
             backfill_enabled=cfg.get("backfill", {}).get("enabled", False),
             backfill_fetch_concurrency=cfg.get("backfill", {}).get(
                 "fetch_concurrency", 5
@@ -365,7 +370,9 @@ async def start_bot(config_path: str):
             backfill_page_size=cfg.get("backfill", {}).get("page_size", 100),
             backfill_max_pages=cfg.get("backfill", {}).get("max_pages", 5),
             backfill_checkpoint=cfg.get("backfill", {}).get("checkpoint"),
-            # T3.2: copy-trader engine (disabled by default)
+            # T3.2: copy-trader engine (disabled by default).
+            # copy_trader.db is repo-relative ('state/...', audit C10.1);
+            # CopyTargetStore mkdirs the parent dir relative to cwd.
             copy_trader_enabled=cfg.get("copy_trader", {}).get("enabled", False),
             copy_trader_db=cfg.get("copy_trader", {}).get("db"),
             copy_trader_min_interval=cfg.get("copy_trader", {}).get(

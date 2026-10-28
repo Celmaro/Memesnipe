@@ -33,10 +33,12 @@ def main() -> int:
     d.observe_trade("m", "w1", is_buy=True, quote_lamports=3_000_000_000, ts=100.0)  # 3 SOL
     d.observe_trade("m", "w2", is_buy=True, quote_lamports=3_000_000_000, ts=101.0)
     d.observe_trade("m", "w1", is_buy=False, quote_lamports=2_000_000_000, ts=120.0)
-    # 3+3+2 = 8 SOL total; w1's 2 SOL sell is round-trip volume.
+    # 3+3+2 = 8 SOL total. Round-tripper = w1 (bought AND sold). C4.6
+    # STRONG test: w1's FULL volume (buy 3 + sell 2 = 5 SOL) is wash —
+    # not just the opposite-side 2 SOL — so share = 5/8 = 0.625.
     check(
-        "round-trip volume flagged (2/8)",
-        abs(d.wash_share("m") - 0.25) < 1e-9,
+        "round-trip volume flagged (5/8)",
+        abs(d.wash_share("m") - 0.625) < 1e-9,
         f"-> {d.wash_share('m'):.3f}",
     )
     check(

@@ -51,8 +51,8 @@ def main() -> int:
     )
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML default off",
-        cfg["node"].get("startup_latency_test") is False,
+        "YAML startup_latency_test enabled",
+        cfg["node"].get("startup_latency_test") is True,
         f"-> {cfg['node'].get('startup_latency_test')!r}",
     )
 

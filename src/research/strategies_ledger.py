@@ -27,13 +27,13 @@ it (the caller wires it the same way as ``shadow_capture``).
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from trading.trail_exit import TrailDecision, TrailExitState
 
+from research.async_jsonl import AsyncJsonlWriter  # C8.5 buffered writer
 from research.cost_model import net_round_trip  # R5-P1-3 / R5-P0-1
 
 
@@ -200,20 +200,32 @@ class StrategiesLedger:
             )
         # Per-position evaluator instances live here until close.
         self._positions: dict[str, dict[str, Any]] = {}
-        self._file: Path | None = None
+        # C8.5: buffered persistent-handle writer (one open fd per UTC day,
+        # flushed every N rows or 1s) instead of open-per-emit writes on the
+        # asyncio loop.
+        self._writer = AsyncJsonlWriter(
+            dir_path=dir_path, enabled=enabled
+        )
 
     def _emit(self, event_type: str, **fields: Any) -> None:
+        """Buffer one row; flush policy handled inside the writer."""
         if not self.enabled:
             return
-        try:
-            self.dir_path.mkdir(parents=True, exist_ok=True)
-            self._file = self.dir_path / f"{datetime.now(UTC):%Y-%m-%d}.jsonl"
-            row = {"type": event_type, "ts": _now(), **fields}
-            with self._file.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, default=str) + "\n")
-        except Exception:
-            # Research data only; never break the shadow trade.
-            return
+        # Research data only; the writer swallows write failures so a
+        # disk/JSON failure never breaks the shadow trade.
+        self._writer.write(event_type, ts=_now(), **fields)
+
+    def flush(self) -> None:
+        """Persist buffered rows now (never raises)."""
+        self._writer.flush()
+
+    def close(self) -> None:
+        """Flush and release the daily file handle (idempotent)."""
+        self._writer.close()
+
+    def rotate(self) -> None:
+        """Force a daily-file rotation boundary (rows flushed first)."""
+        self._writer.rotate()
 
     def open_position(
         self,
@@ -317,7 +329,21 @@ class StrategiesLedger:
         hold_seconds: float,
         **extra: Any,
     ) -> None:
-        """Final per-strategy outcome for a closed shadow position."""
+        """Final per-strategy outcome for a closed shadow position.
+
+        C8.2: each strategy's own exit path is simulated, so the emitted
+        per-strategy PnL reflects the strategy's own out, not the shared
+        live close. A strategy with a recorded first exit (from decide())
+        realizes on its OWN first-exit economics: an ``exit_all`` first
+        action realizes the whole position at ``first_exit_price``; a
+        staged ``sell_share`` first action blends the initial TP leg
+        (``first_share`` at ``first_exit_price``) with the remaining share
+        at the live close. The live close is kept as the common
+        ``pnl_quote``/``pnl_pct`` reference ("would" semantics, unchanged)
+        and as ``close_price``/``would_exit_reason``; the strategy-specific
+        realized gross and net are emitted separately so downstream can
+        verify the per-strategy accounting.
+        """
         if not self.enabled:
             return
         pos = self._positions.pop(mint, None)
@@ -334,23 +360,57 @@ class StrategiesLedger:
                 final = sim.on_tick(close_price)
             except Exception:
                 final = None
+            # Live-close reference (C8.2: kept as the uniform "would"
+            # baseline for cross-strategy comparison — universal_trader
+            # reprices every strategy at this same price).
             pnl_quote = (close_price - pos["entry_price"]) * amount
             pnl_pct = (close_price - pos["entry_price"]) / entry_price
-            # R5-P0-1: this strategy's own first exit (recorded by decide()),
-            # plus its OWN PnL at that first-exit price — the price that
-            # strategy would actually have realised, not the live close.
+            # R5-P0-1: this strategy's own first exit (recorded by decide()).
             first = pos["firsts"].get(name)
             first_pnl_quote = 0.0
             if first is not None:
                 first_pnl_quote = (
                     first["first_exit_price"] - pos["entry_price"]
                 ) * amount
-            gross_fraction = (
-                pnl_quote / quote_spent if quote_spent > 0 else 0.0
+            # C8.2: simulate the strategy's OWN exit path on the quote spent.
+            # - exit_all first action: full amount exits at first_exit_price.
+            # - staged sell_share: initial TP leg (first_share) at the
+            #   strategy's first-exit price + remaining share at live close.
+            # - no first exit (never fired): realize at the live close.
+            first_share: float | None = None
+            realized_gross_quote: float
+            if first is not None:
+                first_price = first["first_exit_price"]
+                if first.get("first_action") == "sell_share":
+                    share = float(first.get("first_share") or 0.0)
+                    share = min(1.0, max(0.0, share))
+                    first_share = share
+                    # Blend: TP leg at the strategy's own exit price, the
+                    # remainder at the live close (the position's last
+                    # price, identical for every strategy).
+                    realized_gross_quote = (
+                        share * amount * (first_price - pos["entry_price"])
+                        + (1.0 - share)
+                        * amount
+                        * (close_price - pos["entry_price"])
+                    )
+                else:
+                    # exit_all: the whole position exits at the strategy's
+                    # own first-exit price, not at the live close.
+                    first_share = 0.0
+                    realized_gross_quote = (
+                        amount * (first_price - pos["entry_price"])
+                    )
+            else:
+                realized_gross_quote = (
+                    (close_price - pos["entry_price"]) * amount
+                )
+            realized_gross_pct = (
+                realized_gross_quote / quote_spent if quote_spent > 0 else 0.0
             )
-            net_pnl_quote = net_round_trip(gross_fraction, quote_spent) * (
-                quote_spent if quote_spent > 0 else 0.0
-            )
+            net_pnl_quote = net_round_trip(
+                realized_gross_pct, quote_spent
+            ) * (quote_spent if quote_spent > 0 else 0.0)
             self._emit(
                 "strategy_close",
                 mint=mint,
@@ -375,6 +435,9 @@ class StrategiesLedger:
                     first["first_exit_hold_s"] if first is not None else None
                 ),
                 first_exit_pnl_quote=first_pnl_quote,
+                first_share=first_share,
+                realized_gross_pnl_quote=realized_gross_quote,
+                realized_gross_pnl_pct=realized_gross_pct,
                 net_pnl_quote=net_pnl_quote,
                 **extra,
             )

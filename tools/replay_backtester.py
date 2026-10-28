@@ -83,6 +83,11 @@ TOKEN_MAX_AGE_S = 1.0  # entries only within 1s of create (bot freshness gate)
 # directly; the old `* 60` multiplied the 1s constant into a 60s window,
 # admitting launches that were a minute old. Keep the constant as seconds.
 MAX_TOKEN_LIFETIME_S = 3600  # stop tracking a token after 1h
+# C6.1: hold positions through migrate/createPool — the live bot routes
+# post-graduation positions to the graduated/PumpSwap market instead of
+# exiting at the curve price, so the replay default does the same.
+# --close-on-migrate flips this back to the old force-close for A/B.
+HOLD_THROUGH_MIGRATION = True
 
 
 @dataclass
@@ -100,6 +105,7 @@ class Position:
     remaining_share: float = 1.0
     realized_pnl: float = 0.0  # size-weighted pnl of legs already sold
     floor_price: float | None = None
+    migrated: bool = False  # C6.1: position crossed migrate/createPool
 
 
 @dataclass
@@ -115,12 +121,17 @@ class ReplayBacktester:
         strategies: list[dict],
         out_dir: Path,
         max_open_positions: int = MAX_OPEN_POSITIONS,
+        close_on_migrate: bool = False,
     ):
         self.strategies = {s["name"]: StrategyState(s) for s in strategies}
         self.out_dir = out_dir
         # C8.1 fix: thread the CLI --max-open cap down (was a module global
         # that ignored the parsed argument).
         self.max_open_positions = max_open_positions
+        # C6.1: False (default) holds through migrate/createPool and keeps
+        # trading the mint on later buys/sells, like the live bot; True
+        # reproduces the old force-close-at-migrate for A/B comparison.
+        self.close_on_migrate = close_on_migrate
         # per-token curve state
         self.tokens: dict[str, dict] = {}
         self.trades_out: list = []
@@ -184,14 +195,25 @@ class ReplayBacktester:
                 ):
                     self._try_entries(mint, tok, price, ts, sol_amount)
             self._check_exits(mint, tok, price, ts)
-        # migrate/createPool: position exits on curve? keep simple: treat as
-        # force-close at last curve price (bot wouldn't hold through migration)
+        # C6.1: migrate/createPool = bonding curve drained, position moves to
+        # the graduated/PumpSwap market. Default HOLD_THROUGH_MIGRATION keeps
+        # the position open (flag it) and keeps trading the mint on subsequent
+        # buy/sell events; --close-on-migrate restores the old force-close.
         elif action in ("migrate", "createPool"):
             mint = ev.get("mint")
+            if not mint:
+                return
             tok = self.tokens.get(mint)
-            if tok:
-                ts = _ev_ts(ev)
+            if not tok:
+                return
+            ts = _ev_ts(ev)
+            if self.close_on_migrate:
                 self._force_close_all(mint, tok, tok["price"], ts, "migrate")
+            else:
+                for st in self.strategies.values():
+                    pos = st.open.get(mint)
+                    if pos is not None:
+                        pos.migrated = True  # entry fields stay; exits continue
 
     def _try_entries(
         self, mint: str, tok: dict, price: float, ts: float, sol_amount: float
@@ -301,20 +323,24 @@ class ReplayBacktester:
         # audit's P1-3 — a +20% price move is not +20% realized. Computed on
         # the blended gross, at the shadow position size.
         net_pnl_pct = net_round_trip(pnl_pct / 100.0, ENTRY["position_sol"]) * 100
-        self.trades_out.append(
-            {
-                "strategy": pos.strategy,
-                "mint": pos.mint,
-                "symbol": pos.symbol,
-                "entry_time": pos.entry_time,
-                "exit_time": ts,
-                "hold_s": round(ts - pos.entry_time, 1),
-                "pnl_pct": round(pnl_pct, 2),
-                "net_pnl_pct": round(net_pnl_pct, 2),  # R5-P1-3
-                "exit_reason": reason,
-                "peak_pnl_pct": round((pos.peak_price / pos.entry_price - 1) * 100, 2),
-            }
-        )
+        row = {
+            "strategy": pos.strategy,
+            "mint": pos.mint,
+            "symbol": pos.symbol,
+            "entry_time": pos.entry_time,
+            "exit_time": ts,
+            "hold_s": round(ts - pos.entry_time, 1),
+            "pnl_pct": round(pnl_pct, 2),
+            "net_pnl_pct": round(net_pnl_pct, 2),  # R5-P1-3
+            "exit_reason": reason,
+            "peak_pnl_pct": round((pos.peak_price / pos.entry_price - 1) * 100, 2),
+        }
+        # C6.1: flag rows whose position crossed migrate/createPool and later
+        # closed on the graduated market. No fake "migrate" exit rows in HOLD
+        # mode — the flag is the only carry-over of migration into the exit mix.
+        if pos.migrated:
+            row["migrated"] = True
+        self.trades_out.append(row)
 
     def _force_close_all(self, mint: str, tok: dict, price: float, ts: float, reason: str) -> None:
         for st in self.strategies.values():
@@ -360,6 +386,9 @@ class ReplayBacktester:
                 "avg_net_pct": round(sum(net_pnls) / len(net_pnls), 2),  # R5-P1-3
                 "total_net_pct": round(sum(net_pnls), 1),  # R5-P1-3
                 "median_hold_s": round(statistics.median(t["hold_s"] for t in trades), 1),
+                # C6.1: positions that crossed migrate/createPool and later
+                # closed on the graduated market (migrated flag on the row).
+                "migrated_then_closed": sum(1 for t in trades if t.get("migrated")),
                 "exit_mix": _tally(t["exit_reason"] for t in trades),
                 "best": max(pnls),
                 "worst": min(pnls),
@@ -478,12 +507,20 @@ async def main() -> int:
     g.add_argument("--last", type=int, help="replay last N complete hours")
     g.add_argument("--local", help="path to a cached .jsonl.zst archive")
     ap.add_argument("--max-open", type=int, default=MAX_OPEN_POSITIONS)
+    # C6.1: --close-on-migrate flips HOLD_THROUGH_MIGRATION so the old
+    # force-close behavior is reproduced for A/B comparison.
+    ap.add_argument("--close-on-migrate", action="store_true", default=False)
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     if args.local:
         stamp = Path(args.local).stem
-        bt = ReplayBacktester(EXIT_GRID, OUT_DIR, max_open_positions=args.max_open)
+        bt = ReplayBacktester(
+            EXIT_GRID,
+            OUT_DIR,
+            max_open_positions=args.max_open,
+            close_on_migrate=args.close_on_migrate,
+        )
         t0 = time.time()
         for ev in load_local(Path(args.local)):
             bt.on_event(ev)
@@ -503,7 +540,12 @@ async def main() -> int:
         print("aiohttp required: uv run (has it)", file=sys.stderr)
         return 1
 
-    bt = ReplayBacktester(EXIT_GRID, OUT_DIR, max_open_positions=args.max_open)
+    bt = ReplayBacktester(
+        EXIT_GRID,
+        OUT_DIR,
+        max_open_positions=args.max_open,
+        close_on_migrate=args.close_on_migrate,
+    )
     stamp = f"{hours[0]:%Y%m%d_%H}-{hours[-1]:%H}"
     t0 = time.time()
     async with aiohttp.ClientSession() as session:

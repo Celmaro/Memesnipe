@@ -46,6 +46,28 @@ class CostModel:
 _DEFAULT = CostModel()
 
 
-def net_round_trip(gross_pnl: float, sol_quote: float) -> float:
-    """Shorthand for the default cost model (production shadow size)."""
-    return _DEFAULT.net_round_trip(gross_pnl, sol_quote)
+def net_round_trip(
+    gross_pnl: float,
+    sol_quote: float,
+    *,
+    buy_fee: float | None = None,
+    sell_fee: float | None = None,
+    network_fee_sol: float | None = None,
+) -> float:
+    """Net PnL fraction for a gross return, on the default cost model.
+
+    Shorthand for the production shadow size. C4.8: per-run parameterization
+    — pass ``buy_fee``/``sell_fee``/``network_fee_sol`` to override the
+    corresponding default (``CostModel`` defaults keep current values);
+    omitted overrides fall back, so existing call sites are unchanged.
+    """
+    if buy_fee is None and sell_fee is None and network_fee_sol is None:
+        return _DEFAULT.net_round_trip(gross_pnl, sol_quote)
+    model = CostModel(
+        buy_fee=_DEFAULT.buy_fee if buy_fee is None else buy_fee,
+        sell_fee=_DEFAULT.sell_fee if sell_fee is None else sell_fee,
+        network_fee_sol=(
+            _DEFAULT.network_fee_sol if network_fee_sol is None else network_fee_sol
+        ),
+    )
+    return model.net_round_trip(gross_pnl, sol_quote)

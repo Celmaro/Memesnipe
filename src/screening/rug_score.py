@@ -94,11 +94,25 @@ def _sub(a: float | None, ceiling: float) -> float:
     return _clamp01(_safe_div(float(a), ceiling))
 
 
+#: Features that feed sub-scores. UNKNOWN (None) values do NOT count toward
+#: coverage — the C4.7 fix refuses to score when too few features are
+#: observed instead of treating unknowns as benign 0 (missing-data bias).
+_COVERAGE_FEATURES = (
+    "creator_cadence_mints_per_hour",
+    "curve_progress_sol",
+    "holder_gini",
+    "top10_fraction",
+    "unique_buyers",
+    "dev_balance_fraction",
+)
+
+
 def compute_rug_score(
     f: RugScoreInput,
     weights: dict[str, float] | None = None,
-) -> float:
-    """Weighted rug-risk score in [0, 1]; higher = riskier.
+    min_coverage: float = 1.0,
+) -> float | None:
+    """Weighted rug-risk score in [0, 1]; higher = riskier. None = refuse.
 
     Sub-scores are the normalized distance toward the risk ceiling:
 
@@ -108,9 +122,15 @@ def compute_rug_score(
     - unique buyers: 1 - buyers/buyers_floor (fewer = riskier)
     - dev balance: dev_balance_fraction / dev_ceiling
 
-    UNKNOWN features (None) contribute a benign sub-score of 0.0, matching
-    the fail-open contract of the other gates; a genuine observed 0 is a
-    real signal (e.g. 0 unique buyers -> full buyer-risk sub-score).
+    Coverage (C4.7): the fraction of the six feature dimensions that are
+    OBSERVED (not None). When ``observed/total < min_coverage`` the score
+    returns **None** — the caller must refuse (fail-closed) rather than
+    score on a mostly-unknown profile. Holding/curve/dev balance are all
+    dimensions an operator expects before trusting a score; the old
+    behavior mapped missing features to benign 0, which made a coin pass
+    on data absence. Default 1.0 keeps the strictest contract; pass a
+    lower value when the feeding path cannot supply every dimension.
+
     Calibration can shift weights per replay evidence.
     """
     w = dict(DEFAULT_WEIGHTS)
@@ -118,6 +138,13 @@ def compute_rug_score(
         w.update(weights)
     total_w = sum(w.values()) or 1.0
     inv = 1.0 / total_w
+
+    observed = sum(
+        1 for name in _COVERAGE_FEATURES if getattr(f, name, None) is not None
+    )
+    total = len(_COVERAGE_FEATURES)
+    if min_coverage > 0 and observed / total < min_coverage:
+        return None
 
     creator = _sub(f.creator_cadence_mints_per_hour, f.cadence_ceiling)
     progress = (

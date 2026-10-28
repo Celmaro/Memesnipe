@@ -126,6 +126,10 @@ def _make_trader(
     t._save_token_info = _noop  # consensus test ignores persistence
     t._handle_successful_buy = _noop  # prevents further machinery
     t._handle_failed_buy = _noop  # noqa: SLF001
+    t._buy_reservations = set()  # noqa: SLF001 — C3.4 pre-buy reservation
+    t._active_exit_mints = set()  # noqa: SLF001 — C3.4 open-position window
+    t._unsold_persist_path = None  # noqa: SLF001 — C7.2 persistence off in tests
+    t._unsold_positions = {}  # noqa: SLF001
     t.wait_time_before_new_token = 0
     t.wait_time_after_creation = 0  # skip the stabilization sleep
     t.yolo_mode = False
