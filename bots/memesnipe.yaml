@@ -379,11 +379,14 @@ cleanup:
 
 # Node provider configuration
 node:
-  max_rps: 8 # gentler burst profile for free tiers (25/burst-25 burned our IP
-             # on mainnet-beta/publicnode; 8/burst-4 keeps shadow flow alive).
-  burst_size: 4
+  # Free-tier profile: mainnet-beta 429s the sustained 8 rps / burst-4 profile
+  # (that storm produced 900K retry-log lines and zero sim trades on 2026-10-29).
+  # 2 rps with burst 1  keeps shadow flow alive without tripping the limiter.
+  max_rps: 2 # gentler burst profile for free tiers (25/burst-25 burned our IP
+             # on mainnet-beta/publicnode; 8/burst-4 kept 429ing; 2/burst-1 stable).
+  burst_size: 1
   # R4-P4-3: startup RPC latency self-test (ON). Three get_slot round trips
   # at boot; warns when avg > 200 ms (snipe races are lost on latency before
-  # fees ever matter). One-time 3-request burst << node.max_rps (8), so it
-  # cannot trip the sustained-rate limiter (audit C11.1).
+  # fees ever matter). One-time 3-request burst is absorbed by the 2 rps
+  # bucket (3 req at 0.5s spacing ≈ sustained rate) — no limiter trip.
   startup_latency_test: true
