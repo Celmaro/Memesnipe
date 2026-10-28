@@ -127,11 +127,21 @@ async def _probe_honeypot_caching() -> list[str]:
         calls["n"] += 1
         return "freeze authority set"
 
-    # Patch the module-level functions the gate calls.
+    # Patch the module-level functions the gate calls. `_curve_gate_reason`
+    # lives in GateStackMixin (C12.3), so patch gate_stack's bindings; patch
+    # universal_trader's too for any remaining call site.
+    import trading.gate_stack as gs
+
     original = ut.honeypot_reason
     ut.honeypot_reason = fake_honeypot
+    original_gs_hp = gs.honeypot_reason
+    gs.honeypot_reason = fake_honeypot
     original_platforms = ut.get_platform_implementations
     ut.get_platform_implementations = lambda *_a, **_k: SimpleNamespace(
+        curve_manager=curve
+    )
+    original_gs_platforms = gs.get_platform_implementations
+    gs.get_platform_implementations = lambda *_a, **_k: SimpleNamespace(
         curve_manager=curve
     )
     try:
@@ -174,6 +184,8 @@ async def _probe_honeypot_caching() -> list[str]:
     finally:
         ut.honeypot_reason = original
         ut.get_platform_implementations = original_platforms
+        gs.honeypot_reason = original_gs_hp
+        gs.get_platform_implementations = original_gs_platforms
     return failures
 
 

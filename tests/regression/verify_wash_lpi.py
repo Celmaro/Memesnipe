@@ -134,13 +134,15 @@ def main() -> int:
         "max_wash_share=cfg" in runner,
     )
     trader_src = Path("src/trading/universal_trader.py").read_text()
+    gate_src = Path("src/trading/gate_stack.py").read_text()  # C12.3
     check(
         "trader feeds wash/LPI on trade events",
         "_wash_lpi.observe_trade(" in trader_src,
     )
     check(
         "trader gates on wash share",
-        "wash_share(str(token_info.mint))" in trader_src,
+        "wash_share(str(token_info.mint))" in gate_src
+        or "wash_share(str(token_info.mint))" in trader_src,
     )
 
     if failures:

@@ -227,9 +227,11 @@ def main() -> int:
         "max_gini_coefficient=cfg" in runner,
     )
     trader = Path("src/trading/universal_trader.py").read_text()
+    gate = Path("src/trading/gate_stack.py").read_text()  # C12.3
     check(
         "trader reads max_gini in _skip_reason",
-        "max_gini=self.max_gini_coefficient" in trader,
+        "max_gini=self.max_gini_coefficient" in gate
+        or "max_gini=self.max_gini_coefficient" in trader,
     )
 
     if failures:

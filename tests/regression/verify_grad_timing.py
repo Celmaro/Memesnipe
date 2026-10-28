@@ -65,8 +65,11 @@ def main() -> int:
         t3 = assess(20.0, stats)
         check("nuke_zone stats attach", t3.median_multiple == 0.85)
 
-    # 4. Advisory never gates: the block in the trader only logs.
+    # 4. Advisory never gates: the block in the trader only logs. The
+    # graduation-timing advisory sits inside the curve gate, which C12.3
+    # moved to GateStackMixin — search both source files.
     src = (REPO / "src/trading/universal_trader.py").read_text()
+    src += "\n" + (REPO / "src/trading/gate_stack.py").read_text()
     block_start = src.find("R4-P1-4: graduation-band advisory (log-only)")
     check("advisory block present", block_start > 0)
     block = src[block_start : block_start + 1400]

@@ -173,8 +173,11 @@ def main() -> int:
     reason_off = rug_score_reason(0.9, 0.0)
     check("threshold 0 = off", reason_off is None)
 
-    # 7. Trader wiring: ctor params + _skip_reason uses the score.
+    # 7. Trader wiring: ctor params live on UniversalTrader; the rug-score
+    # evaluation + factory gate sit in the GateStackMixin (C12.3 extraction),
+    # so grep both files.
     trader_src = Path("src/trading/universal_trader.py").read_text()
+    gate_src = Path("src/trading/gate_stack.py").read_text()
     check(
         "trader ctor has rug_score_threshold",
         "rug_score_threshold: float = 0.0" in trader_src,
@@ -185,11 +188,11 @@ def main() -> int:
     )
     check(
         "trader applies rug score in _skip_reason",
-        "compute_rug_score(" in trader_src,
+        "compute_rug_score(" in gate_src or "compute_rug_score(" in trader_src,
     )
     check(
         "trader applies factory gate in _skip_reason",
-        "is a factory" in trader_src,
+        "is a factory" in gate_src or "is a factory" in trader_src,
     )
     # 8. Config wiring (4 places).
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())

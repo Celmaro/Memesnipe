@@ -87,7 +87,10 @@ def check() -> bool:
     # #4: breakout gate — coin below min MC is rejected, above passes
     impls = SimpleNamespace(curve_manager=Curves(mc_sol=40, progress_sol=2, price=4e-8))
     import trading.universal_trader as ut
+    import trading.gate_stack as gs  # C12.3: _curve_gate_reason lives here
+
     ut.get_platform_implementations = lambda p, c: impls
+    gs.get_platform_implementations = lambda p, c: impls
 
     t = _trader(min_market_cap_sol=50)
     reason = asyncio.run(UniversalTrader._curve_gate_reason(t, _token(4e-8)))
@@ -102,6 +105,7 @@ def check() -> bool:
     # #4c: both caps — over max still rejected (swap curve to MC 60)
     impls = SimpleNamespace(curve_manager=Curves(mc_sol=60, progress_sol=3, price=6e-8))
     ut.get_platform_implementations = lambda p, c: impls
+    gs.get_platform_implementations = lambda p, c: impls
     t = _trader(min_market_cap_sol=40, max_market_cap_sol=40.0)
     reason = asyncio.run(UniversalTrader._curve_gate_reason(t, _token(6e-8)))
     print(f"#4c max_mc 40 vs coin 60 -> {reason!r}")

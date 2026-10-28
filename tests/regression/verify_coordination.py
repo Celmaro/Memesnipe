@@ -155,13 +155,15 @@ def main() -> int:
         "max_coordinated_supply_share=cfg" in runner,
     )
     trader_src = Path("src/trading/universal_trader.py").read_text()
+    gate_src = Path("src/trading/gate_stack.py").read_text()  # C12.3
     check(
         "trader feeds co-fire tracker on buy events",
         "_cofire.observe_buy(mint_key, trader_key)" in trader_src,
     )
     check(
         "trader gates on coordinated share",
-        "coordinated_share(str(token_info.mint))" in trader_src,
+        "coordinated_share(str(token_info.mint))" in gate_src
+        or "coordinated_share(str(token_info.mint))" in trader_src,
     )
 
     if failures:
