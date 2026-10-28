@@ -64,6 +64,14 @@ research:
     - {name: st_tp30_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.30, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
     - {name: trail8, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.08, hard_stop_pct: 0.20}}
     - {name: trail10, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
+    # A2-loop-1: param sweep winners (tools/param_sweep.py, 6h net-of-fee).
+    # st trail6/sl25 = staged-family replay winner; t10_15_* = pure trail
+    # replay winner (arm 15, trail 6/8) — needs live first-fire proof before
+    # it can displace the staged mode (trail10 live era lost -375%).
+    - {name: st_trail6_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.06, hard_stop_pct: 0.25}}
+    - {name: st_trail6_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.06, hard_stop_pct: 0.20}}
+    - {name: t10_15_6, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.15, trail_pct: 0.06, hard_stop_pct: 0.20}}
+    - {name: t10_15_8, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.15, trail_pct: 0.08, hard_stop_pct: 0.20}}
     - {name: hold_120s, kind: time_exit, config: {max_hold_s: 120}}
     - {name: hold_300s, kind: time_exit, config: {max_hold_s: 300}}
     - {name: stagn_600s, kind: time_exit, config: {max_hold_s: 600, stagnation_band_pct: 0.02}}
@@ -123,8 +131,8 @@ trade:
   trail_initial_tp_share: 0.4  # fraction of the position sold at first TP
   trail_initial_tp_pct: 0.20  # +20% first take-profit level (sweep-tuned)
   trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
-  trail_trail_pct: 0.08  # floor trails 8% behind each new high
-  trail_hard_stop_pct: 0.20  # -20% hard stop before any profit is armed
+  trail_trail_pct: 0.06  # A2-loop-1: 6-hour param sweep winner (trail 6 vs 8)
+  trail_hard_stop_pct: 0.25  # A2-loop-1: sweep winner (sl25 vs sl20)
   # trail10 (exit_mode "trail10"): pure trailing stop, backtest winner
   # (5h replay, 2420 trades: +25.1% avg vs +16.7% tp_sl, 67.8% WR)
   trail10_arm_pct: 0.10  # arm the trail once unrealized reaches +10%
