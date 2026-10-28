@@ -7,9 +7,11 @@
 name: "memesnipe"
 env_file: ".env"
 # A2-loop-4: RPC failover to mainnet-beta while publicnode JSON-RPC rate-limits
-# our IP (429 -32005 on getBalance/getLatestBlockhash/sendTransaction). Geyser
-# stream stays on publicnode (separate authenticated push service, healthy).
-# Set RPC_ENDPOINT to the publicnode URL if you prefer it back after the storm.
+# RPC leg on mainnet-beta (publicnode JSON-RPC rate-limits our IP).
+# Tatum gateway (solana-mainnet.gateway.tatum.io, x-api-key from
+# TATUM_API_KEY/GEYSER_API_TOKEN) was verified working but the key's
+# credits are exhausted (HTTP 402) — revert here + set max_rps<=2 once
+# credits are topped up. Geyser stream stays on publicnode (token-auth).
 rpc_endpoint: "https://api.mainnet-beta.solana.com"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
 private_key: "${SOLANA_PRIVATE_KEY}"
@@ -384,7 +386,9 @@ cleanup:
 
 # Node provider configuration
 node:
-  max_rps: 25 # match your provider's RPS limit
+  max_rps: 25 # publicnode/mainnet-beta free tiers tolerate bursts better than
+              # sustained 25/s; Tatum needs <=2/s if re-enabled (its plan caps
+              # at 3 req/s). burst_size defaults to ceil(max_rps).
   # R4-P4-3: startup RPC latency self-test (off by default). Three get_slot
   # round trips at boot; warns when avg > 200 ms (snipe races are lost on
   # latency before fees ever matter).

@@ -2,6 +2,7 @@
 
 import asyncio
 import enum
+import os
 import random
 import struct
 from time import monotonic
@@ -227,6 +228,7 @@ class SolanaClient:
         self,
         rpc_endpoint: str,
         max_rps: float = 25.0,
+        burst_size: int | None = None,
         blockhash_refresh_interval: float = 5.0,
         durable_nonce_account: str | None = None,
         alt_addresses: list[str] | None = None,
@@ -264,9 +266,21 @@ class SolanaClient:
         self.durable_nonce_account = durable_nonce_account
         self.alt_addresses = alt_addresses or []
         self._alt_cache_ts: dict[str, float] = {}
-        self._rate_limiter = TokenBucketRateLimiter(max_rps=max_rps)
+        self._rate_limiter = TokenBucketRateLimiter(
+            max_rps=max_rps, burst_size=burst_size
+        )
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        # Tatum RPC gateway auth: send x-api-key when the endpoint is a
+        # tatum.io gateway and TATUM_API_KEY is present (fall back to the
+        # geyser token slot, which the operator also sets to the Tatum key).
+        self._rpc_headers: dict[str, str] = {}
+        if "tatum.io" in (rpc_endpoint or ""):
+            api_key = os.environ.get("TATUM_API_KEY") or os.environ.get(
+                "GEYSER_API_TOKEN"
+            )
+            if api_key:
+                self._rpc_headers = {"x-api-key": api_key}
 
     async def start_blockhash_updater(self, interval: float = 5.0):
         """Start background task to update recent blockhash.
@@ -320,7 +334,10 @@ class SolanaClient:
     async def get_client(self) -> AsyncClient:
         """Get or create the AsyncClient instance."""
         if self._client is None:
-            self._client = AsyncClient(self.rpc_endpoint)
+            self._client = AsyncClient(
+                self.rpc_endpoint,
+                extra_headers=self._rpc_headers or None,
+            )
         return self._client
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -1170,6 +1187,7 @@ class SolanaClient:
                 async with session.post(
                     self.rpc_endpoint,
                     json=body,
+                    headers=self._rpc_headers or None,
                 ) as response:
                     if response.status == HTTP_TOO_MANY_REQUESTS:
                         rate_limit_attempts += 1

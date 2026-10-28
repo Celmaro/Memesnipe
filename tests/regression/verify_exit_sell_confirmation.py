@@ -498,6 +498,7 @@ async def check_confirm_transaction_stays_bool() -> bool:
         Whether the check passed
     """
     solana_client = object.__new__(SolanaClient)
+    solana_client._rpc_headers = {}  # noqa: SLF001 — bypasses __init__
     seen = []
     for status in ConfirmationStatus:
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from research.cost_model import net_round_trip
@@ -35,7 +36,7 @@ def main() -> None:
         ledger.decide("mintA", current_price=1.50, hold_seconds=120.0)
         ledger.close_position("mintA", close_price=1.50, exit_reason="live", hold_seconds=180.0)
 
-        rows = [json.loads(l) for l in (d / "2026-10-27.jsonl").open()]
+        rows = [json.loads(l) for l in (d / f"{datetime.now(UTC):%Y-%m-%d}.jsonl").open()]
         decides = [r for r in rows if r["type"] == "strategy_decide"]
         closes = [r for r in rows if r["type"] == "strategy_close"]
 

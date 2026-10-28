@@ -117,7 +117,7 @@ class StubSession:
         self.outcomes = list(outcomes)
         self.requests = 0
 
-    def post(self, _url: str, json: dict) -> StubResponse:  # noqa: ARG002
+    def post(self, _url: str, json: dict, headers: dict | None = None) -> StubResponse:  # noqa: ARG002,FBT002
         """Answer one request.
 
         Args:
@@ -162,6 +162,7 @@ def _make_client(session: StubSession) -> SolanaClient:
     solana_client = object.__new__(SolanaClient)
     solana_client.rpc_endpoint = "https://stub.invalid"
     solana_client._rate_limiter = _NoRateLimit()  # noqa: SLF001
+    solana_client._rpc_headers = {}  # noqa: SLF001 — bypasses __init__
 
     async def _get_session() -> StubSession:
         return session

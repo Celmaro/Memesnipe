@@ -435,6 +435,7 @@ async def start_bot(config_path: str):
             compute_units=cfg.get("compute_units", {}),
             # Node provider configuration
             max_rps=cfg.get("node", {}).get("max_rps", 25),
+            burst_size=cfg.get("node", {}).get("burst_size"),
             # P2-STRUC-1: background blockhash refresh cadence (s)
             blockhash_refresh_interval=cfg["trade"].get(
                 "blockhash_refresh_interval", 5.0

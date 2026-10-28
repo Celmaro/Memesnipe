@@ -92,6 +92,7 @@ class StubRpc:
 def _client_with(responses: list[dict]) -> tuple[SolanaClient, StubRpc]:
     """Build a SolanaClient that never opens a socket."""
     client = object.__new__(SolanaClient)
+    client._rpc_headers = {}  # noqa: SLF001 — bypasses __init__
     rpc = StubRpc(responses)
     client.post_rpc = rpc.post_rpc
     return client, rpc

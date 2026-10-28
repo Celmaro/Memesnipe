@@ -425,6 +425,7 @@ class UniversalTrader:
         jito_dontfront: bool = False,
         # Node provider configuration
         max_rps: float = 25.0,
+        burst_size: int | None = None,
         # P2-STRUC-1: background blockhash refresh cadence (s); 0.05 min.
         blockhash_refresh_interval: float = 5.0,
         # R3-P2-2: durable nonce (off by default). When set to the base58
@@ -478,6 +479,7 @@ class UniversalTrader:
         self.solana_client = SolanaClient(
             rpc_endpoint,
             max_rps=max_rps,
+            burst_size=burst_size,
             blockhash_refresh_interval=blockhash_refresh_interval,
             durable_nonce_account=durable_nonce_account,
             alt_addresses=alt_addresses,

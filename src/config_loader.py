@@ -558,7 +558,7 @@ _KNOWN_SECTION_KEYS: dict[str, set[str]] = {
         "wait_before_new_token",
     },
     "cleanup": {"mode", "force_close_with_burn", "with_priority_fee"},
-    "node": {"max_rps", "startup_latency_test"},
+    "node": {"max_rps", "burst_size", "startup_latency_test"},
     "backfill": {"enabled", "checkpoint", "max_pages", "page_size"},
     "timing": {"token_wait_timeout"},
 }
