@@ -6,7 +6,11 @@
 
 name: "memesnipe"
 env_file: ".env"
-rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
+# A2-loop-4: RPC failover to mainnet-beta while publicnode JSON-RPC rate-limits
+# our IP (429 -32005 on getBalance/getLatestBlockhash/sendTransaction). Geyser
+# stream stays on publicnode (separate authenticated push service, healthy).
+# Set RPC_ENDPOINT to the publicnode URL if you prefer it back after the storm.
+rpc_endpoint: "https://api.mainnet-beta.solana.com"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
 private_key: "${SOLANA_PRIVATE_KEY}"
 
@@ -72,6 +76,12 @@ research:
     - {name: st_trail6_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.06, hard_stop_pct: 0.20}}
     - {name: t10_15_6, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.15, trail_pct: 0.06, hard_stop_pct: 0.20}}
     - {name: t10_15_8, kind: staged_trail, config: {initial_tp_share: 0.0, initial_tp_pct: 0.10, arm_pct: 0.15, trail_pct: 0.08, hard_stop_pct: 0.20}}
+    # A2-loop-4 (user: runner capture in staged trail): wide-trail staged cells
+    # so the post-TP 60% rides runners instead of shaking out on pullbacks.
+    - {name: st_trail10_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
+    - {name: st_trail12_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.12, hard_stop_pct: 0.25}}
+    - {name: st_trail10_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
+    - {name: st_50@25p_trail10_sl25, kind: staged_trail, config: {initial_tp_share: 0.5, initial_tp_pct: 0.25, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
     - {name: hold_120s, kind: time_exit, config: {max_hold_s: 120}}
     - {name: hold_300s, kind: time_exit, config: {max_hold_s: 300}}
     - {name: stagn_600s, kind: time_exit, config: {max_hold_s: 600, stagnation_band_pct: 0.02}}
@@ -131,8 +141,8 @@ trade:
   trail_initial_tp_share: 0.4  # fraction of the position sold at first TP
   trail_initial_tp_pct: 0.20  # +20% first take-profit level (sweep-tuned)
   trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
-  trail_trail_pct: 0.06  # A2-loop-1: 6-hour param sweep winner (trail 6 vs 8)
-  trail_hard_stop_pct: 0.25  # A2-loop-1: sweep winner (sl25 vs sl20)
+  trail_trail_pct: 0.08  # runner capture: 8% trail keeps the 60% through normal pullbacks (6% shakes runners out)
+  trail_hard_stop_pct: 0.25  # A2-loop-1: sweep winner sl25 (equal-best held-out +15.08%)
   # trail10 (exit_mode "trail10"): pure trailing stop, backtest winner
   # (5h replay, 2420 trades: +25.1% avg vs +16.7% tp_sl, 67.8% WR)
   trail10_arm_pct: 0.10  # arm the trail once unrealized reaches +10%
@@ -180,7 +190,7 @@ trade:
   stuck_sweep_interval: 60 # seconds between wallet scans; 0 disables
   # Improvement #8: shadow/paper mode — record simulated decisions and
   # outcomes without sending transactions (backtest the gates risk-free).
-  shadow_mode: true # SHADOW ON (log-only, no real sends) — user requested 2026-10-26
+  shadow_mode: true # SHADOW ON — live data window complete; no further real sends
   # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
   # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
   backfill:
