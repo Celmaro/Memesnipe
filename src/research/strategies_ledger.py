@@ -86,7 +86,7 @@ def _staged_trail_evaluator(entry_price: float, **cfg: Any) -> Any:
         initial_tp_pct=float(cfg.get("initial_tp_pct", 0.20)),
         arm_pct=float(cfg.get("arm_pct", 0.10)),
         trail_pct=float(cfg.get("trail_pct", 0.12)),
-        hard_stop_pct=float(cfg.get("hard_stop_pct", 0.25)),
+        hard_stop_pct=float(cfg.get("hard_stop_pct", 0.20)),
     )
 
     class _StagedSim:

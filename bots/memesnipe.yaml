@@ -64,10 +64,10 @@ research:
   # Keep: live config (must match trade.exit_mode knobs, trail12) + the
   # previous live cell (trail10) as the A/B probe.
   strategies:
-    # live exit config — keep in sync with trade.trail_* knobs (sl25, trail12)
-    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.12, hard_stop_pct: 0.25}}
+    # live exit config — keep in sync with trade.trail_* knobs (sl20, trail12)
+    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.12, hard_stop_pct: 0.20}}
     # runner A/B probe (shadow-only): trail10 was the prior live runner cell
-    - {name: st_trail10_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
+    - {name: st_trail10_sl20, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.20}}
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
@@ -130,7 +130,7 @@ trade:
   trail_initial_tp_pct: 0.20  # +20% first take-profit level (sweep-tuned)
   trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
   trail_trail_pct: 0.12  # runner capture: 12% trail rides the deepest pullbacks (runner-riding sweep winner; 10% = runner A/B probe)
-  trail_hard_stop_pct: 0.25  # A2-loop-1: sweep winner sl25 (equal-best held-out +15.08%)
+  trail_hard_stop_pct: 0.20  # tightened 2026-10-29 25->20: cut the stuck-open tail (positions were sitting -10..-25% with no trigger); still loose enough to never shake out a runner
   # trail10 (exit_mode "trail10"): pure trailing stop, backtest winner
   # (5h replay, 2420 trades: +25.1% avg vs +16.7% tp_sl, 67.8% WR)
   trail10_arm_pct: 0.10  # arm the trail once unrealized reaches +10%
