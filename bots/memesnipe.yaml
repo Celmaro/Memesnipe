@@ -12,6 +12,8 @@ env_file: ".env"
 # TATUM_API_KEY/GEYSER_API_TOKEN) was verified working but the key's
 # credits are exhausted (HTTP 402) — revert here + set max_rps<=2 once
 # credits are topped up. Geyser stream stays on publicnode (token-auth).
+# RPC: mainnet-beta is the least-bad free tier (zan.top was worse under real
+# load: 7/min fail-closed errors vs 3.5/min). 2rps/burst1 storm-safe profile.
 rpc_endpoint: "https://api.mainnet-beta.solana.com"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
 private_key: "${SOLANA_PRIVATE_KEY}"
@@ -255,7 +257,12 @@ filters:
   rug_min_unique_buyers: 2
   rug_check_slots: 12
   rug_early_drain_ratio: 0.5
-  max_market_cap_sol: 35.0 # A2-loop-2: gate sweep winner mc<35 (90.8% WR, PF 10.5, ~4x fewer entries)
+  # 2026-10-30 live window: gate sweep winner mc<35 (PF 10.5) produced ZERO
+  # fills in ~2h because tokens that clear the curve floor pump past 35 SOL
+  # before the check. Raised to 60 for live data collection (user-approved);
+  # the $10 realized-loss cut bounds the downside. Re-tighten after ~20-30
+  # live fills if the mode=live PF collapses vs the backtest.
+  max_market_cap_sol: 60.0
   min_curve_progress_sol: 0.25 # Phase 5 trial: skip dead launches
   # Improvement #4: buy-on-breakout — buy only after MC rises through this.
   # Leave null to keep pure launch sniping (max cap only).

@@ -21,6 +21,7 @@ from typing import Any
 from core.pubkeys import normalize_quote_mint
 from interfaces.core import TokenInfo
 from screening.honeypot import honeypot_reason
+from screening.grad_timing import assess as grad_timing_assess  # R4-P1-4
 from platforms import get_platform_implementations
 from utils.logger import get_logger
 
