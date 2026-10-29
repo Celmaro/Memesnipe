@@ -35,9 +35,9 @@ MC_GATE = 35.0  # live entry gate
 #   staged: (tp_share, tp_lvl, arm, trail, hard_stop)
 SETS = {
     "tp_sl": ("fixed", (0.20, 0.20)),  # research baseline only (removed from live grid)
-    "staged_trail(live trail10/sl25)": ("staged", (0.40, 0.20, 0.10, 0.10, 0.25)),
+    "staged_trail(live trail12/sl25)": ("staged", (0.40, 0.20, 0.10, 0.12, 0.25)),
     "st_trail6_sl25": ("staged", (0.40, 0.20, 0.10, 0.06, 0.25)),
-    "st_trail12_sl25": ("staged", (0.40, 0.20, 0.10, 0.12, 0.25)),
+    "st_trail10_sl25": ("staged", (0.40, 0.20, 0.10, 0.10, 0.25)),
 }
 
 

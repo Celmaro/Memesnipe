@@ -61,14 +61,13 @@ research:
   # no-exit baseline. Runner-riding only (user directive 2026-10-29):
   # tp_sl removed (fixed +20/-20 caps upside, cannot ride a runner),
   # trail6 removed (6% trail shaves runners out — the opposite of riding).
-  # Keep: live config (must match trade.exit_mode knobs) + wider-trail
-  # runner probe (trail12 lets the 60% leg ride deeper pullbacks).
+  # Keep: live config (must match trade.exit_mode knobs, trail12) + the
+  # previous live cell (trail10) as the A/B probe.
   strategies:
-    # live exit config — keep in sync with trade.trail_* knobs (sl25, trail10)
-    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
-    # wider-trail runner probe (shadow-only): trail12 rides through deeper
-    # pullbacks than trail10 — the "lucky runner" end of the family
-    - {name: st_trail12_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.12, hard_stop_pct: 0.25}}
+    # live exit config — keep in sync with trade.trail_* knobs (sl25, trail12)
+    - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.12, hard_stop_pct: 0.25}}
+    # runner A/B probe (shadow-only): trail10 was the prior live runner cell
+    - {name: st_trail10_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
@@ -117,19 +116,20 @@ trade:
   # R4-P1-7: exit shape within the tp_sl family. "tp_sl" (default) = current
   # single/staged TP/SL unchanged. "staged_trail" = asymmetric staged-then-
   # trail: sell 40% at +20%, arm a break-even floor at +10%, trail the rest
-  # 10% behind each new high, exit on the floor or the -25% hard stop. The
+  # 12% behind each new high, exit on the floor or the -25% hard stop. The
   # same rule is shadow-tested in parallel via the strategies ledger
   # (research.strategies_ledger_enabled) regardless of which mode is active.
-  # trail_pct 0.10 = corrected-sweep runner-capture winner (2026-10-29):
-  # best held-out +18.50/PF 2.8 and best runner capture on tuning AND
-  # held-out (44%/41% legs >+50, 16%/17% >+100) vs trail8's 42%/39% and
-  # +14.77/PF 2.4 (which never topped any metric). NOT the pure-trail
-  # trail10 mode below (that bled -353% live); 40% banks at +20% first.
+  # trail_pct 0.12 = runner-riding winner (user directive 2026-10-29):
+  # corrected-sweep A/B vs trail10 — identical expectancy (HO +18.35 vs
+  # +18.50, PF 2.8 both) but BETTER runner capture on tuning AND held-out
+  # (46%/44% legs >+50 vs 44%/41%, 17%/18% >+100 vs 16%/17%, avg leg-peak
+  # +76.5%/+73.7% vs +73.8%/+71.0%). NOT the pure-trail trail10 mode below
+  # (that bled -353% live); 40% banks at +20% first.
   exit_mode: "staged_trail"
   trail_initial_tp_share: 0.4  # fraction of the position sold at first TP
   trail_initial_tp_pct: 0.20  # +20% first take-profit level (sweep-tuned)
   trail_arm_pct: 0.10  # +10% unrealized arms the break-even floor
-  trail_trail_pct: 0.10  # runner capture: 10% trail keeps the 60% riding pullbacks (corrected-sweep winner; 8% shook out runners in the trail10-vs-trail8 A/B)
+  trail_trail_pct: 0.12  # runner capture: 12% trail rides the deepest pullbacks (runner-riding sweep winner; 10% = runner A/B probe)
   trail_hard_stop_pct: 0.25  # A2-loop-1: sweep winner sl25 (equal-best held-out +15.08%)
   # trail10 (exit_mode "trail10"): pure trailing stop, backtest winner
   # (5h replay, 2420 trades: +25.1% avg vs +16.7% tp_sl, 67.8% WR)
