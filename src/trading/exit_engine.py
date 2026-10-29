@@ -317,6 +317,37 @@ class ExitEngineMixin:
                     f"{sell_result.error_message}"
                 )
                 return
+            # Live research capture: record the real partial leg using the
+            # same schema as shadow sim_close, tagged for calibration.
+            if not self.shadow_mode and self.shadow_capture is not None:
+                fee_fields = await self._fee_estimate_fields()
+                self.shadow_capture.sim_close(
+                    mint=str(token_info.mint),
+                    symbol=token_info.symbol,
+                    platform=token_info.platform.value,
+                    price=sell_result.price,
+                    amount_tokens=qty,
+                    quote_received=sell_result.price * qty,
+                    exit_reason=exit_reason,
+                    pnl_quote=(sell_result.price - position.entry_price) * qty,
+                    pnl_pct=(
+                        (sell_result.price - position.entry_price)
+                        / position.entry_price
+                        if position.entry_price > 0
+                        else 0.0
+                    ),
+                    hold_seconds=(
+                        datetime.utcnow() - position.entry_time
+                    ).total_seconds(),
+                    pool_snapshot=await self._pool_snapshot(token_info),
+                    **fee_fields,
+                    reordering_bps=0,
+                    is_partial=not drained,
+                    position_id=position.position_id,
+                    leg_exit_reason=exit_reason,
+                    mode="live",
+                    tx_signature=sell_result.tx_signature,
+                )
         # Reduce position quantity by the sold share (keep entry price).
         # C4.8: bank the leg's realized PnL BEFORE shrinking quantity so the
         # final close (here for a draining leg, or via _attempt_position_exit
@@ -462,6 +493,41 @@ class ExitEngineMixin:
                 )
 
         if sell_result.success:
+            # Live research capture: the real closing fill, same schema as
+            # the shadow sim_close, tagged for calibration. Placed right
+            # after success so the strategies ledger finalizes against the
+            # actual fill (and both writers share the fee estimates).
+            if not self.shadow_mode and self.shadow_capture is not None:
+                hold_seconds = (
+                    datetime.utcnow() - position.entry_time
+                ).total_seconds()
+                fee_fields = await self._fee_estimate_fields()
+                self.shadow_capture.sim_close(
+                    mint=str(token_info.mint),
+                    symbol=token_info.symbol,
+                    platform=token_info.platform.value,
+                    price=sell_result.price,
+                    amount_tokens=position.quantity,
+                    quote_received=sell_result.price * position.quantity,
+                    exit_reason=exit_reason.value,
+                    pnl_quote=float(pnl.get("unrealized_pnl_quote", 0.0)),
+                    pnl_pct=float(pnl.get("price_change_pct", 0.0)),
+                    hold_seconds=hold_seconds,
+                    pool_snapshot=await self._pool_snapshot(token_info),
+                    **fee_fields,
+                    reordering_bps=0,
+                    position_id=position.position_id,
+                    mode="live",
+                    tx_signature=sell_result.tx_signature,
+                )
+                if self.strategies_ledger is not None:
+                    self.strategies_ledger.close_position(
+                        mint=str(token_info.mint),
+                        close_price=sell_result.price,
+                        exit_reason=exit_reason.value,
+                        hold_seconds=hold_seconds,
+                        **fee_fields,
+                    )
             # Close position with actual exit price
             position.close_position(sell_result.price, exit_reason)
             # R3-P2-10: track realized PnL for the risk guards.

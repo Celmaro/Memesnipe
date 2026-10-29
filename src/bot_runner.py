@@ -404,25 +404,23 @@ async def start_bot(config_path: str):
             sell_priority_fee=cfg.get("priority_fees", {}).get("sell_fixed_amount"),
             stuck_sweep_interval=cfg.get("trade", {}).get("stuck_sweep_interval", 0),
             shadow_mode=cfg.get("trade", {}).get("shadow_mode", False),
-            # Shadow research capture: when shadow mode is on and capture is
-            # enabled, the trader gets an append-only JSONL ledger of every
-            # detect/sim_open/sim_close event for backtesting.
+            # Research data capture: records detect/sim_open/sim_close rows.
+            # Lives in BOTH shadow and live modes (user wants live calibration);
+            # the mode is tagged on every summary row. Enabled by
+            # research.shadow_capture_enabled (default on for shadow runs).
             shadow_capture=(
                 ShadowDataCapture(
                     dir_path=cfg.get("research", {}).get(
                         "shadow_data_dir", "shadow_data"
                     )
                 )
-                if (
-                    cfg.get("trade", {}).get("shadow_mode", False)
-                    and cfg.get("research", {}).get("shadow_capture_enabled", True)
-                )
+                if cfg.get("research", {}).get("shadow_capture_enabled", True)
                 else None
             ),
-            # R4-P1-7: strategies ledger — shadow-only parallel exit-strategy
-            # testing (same hard guard as shadow_capture). Every open shadow
-            # position is evaluated against tp_sl AND staged_trail so one
-            # price path yields a per-strategy outcome row.
+            # R4-P1-7: strategies ledger — parallel exit-strategy testing.
+            # Same live/shadow contract as shadow_capture: every open
+            # position is evaluated against every registered strategy so one
+            # price path yields a per-strategy outcome row for calibration.
             strategies_ledger=(
                 StrategiesLedger(
                     dir_path=cfg.get("research", {}).get(
@@ -436,8 +434,7 @@ async def start_bot(config_path: str):
                     strategies=cfg.get("research", {}).get("strategies") or None,
                 )
                 if (
-                    cfg.get("trade", {}).get("shadow_mode", False)
-                    and cfg.get("research", {}).get("shadow_capture_enabled", True)
+                    cfg.get("research", {}).get("shadow_capture_enabled", True)
                     and cfg.get("research", {}).get(
                         "strategies_ledger_enabled", True
                     )
@@ -476,7 +473,10 @@ async def start_bot(config_path: str):
 
         # Close sims orphaned by the previous process (restart zombies) so
         # open-position counts stay honest; must run before trading starts.
-        if trader.shadow_capture is not None:
+        # SHADOW-ONLY: in live mode a real position opened by the prior
+        # process still holds wallet tokens — the stuck-token sweeper owns
+        # that cleanup, and fabricated 0% closes would corrupt calibration.
+        if trader.shadow_mode and trader.shadow_capture is not None:
             swept = trader.shadow_capture.sweep_zombies()
             if swept:
                 logging.info(f"Shadow zombie sweep: closed {swept} orphaned sims")

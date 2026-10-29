@@ -16,7 +16,7 @@ rpc_endpoint: "https://api.mainnet-beta.solana.com"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
 private_key: "${SOLANA_PRIVATE_KEY}"
 
-enabled: true # Shadow mode run (trade.shadow_mode: true — log-only, no real sends)
+enabled: true # LIVE mode — real sends (shadow_mode: false; $10 realized-loss cut below)
 separate_process: true
 
 # Options: "pump_fun" (default), "lets_bonk", "stonk_fun"
@@ -41,7 +41,7 @@ research:
   # R3-P2-5: PumpSwap graduation watcher (off by default). Detects the
   # CompletePumpAmmMigrationEvent in trade logs so post-graduation leader
   # activity is seen as PumpSwap trades, not curve trades.
-  pumpswap_migrate_watcher: false
+  pumpswap_migrate_watcher: true # research capture: classify post-graduation activity in live data
   # R3-P2-14: slot-ordered copy/monitor feed (off by default). When on, copy
   # fills release in ascending slot order so an out-of-order geyser delivery
   # cannot corrupt position state. The snipe path stays unordered.
@@ -65,8 +65,12 @@ research:
   strategies:
     # live Profile B baseline — TP1 +20/40%, TP2 +40/30%, runner 30%
     - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, second_tp_share: 0.30, second_tp_pct: 0.40, tp1_floor_pct: 0.025, arm_pct: 0.25, trail_pct: 0.18, hard_stop_pct: 0.18}}
-    # runner A/B probe (shadow-only): same Profile B, narrower 10% trail
+    # runner A/B probe (shadow-only / live research): same Profile B, narrower 10% trail
     - {name: st_trail10_sl18, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, second_tp_share: 0.30, second_tp_pct: 0.40, tp1_floor_pct: 0.025, arm_pct: 0.25, trail_pct: 0.10, hard_stop_pct: 0.18}}
+    # recommendation Profile A: fast scalp with a 20% runner (research-only)
+    - {name: profile_a_fast, kind: staged_trail, config: {initial_tp_share: 0.50, initial_tp_pct: 0.15, second_tp_share: 0.30, second_tp_pct: 0.30, tp1_floor_pct: 0.025, arm_pct: 0.25, trail_pct: 0.15, hard_stop_pct: 0.15}}
+    # recommendation Profile C: runner-focused with a 40% runner (research-only)
+    - {name: profile_c_runner, kind: staged_trail, config: {initial_tp_share: 0.35, initial_tp_pct: 0.25, second_tp_share: 0.25, second_tp_pct: 0.60, tp1_floor_pct: 0.025, arm_pct: 0.25, trail_pct: 0.20, hard_stop_pct: 0.20}}
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades
@@ -133,7 +137,7 @@ trade:
   # band the curve progress falls in (nuke_zone <50 SOL / sweet_spot
   # 85-120 SOL per the graduation monitor recut). NEVER gates a buy;
   # band stats optional via grad_band_stats_path.
-  grad_timing_enabled: false
+  grad_timing_enabled: true # log-only research: record graduation-band context; never gates buys
   grad_band_stats_path: state/grad_band_stats.json
   # R3-P2-12: event-driven sell-fill (off by default = current polling). When
   # on, a TradeEvent from the bot's own wallet prompts the monitor to evaluate
@@ -168,9 +172,11 @@ trade:
   # tokens the bot owns but isn't tracking (restart leftovers, late-confirmed
   # buys, abandoned positions) and sells them through the persistent watcher.
   stuck_sweep_interval: 60 # seconds between wallet scans; 0 disables
-  # Improvement #8: shadow/paper mode — record simulated decisions and
-  # outcomes without sending transactions (backtest the gates risk-free).
-  shadow_mode: true # SHADOW ON — live data window complete; no further real sends
+  # Improvement #8: live trading mode — real sends. When shadow_mode was on,
+  # buy/sell produced simulated fills; with it OFF the real buyer/seller fire.
+  # Research capture (shadow_data/ + strategies ledger) stays ON in live mode
+  # so every real trade is recorded for calibration.
+  shadow_mode: false # LIVE TRADING ON — real funds (0.01 SOL/buy, risk cut below)
 # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
 # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
 backfill:
@@ -222,7 +228,7 @@ jito:
 # while sells still run — it never traps money in a falling position.
 risk:
   max_concurrent_positions: 0 # 0 = off (unlimited open positions; shadow A/B needs the sample)
-  daily_loss_limit_sol: 0 # realized-loss floor for the session; 0 = off
+  daily_loss_limit_sol: 0.098 # ~$10 realized portfolio loss (SOL @ $102.15 on 2026-10-29): blocks NEW buys, sells still run (never traps money)
   budget_sol: 0 # cap on total quote spent on buys this session; 0 = off
 
 # Filters for token selection
@@ -270,7 +276,7 @@ filters:
   # When on, the monitor evaluates creator-sell/rug-drain/buyer-stall on
   # open positions, logs a warning, and NEVER exits — shadow evidence
   # before any hard gate is armed.
-  post_entry_advisories_enabled: false
+  post_entry_advisories_enabled: true # log-only research: creator/rug/buyer-stall signals; never exits
   # R3-P1-5: holder-concentration gates (0 = off). Background refresher
   # fills the holder snapshot; fail-open until it has data for a mint.
   min_unique_holders: 0

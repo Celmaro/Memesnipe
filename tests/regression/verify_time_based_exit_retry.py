@@ -146,6 +146,7 @@ def _make_trader(
     trader.max_coordinated_supply_share = 0.0  # R4-P1-3 mock default
     trader.exit_mode = "tp_sl"  # R4-P1-7 mock default
     trader.strategies_ledger = None  # R4-P1-7 mock default
+    trader.shadow_capture = None  # live/shadow research capture mock default
     trader.wait_time_after_buy = 0  # no real waiting before the sell
     trader.max_exit_sell_attempts = max_exit_sell_attempts
     trader.platform_implementations = SimpleNamespace(

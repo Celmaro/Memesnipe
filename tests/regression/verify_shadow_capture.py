@@ -154,8 +154,13 @@ def main() -> int:
     t2.strategies_ledger = None  # R4-P1-7 mock default
     t2.allow_mayhem_mode = False  # R3-P0-2 off in verifiers
     t2.shadow_mode = False
-    t2.shadow_capture = None
-    check("trader drops capture when shadow off", t2.shadow_capture is None)
+    # Decoupled contract (2026-10-30): capture is a research feature that
+    # lives in BOTH shadow and live modes — the constructor keeps whatever
+    # bot_runner passed (None only when research.shadow_capture_enabled is
+    # off), so live-mode real trades are recorded for calibration. Shadow
+    # mode no longer nulls it.
+    t2.shadow_capture = cap
+    check("trader keeps capture when shadow off (live research)", t2.shadow_capture is cap)
 
     # Config wiring: BOOL_FIELDS + YAML default.
     import yaml

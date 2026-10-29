@@ -74,6 +74,7 @@ def main() -> int:
     t.max_coordinated_supply_share = 0.0  # R4-P1-3 mock default
     t.exit_mode = "tp_sl"  # R4-P1-7 mock default
     t.strategies_ledger = None  # R4-P1-7 mock default
+    t.shadow_capture = None  # live/shadow research capture mock default
     t.migrate_watcher = None
     check("trader watcher None when disabled", t.migrate_watcher is None)
 
@@ -81,8 +82,8 @@ def main() -> int:
 
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML default pumpswap_migrate_watcher false",
-        cfg["research"].get("pumpswap_migrate_watcher") is False,
+        "YAML enables pumpswap_migrate_watcher (live research capture)",
+        cfg["research"].get("pumpswap_migrate_watcher") is True,
         f"-> {cfg['research'].get('pumpswap_migrate_watcher')!r}",
     )
     check(

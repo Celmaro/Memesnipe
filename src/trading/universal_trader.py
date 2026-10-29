@@ -716,12 +716,16 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         self.rug_min_unique_buyers = rug_min_unique_buyers
         self.rug_check_slots = rug_check_slots
         self.rug_early_drain_ratio = rug_early_drain_ratio
-        # Shadow research capture — only live when shadow_mode is also on.
-        # Uses the constructor param here: self.shadow_mode is assigned
-        # later in __init__.
-        self.shadow_capture = shadow_capture if shadow_mode else None
-        # R4-P1-7: strategies ledger — same hard guard as shadow_capture.
-        self.strategies_ledger = strategies_ledger if shadow_mode else None
+        # Research data capture — lives in BOTH shadow and live modes so real
+        # trades are recorded for calibration (user directive: collect data
+        # while live). The mode is tagged per row by the caller. Enabled purely
+        # by the research.shadow_capture_enabled config; shadow_mode no longer
+        # gates it (bot_runner passes None when disabled).
+        self.shadow_capture = shadow_capture
+        # R4-P1-7: strategies ledger — same live/shadow contract: every open
+        # position (simulated or real) is evaluated against every strategy so
+        # one price path yields a per-strategy outcome row.
+        self.strategies_ledger = strategies_ledger
         # mint -> set of buyer wallet strings observed via trade events.
         self._rug_buyers: dict[str, set[str]] = {}
         # R4-P1-3: insider-coordination tracker (fed the same buy events).
@@ -2711,6 +2715,39 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     # R3-P2-10: track the buy for concurrency/budget accounting
                     # using the EFFECTIVE quote spent (fragility-scaled).
                     self.risk_tracker.record_buy(float(eff_quote))
+                    # Live research capture: record the real fill using the
+                    # same schema as shadow sim_open, tagged for calibration.
+                    if not self.shadow_mode and self.shadow_capture is not None:
+                        fee_fields = await self._fee_estimate_fields()
+                        race_fields = await self._race_kpi_fields(token_info)
+                        snapshot = await self._pool_snapshot(token_info)
+                        self.shadow_capture.sim_open(
+                            mint=str(token_info.mint),
+                            symbol=token_info.symbol,
+                            platform=token_info.platform.value,
+                            price=buy_result.price,
+                            amount_tokens=buy_result.amount,
+                            quote_spent=eff_quote,
+                            pool_snapshot=snapshot,
+                            mode="live",
+                            tx_signature=buy_result.tx_signature,
+                            **fee_fields,
+                            **race_fields,
+                        )
+                        if self.strategies_ledger is not None:
+                            self.strategies_ledger.open_position(
+                                mint=str(token_info.mint),
+                                symbol=token_info.symbol,
+                                platform=token_info.platform.value,
+                                entry_price=buy_result.price,
+                                amount_tokens=buy_result.amount,
+                                quote_spent=eff_quote,
+                                pool_snapshot=snapshot,
+                                mode="live",
+                                tx_signature=buy_result.tx_signature,
+                                **fee_fields,
+                                **race_fields,
+                            )
                     await self._handle_successful_buy(token_info, buy_result)
                 else:
                     await self._handle_failed_buy(token_info, buy_result)
@@ -2873,9 +2910,11 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         """Rate-limited sim_mark + strategies-ledger tick (every ~15s).
 
         Shared by the tp_sl and trail exit paths so open positions stay
-        replayable regardless of exit mode.
+        replayable regardless of exit mode. Runs in BOTH shadow and live
+        modes: real positions get marked against the real price path so the
+        strategies ledger can evaluate every strategy on live data.
         """
-        if not (self.shadow_mode and self.shadow_capture is not None):
+        if self.shadow_capture is None:
             return
         pnl = position.get_pnl(current_price)
         mark_interval = max(1, 15 // max(1, self.price_check_interval))
@@ -3026,6 +3065,46 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
 
             if sell_result.success:
                 logger.info(f"Successfully sold {token_info.symbol}")
+                # Live research capture: real time-based close, same schema
+                # as the shadow close, tagged for calibration (mirrors the
+                # staging/trail live closes in exit_engine).
+                if not self.shadow_mode and self.shadow_capture is not None:
+                    fee_fields = await self._fee_estimate_fields()
+                    _qty = sell_result.amount or buy_result.amount or 0.0
+                    _buy_px = buy_result.price or 0.0
+                    self.shadow_capture.sim_close(
+                        mint=str(token_info.mint),
+                        symbol=token_info.symbol,
+                        platform=token_info.platform.value,
+                        price=sell_result.price,
+                        amount_tokens=_qty,
+                        quote_received=(sell_result.price or 0.0) * _qty,
+                        exit_reason="time_based_sell",
+                        pnl_quote=(
+                            (sell_result.price - _buy_px) * _qty
+                            if sell_result.price and _buy_px
+                            else 0.0
+                        ),
+                        pnl_pct=(
+                            (sell_result.price - _buy_px) / _buy_px
+                            if sell_result.price and _buy_px
+                            else 0.0
+                        ),
+                        hold_seconds=self.wait_time_after_buy or 0.0,
+                        pool_snapshot=await self._pool_snapshot(token_info),
+                        **fee_fields,
+                        reordering_bps=0,
+                        mode="live",
+                        tx_signature=sell_result.tx_signature,
+                    )
+                    if self.strategies_ledger is not None:
+                        self.strategies_ledger.close_position(
+                            mint=str(token_info.mint),
+                            close_price=sell_result.price,
+                            exit_reason="time_based_sell",
+                            hold_seconds=self.wait_time_after_buy or 0.0,
+                            **fee_fields,
+                        )
                 # R3-P2-10: track realized PnL for the risk guards. The
                 # time-based path has the buy price; PnL = (sell-buy)*amount.
                 try:
