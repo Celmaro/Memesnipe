@@ -58,19 +58,17 @@ research:
   strategies_ledger_enabled: true
   # Parallel exit-strategy grid — every open shadow position is evaluated
   # against each spec (kind: tp_sl | staged_trail | hold). "hold" is the
-  # no-exit baseline. Pruned to 3 cells 2026-10-29 (user: too many strategies):
-  # poison/duplicate cells removed (tp20_sl10 -2360%, holds -957/-1219%,
-  # pure-trail family live-disproven in trail10 era -373%, sl20 duplicates).
-  # st_trail10_sl25 graduated INTO the live config (corrected-sweep runner
-  # winner) so its probe cell was dropped rather than duplicated.
-  # Keep: fixed baseline, live config (must match trade.exit_mode knobs),
-  # tuning-average winner (trail6/sl25).
+  # no-exit baseline. Runner-riding only (user directive 2026-10-29):
+  # tp_sl removed (fixed +20/-20 caps upside, cannot ride a runner),
+  # trail6 removed (6% trail shaves runners out — the opposite of riding).
+  # Keep: live config (must match trade.exit_mode knobs) + wider-trail
+  # runner probe (trail12 lets the 60% leg ride deeper pullbacks).
   strategies:
-    - {name: tp_sl, kind: tp_sl, config: {take_profit_pct: 0.20, stop_loss_pct: 0.20}}
     # live exit config — keep in sync with trade.trail_* knobs (sl25, trail10)
     - {name: staged_trail, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.10, hard_stop_pct: 0.25}}
-    # 6-hour param-sweep tuning winner (net-of-fee, tuning +11.36 / held-out +15.35)
-    - {name: st_trail6_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.06, hard_stop_pct: 0.25}}
+    # wider-trail runner probe (shadow-only): trail12 rides through deeper
+    # pullbacks than trail10 — the "lucky runner" end of the family
+    - {name: st_trail12_sl25, kind: staged_trail, config: {initial_tp_share: 0.4, initial_tp_pct: 0.20, arm_pct: 0.10, trail_pct: 0.12, hard_stop_pct: 0.25}}
 
 trade:
   # Phase 1 sizing: 0.01 SOL ≈ 3% of a 0.33 SOL wallet (~30 losing trades

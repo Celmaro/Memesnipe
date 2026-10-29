@@ -31,13 +31,13 @@ HELDOUT = ["14"]
 POSITION_SOL = 0.01
 MC_GATE = 35.0  # live entry gate
 
-# (name, kind, cfg) — exactly the pruned live grid
+# (name, kind, cfg) — runner-riding grid (user directive 2026-10-29)
 #   staged: (tp_share, tp_lvl, arm, trail, hard_stop)
 SETS = {
-    "tp_sl": ("fixed", (0.20, 0.20)),
-    "staged_trail(live trail8/sl25)": ("staged", (0.40, 0.20, 0.10, 0.08, 0.25)),
+    "tp_sl": ("fixed", (0.20, 0.20)),  # research baseline only (removed from live grid)
+    "staged_trail(live trail10/sl25)": ("staged", (0.40, 0.20, 0.10, 0.10, 0.25)),
     "st_trail6_sl25": ("staged", (0.40, 0.20, 0.10, 0.06, 0.25)),
-    "st_trail10_sl25": ("staged", (0.40, 0.20, 0.10, 0.10, 0.25)),
+    "st_trail12_sl25": ("staged", (0.40, 0.20, 0.10, 0.12, 0.25)),
 }
 
 

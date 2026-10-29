@@ -75,9 +75,12 @@ def check_yaml_grid_complete() -> None:
     cfg = yaml.safe_load(YAML.read_text())
     specs = cfg["research"]["strategies"]
     assert specs, "yaml grid is empty"
-    # A runner-capture/tp_sl cell must exist; no time_exit cells ship anymore.
+    # A staged_trail runner-riding cell must exist (the live exit shape);
+    # no time_exit cells ship anymore. tp_sl baseline was removed from the
+    # grid 2026-10-29 per the user's runner-riding-only directive — the
+    # fixed +20/-20 caps upside and cannot ride a runner.
     names = {s["name"] for s in specs}
-    assert {"tp_sl", "staged_trail"}.issubset(names), names
+    assert {"staged_trail"}.issubset(names), names
     assert not any(s["kind"] == "time_exit" for s in specs), names
 
     with tempfile.TemporaryDirectory() as td:
