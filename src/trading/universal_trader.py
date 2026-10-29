@@ -270,6 +270,9 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         # is "staged_trail" or the strategies ledger simulates it).
         trail_initial_tp_share: float = 0.4,
         trail_initial_tp_pct: float = 0.25,
+        trail_second_tp_share: float = 0.0,
+        trail_second_tp_pct: float = 0.0,
+        trail_tp1_floor_pct: float = 0.0,
         trail_arm_pct: float = 0.10,
         trail_trail_pct: float = 0.08,
         trail_hard_stop_pct: float = 0.20,
@@ -761,6 +764,9 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         self.trail10_hard_stop_pct = trail10_hard_stop_pct
         self.trail_initial_tp_share = float(trail_initial_tp_share)
         self.trail_initial_tp_pct = float(trail_initial_tp_pct)
+        self.trail_second_tp_share = float(trail_second_tp_share)
+        self.trail_second_tp_pct = float(trail_second_tp_pct)
+        self.trail_tp1_floor_pct = float(trail_tp1_floor_pct)
         self.trail_arm_pct = float(trail_arm_pct)
         self.trail_trail_pct = float(trail_trail_pct)
         self.trail_hard_stop_pct = float(trail_hard_stop_pct)

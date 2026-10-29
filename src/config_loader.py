@@ -499,7 +499,8 @@ _KNOWN_SECTION_KEYS: dict[str, set[str]] = {
     "trade": {
         "buy_amount", "buy_slippage", "sell_slippage", "shadow_mode",
         "exit_strategy", "exit_mode", "trail_initial_tp_share",
-        "trail_initial_tp_pct", "trail_arm_pct", "trail_trail_pct",
+        "trail_initial_tp_pct", "trail_second_tp_share", "trail_second_tp_pct",
+        "trail_tp1_floor_pct", "trail_arm_pct", "trail_trail_pct",
         "trail_hard_stop_pct", "trail", "max_hold_time", "price_check_interval",
         "quote_amounts", "stuck_sweep_interval", "tp_ranges", "sl_ranges",
         "take_profit_percentage", "stop_loss_percentage",

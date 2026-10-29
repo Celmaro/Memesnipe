@@ -200,6 +200,9 @@ async def start_bot(config_path: str):
                 "trail_initial_tp_share", 0.4
             ),
             trail_initial_tp_pct=cfg["trade"].get("trail_initial_tp_pct", 0.25),
+            trail_second_tp_share=cfg["trade"].get("trail_second_tp_share", 0.0),
+            trail_second_tp_pct=cfg["trade"].get("trail_second_tp_pct", 0.0),
+            trail_tp1_floor_pct=cfg["trade"].get("trail_tp1_floor_pct", 0.0),
             trail_arm_pct=cfg["trade"].get("trail_arm_pct", 0.10),
             trail_trail_pct=cfg["trade"].get("trail_trail_pct", 0.08),
             trail_hard_stop_pct=cfg["trade"].get("trail_hard_stop_pct", 0.20),

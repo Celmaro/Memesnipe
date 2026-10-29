@@ -40,12 +40,16 @@ class TrailExitState:
     entry_price: float
     initial_tp_share: float = 0.4
     initial_tp_pct: float = 0.25
+    second_tp_share: float = 0.0
+    second_tp_pct: float = 0.0
     arm_pct: float = 0.10
     trail_pct: float = 0.08
     hard_stop_pct: float = 0.20
+    tp1_floor_pct: float = 0.0
     peak_price: float = field(init=False)
     floor_price: float = field(init=False)
     initial_tp_fired: bool = field(init=False, default=False)
+    second_tp_fired: bool = field(init=False, default=False)
     armed: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
@@ -54,6 +58,15 @@ class TrailExitState:
         if not 0 <= self.initial_tp_share <= 1.0:
             raise ValueError(
                 f"initial_tp_share must be in [0, 1]: {self.initial_tp_share!r}"
+            )
+        if not 0 <= self.second_tp_share <= 1.0:
+            raise ValueError(
+                f"second_tp_share must be in [0, 1]: {self.second_tp_share!r}"
+            )
+        if self.initial_tp_share + self.second_tp_share > 1.0:
+            raise ValueError(
+                "initial_tp_share + second_tp_share must be <= 1.0: "
+                f"{self.initial_tp_share} + {self.second_tp_share}"
             )
         self.peak_price = self.entry_price
         self.floor_price = self.entry_price * (1 - self.hard_stop_pct)
@@ -64,7 +77,8 @@ class TrailExitState:
         Order of checks (cheapest first):
         - below the armed floor -> exit all (trail floor)
         - below the hard stop while never armed -> exit all
-        - initial TP level touched -> sell a share, start arming
+        - initial TP level touched -> sell a share, lock the post-TP1 floor
+        - second TP level touched -> sell another share (runner protection)
         - new high -> raise the floor, arm at +arm_pct, hold
         - otherwise hold
 
@@ -87,6 +101,13 @@ class TrailExitState:
             if current_price >= tp_level:
                 self.initial_tp_fired = True
                 self.peak_price = max(self.peak_price, current_price)
+                # Post-TP1 floor: a banked TP must not be given back. Lock
+                # at entry (+ round-trip costs when tp1_floor_pct > 0) even
+                # before the +arm_pct trigger would normally arm.
+                self.floor_price = max(
+                    self.floor_price,
+                    self.entry_price * (1 + self.tp1_floor_pct),
+                )
                 return TrailDecision(
                     "sell_share",
                     "initial_tp",
@@ -94,7 +115,29 @@ class TrailExitState:
                     price=current_price,
                 )
 
-        # 4. New high: raise peak, activate the floor, trail it.
+        # 4. Second take-profit share (runner protection). Share is a
+        # fraction of the REMAINING position: second_tp_share is defined
+        # against the ORIGINAL position, so convert (e.g. 0.3 of original
+        # after 0.4 was sold at TP1 -> 0.5 of the remaining 0.6).
+        if (
+            self.initial_tp_fired
+            and not self.second_tp_fired
+            and self.second_tp_share > 0
+        ):
+            tp2_level = self.entry_price * (1 + self.second_tp_pct)
+            if current_price >= tp2_level:
+                self.second_tp_fired = True
+                self.peak_price = max(self.peak_price, current_price)
+                remaining = 1.0 - self.initial_tp_share
+                share = self.second_tp_share / remaining if remaining > 0 else 0.0
+                return TrailDecision(
+                    "sell_share",
+                    "second_tp",
+                    share=min(1.0, share),
+                    price=current_price,
+                )
+
+        # 5. New high: raise peak, activate the floor, trail it.
         if current_price > self.peak_price:
             self.peak_price = current_price
             if not self.armed and current_price >= self.entry_price * (
@@ -109,5 +152,5 @@ class TrailExitState:
                 self.floor_price = new_floor
             return TrailDecision("hold", "new_high", price=current_price)
 
-        # 5. Ordinary tick: hold.
+        # 6. Ordinary tick: hold.
         return TrailDecision("hold", "", price=current_price)
