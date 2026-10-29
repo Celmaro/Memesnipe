@@ -274,6 +274,13 @@ class SolanaClient:
         self.durable_nonce_account = durable_nonce_account
         self.alt_addresses = alt_addresses or []
         self._alt_cache: dict[str, tuple[float, AddressLookupTableAccount]] = {}
+        self._latest_blockhash = None
+        self._latest_blockhash_height = None
+        # T2.2 confirm-path dedup: parsed getTransaction results keyed by
+        # signature, reused by the token-balance / buy-details parsers so a
+        # trade that confirms then parses does not fetch the same tx twice.
+        self._tx_result_cache: dict[str, tuple[float, dict]] = {}
+        self._tx_result_cache_ttl = 60.0
         self._rate_limiter = TokenBucketRateLimiter(
             max_rps=max_rps, burst_size=burst_size
         )
@@ -966,6 +973,28 @@ class SolanaClient:
 
         return ConfirmationStatus.SUCCESS
 
+    async def _get_transaction_result_cached(
+        self,
+        signature: str | Signature,
+        budget_seconds: float = TX_RESULT_RETRY_BUDGET,
+    ) -> dict | None:
+        """Fetch a transaction result, reusing a recent one when available.
+
+        The confirm path already fetched it (see `_get_transaction_result`):
+        parsers like :meth:`get_buy_transaction_details` and
+        :meth:`get_transaction_token_balance` call this instead so a trade
+        that confirms then parses does not pay two getTransaction RPCs.
+        """
+        signature = str(signature)
+        cache = getattr(self, "_tx_result_cache", None)
+        if cache is not None:
+            hit = cache.get(signature)
+            if hit is not None and monotonic() - hit[0] < getattr(
+                self, "_tx_result_cache_ttl", 60.0
+            ):
+                return hit[1]
+        return await self._get_transaction_result(signature, budget_seconds)
+
     async def get_transaction_token_balance(
         self, signature: str | Signature, user_pubkey: Pubkey, mint: Pubkey
     ) -> int | None:
@@ -979,7 +1008,7 @@ class SolanaClient:
         Returns:
             Token balance (raw amount) after transaction, or None if not found
         """
-        result = await self._get_transaction_result(signature)
+        result = await self._get_transaction_result_cached(signature)
         if not result:
             return None
 
@@ -1026,7 +1055,7 @@ class SolanaClient:
         # Normalized up front: the log lines below slice it, which a Signature
         # does not support.
         signature = str(signature)
-        result = await self._get_transaction_result(signature)
+        result = await self._get_transaction_result_cached(signature)
         if not result:
             return None, None
 
@@ -1185,6 +1214,11 @@ class SolanaClient:
                         f"Transaction {signature[:16]}... became visible on "
                         f"attempt {attempts}"
                     )
+                # T2.2: share the fetched result with the parsers so a
+                # confirm-then-parse flow does not re-fetch the same tx.
+                cache = getattr(self, "_tx_result_cache", None)
+                if cache is not None and len(cache) < 64:
+                    cache[signature] = (monotonic(), result)
                 return result
 
             if monotonic() + TX_RESULT_RETRY_DELAY > deadline:
