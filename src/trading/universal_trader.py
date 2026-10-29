@@ -1474,27 +1474,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         """
         try:
             while True:
-                mints = set()
-                for key in list(getattr(self, "processed_tokens", set()) or set()) + [
-                    str(m) for m in getattr(self, "traded_mints", set())
-                ]:
-                    if key:
-                        mints.add(key)
-                # Also refresh mints seen by the detector queue (may not be
-                # processed yet): the gate should see fresh distribution
-                # before the buy, not only after.
-                queue_mints = set()
-                try:
-                    q = getattr(self, "token_queue", None)
-                    if q is not None and hasattr(q, "_queue"):
-                        for item in list(q._queue):  # noqa: SLF001
-                            mint = getattr(item, "mint", None)
-                            if mint:
-                                queue_mints.add(str(mint))
-                except Exception:
-                    pass
-                mints |= queue_mints
-                for mint in list(mints)[: self.max_tracked_tokens]:
+                for mint in self._refresh_target_mints():
                     await self._refresh_one_holder_snapshot(mint)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -1502,6 +1482,31 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         except Exception:
             logger.exception("Holder snapshot refresher stopped")
             raise
+
+    def _refresh_target_mints(self) -> list[str]:
+        """Mints both background refreshers visit, bounded by the cap.
+
+        Union of processed/traded mints plus whatever the detector queue
+        still holds (so a gate sees fresh data before the buy, not only
+        after), capped at `max_tracked_tokens`. Shared by the holder and
+        metadata refresh loops so their collection logic cannot drift.
+        """
+        mints = set()
+        for key in list(getattr(self, "processed_tokens", set()) or set()) + [
+            str(m) for m in getattr(self, "traded_mints", set())
+        ]:
+            if key:
+                mints.add(key)
+        try:
+            q = getattr(self, "token_queue", None)
+            if q is not None and hasattr(q, "_queue"):
+                for item in list(q._queue):  # noqa: SLF001
+                    mint = getattr(item, "mint", None)
+                    if mint:
+                        mints.add(str(mint))
+        except Exception:
+            pass
+        return list(mints)[: self.max_tracked_tokens]
 
     async def _refresh_one_holder_snapshot(self, mint: str) -> None:
         """Pull largest accounts + supply for one mint and store a snapshot."""
@@ -1534,22 +1539,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         """
         try:
             while True:
-                mints = set()
-                for key in list(getattr(self, "processed_tokens", set()) or set()) + [
-                    str(m) for m in getattr(self, "traded_mints", set())
-                ]:
-                    if key:
-                        mints.add(key)
-                try:
-                    q = getattr(self, "token_queue", None)
-                    if q is not None and hasattr(q, "_queue"):
-                        for item in list(q._queue):  # noqa: SLF001
-                            mint = getattr(item, "mint", None)
-                            if mint:
-                                mints.add(str(mint))
-                except Exception:
-                    pass
-                for mint in list(mints)[: self.max_tracked_tokens]:
+                for mint in self._refresh_target_mints():
                     await self._refresh_one_metadata_snapshot(mint)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -2114,6 +2104,28 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             f"Queued new token: {token_info.symbol} ({token_info.mint}) on {token_info.platform.value}"
         )
 
+    def _claim_queue_token(
+        self, token_info: TokenInfo, max_age: float, prefix: str = ""
+    ) -> float | None:
+        """Claim a queued token and apply the shared freshness gate.
+
+        Returns the token age when fresh, or None after recording a stale skip.
+        Queue ownership remains with the caller so each get/task_done pair
+        keeps its existing cancellation semantics.
+        """
+        token_key = str(token_info.mint)
+        self._queued_mints.discard(token_key)  # C3.3 enqueue dedupe
+        token_age = monotonic() - self.token_timestamps.get(token_key, monotonic())
+        if max_age > 0 and token_age > max_age:
+            logger.info(
+                f"{prefix}Skipping token {token_info.symbol} - too old "
+                f"({token_age:.1f}s queue wait > {max_age}s)"
+            )
+            metrics.incr("tokens.skipped_stale")
+            return None
+        self.processed_tokens.add(token_key)
+        return token_age
+
     async def _process_token_queue(self) -> None:
         """Continuously process tokens from the queue, only if they're fresh.
 
@@ -2129,35 +2141,17 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 token_info = await self.token_queue.get()
                 took_item = True
                 token_key = str(token_info.mint)
-                self._queued_mints.discard(token_key)  # C3.3 enqueue dedupe
                 metrics.set_gauge("token_queue.depth", self.token_queue.qsize())
                 metrics.incr("tokens.dequeued")
 
-                # Check if token is still "fresh". The freshness gate uses the
-                # local discovery time (self.token_timestamps), not the
-                # on-chain launch timestamp, so a backed-up queue cannot evict
-                # a coin that is genuinely new on-chain. The launch timestamp
-                # is recorded in self.token_launch_timestamps and surfaced in
-                # the skip log for diagnostics (its units are listener-owned).
-                current_time = monotonic()
-                token_age = current_time - self.token_timestamps.get(
-                    token_key, current_time
-                )
-
+                token_age = self._claim_queue_token(token_info, self.max_token_age)
                 launch_age = self.token_launch_timestamps.get(token_key)
                 age_note = (
                     f", launch_ts={launch_age:.3f}" if launch_age is not None else ""
                 )
 
-                if self.max_token_age > 0 and token_age > self.max_token_age:
-                    logger.info(
-                        f"Skipping token {token_info.symbol} - too old "
-                        f"({token_age:.1f}s queue wait{age_note} > {self.max_token_age}s)"
-                    )
-                    metrics.incr("tokens.skipped_stale")
+                if token_age is None:
                     continue
-
-                self.processed_tokens.add(token_key)
 
                 logger.info(
                     f"Processing fresh token: {token_info.symbol} (age: {token_age:.1f}s)"
@@ -2209,21 +2203,15 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         """
         while not self.token_queue.empty():
             token_info = await self.token_queue.get()
-            token_key = str(token_info.mint)
-            self._queued_mints.discard(token_key)  # C3.3 enqueue dedupe
             try:
-                token_age = monotonic() - self.token_timestamps.get(
-                    token_key, monotonic()
+                token_age = self._claim_queue_token(
+                    token_info, max_age, prefix="Drain: "
                 )
-                if max_age > 0 and token_age > max_age:
-                    logger.info(
-                        f"Drain: skipping {token_info.symbol} - too old ({token_age:.1f}s)"
-                    )
-                    metrics.incr("tokens.skipped_stale")
+                if token_age is None:
                     continue
-                self.processed_tokens.add(token_key)
                 logger.info(
-                    f"Drain: processing fresh token {token_info.symbol} (age: {token_age:.1f}s)"
+                    f"Drain: processing fresh token {token_info.symbol} "
+                    f"(age: {token_age:.1f}s)"
                 )
                 await self._handle_token(token_info)
             finally:
@@ -3754,77 +3742,71 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
     # ------------------------------------------------------------------
     # C7.2: durable unsold registry — serialize/rehydrate/persist helpers.
     # ------------------------------------------------------------------
+    @staticmethod
+    def _token_info_to_row(token_info: TokenInfo) -> dict[str, Any]:
+        """Serialize the TokenInfo half of a durable unsold row."""
+        pubkey_fields = (
+            "bonding_curve", "associated_bonding_curve", "pool_state",
+            "base_vault", "quote_vault", "global_config", "platform_config",
+            "user", "creator", "creator_vault", "token_program_id",
+            "quote_mint", "quote_token_program_id",
+        )
+        row: dict[str, Any] = {
+            "symbol": token_info.symbol,
+            "platform": token_info.platform.value,
+            "is_mayhem_mode": token_info.is_mayhem_mode,
+            "is_cashback_coin": token_info.is_cashback_coin,
+            "is_holder_reward": token_info.is_holder_reward,
+            "creator_fee_bps": token_info.creator_fee_bps,
+            "create_slot": token_info.create_slot,
+        }
+        row.update({
+            field: (str(value) if (value := getattr(token_info, field)) else None)
+            for field in pubkey_fields
+        })
+        return row
+
+    @staticmethod
+    def _token_info_from_row(row: dict[str, Any]) -> TokenInfo:
+        """Rebuild TokenInfo from the JSON-safe durable row fields."""
+        pubkey_fields = (
+            "bonding_curve", "associated_bonding_curve", "pool_state",
+            "base_vault", "quote_vault", "global_config", "platform_config",
+            "user", "creator", "creator_vault", "token_program_id",
+            "quote_mint", "quote_token_program_id",
+        )
+        kwargs: dict[str, Any] = {
+            "name": row.get("symbol", ""),
+            "symbol": row.get("symbol", ""),
+            "uri": "",
+            "mint": Pubkey.from_string(row["mint"]),
+            "platform": Platform(row.get("platform", Platform.PUMP_FUN.value)),
+            "is_mayhem_mode": bool(row.get("is_mayhem_mode", False)),
+            "is_cashback_coin": bool(row.get("is_cashback_coin", False)),
+            "is_holder_reward": bool(row.get("is_holder_reward", False)),
+            "creator_fee_bps": int(row.get("creator_fee_bps", 0) or 0),
+            "create_slot": int(row["create_slot"]) if row.get("create_slot") else None,
+        }
+        kwargs.update({
+            field: Pubkey.from_string(value) if (value := row.get(field)) else None
+            for field in pubkey_fields
+        })
+        return TokenInfo(**kwargs)
+
     def _serialize_unsold(self) -> list[dict]:
         """Serialize the unsold registry for JSON persistence.
 
         Pubkey and datetime are not JSON-native; both are losslessly
-        stringified here (and parsed back in `_rehydrate_unsold`). TokenInfo
-        carries everything a restart needs to re-derive the ATA and sell:
-        platform, bonding-curve/pool addresses, token program, quote mint.
+        stringified here (and parsed back in `_rehydrate_unsold`).
         """
         rows: list[dict] = []
         for key, (token_info, position) in self._unsold_positions.items():
-            rows.append(
+            # Class-bound call: verifier stubs (SimpleNamespace doubles) run
+            # the real helper without owning it as an instance attribute.
+            row = UniversalTrader._token_info_to_row(token_info)
+            row.update(
                 {
                     "mint": key,
-                    "symbol": token_info.symbol,
-                    "platform": token_info.platform.value,
-                    "bonding_curve": (
-                        str(token_info.bonding_curve)
-                        if token_info.bonding_curve
-                        else None
-                    ),
-                    "associated_bonding_curve": (
-                        str(token_info.associated_bonding_curve)
-                        if token_info.associated_bonding_curve
-                        else None
-                    ),
-                    "pool_state": (
-                        str(token_info.pool_state) if token_info.pool_state else None
-                    ),
-                    "base_vault": (
-                        str(token_info.base_vault) if token_info.base_vault else None
-                    ),
-                    "quote_vault": (
-                        str(token_info.quote_vault) if token_info.quote_vault else None
-                    ),
-                    "global_config": (
-                        str(token_info.global_config)
-                        if token_info.global_config
-                        else None
-                    ),
-                    "platform_config": (
-                        str(token_info.platform_config)
-                        if token_info.platform_config
-                        else None
-                    ),
-                    "user": str(token_info.user) if token_info.user else None,
-                    "creator": (
-                        str(token_info.creator) if token_info.creator else None
-                    ),
-                    "creator_vault": (
-                        str(token_info.creator_vault)
-                        if token_info.creator_vault
-                        else None
-                    ),
-                    "token_program_id": (
-                        str(token_info.token_program_id)
-                        if token_info.token_program_id
-                        else None
-                    ),
-                    "quote_mint": (
-                        str(token_info.quote_mint) if token_info.quote_mint else None
-                    ),
-                    "quote_token_program_id": (
-                        str(token_info.quote_token_program_id)
-                        if token_info.quote_token_program_id
-                        else None
-                    ),
-                    "is_mayhem_mode": token_info.is_mayhem_mode,
-                    "is_cashback_coin": token_info.is_cashback_coin,
-                    "is_holder_reward": token_info.is_holder_reward,
-                    "creator_fee_bps": token_info.creator_fee_bps,
-                    "create_slot": token_info.create_slot,
                     "entry_price": position.entry_price,
                     "quantity": position.quantity,
                     "entry_time": position.entry_time.isoformat(),
@@ -3838,6 +3820,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     "entered_watcher_at": time.time(),
                 }
             )
+            rows.append(row)
         return rows
 
     def _persist_unsold(self) -> None:
@@ -3878,85 +3861,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             for row in rows:
                 try:
                     mint = row["mint"]
-                    platform_name = row["platform"]
-                    platform = Platform(platform_name)
-                    info = TokenInfo(
-                        name=row.get("symbol", ""),
-                        symbol=row.get("symbol", ""),
-                        uri="",
-                        mint=Pubkey.from_string(mint),
-                        platform=platform,
-                        bonding_curve=(
-                            Pubkey.from_string(row["bonding_curve"])
-                            if row.get("bonding_curve")
-                            else None
-                        ),
-                        associated_bonding_curve=(
-                            Pubkey.from_string(row["associated_bonding_curve"])
-                            if row.get("associated_bonding_curve")
-                            else None
-                        ),
-                        pool_state=(
-                            Pubkey.from_string(row["pool_state"])
-                            if row.get("pool_state")
-                            else None
-                        ),
-                        base_vault=(
-                            Pubkey.from_string(row["base_vault"])
-                            if row.get("base_vault")
-                            else None
-                        ),
-                        quote_vault=(
-                            Pubkey.from_string(row["quote_vault"])
-                            if row.get("quote_vault")
-                            else None
-                        ),
-                        global_config=(
-                            Pubkey.from_string(row["global_config"])
-                            if row.get("global_config")
-                            else None
-                        ),
-                        platform_config=(
-                            Pubkey.from_string(row["platform_config"])
-                            if row.get("platform_config")
-                            else None
-                        ),
-                        user=(
-                            Pubkey.from_string(row["user"]) if row.get("user") else None
-                        ),
-                        creator=(
-                            Pubkey.from_string(row["creator"])
-                            if row.get("creator")
-                            else None
-                        ),
-                        creator_vault=(
-                            Pubkey.from_string(row["creator_vault"])
-                            if row.get("creator_vault")
-                            else None
-                        ),
-                        token_program_id=(
-                            Pubkey.from_string(row["token_program_id"])
-                            if row.get("token_program_id")
-                            else None
-                        ),
-                        quote_mint=(
-                            Pubkey.from_string(row["quote_mint"])
-                            if row.get("quote_mint")
-                            else None
-                        ),
-                        quote_token_program_id=(
-                            Pubkey.from_string(row["quote_token_program_id"])
-                            if row.get("quote_token_program_id")
-                            else None
-                        ),
-                        is_mayhem_mode=bool(row.get("is_mayhem_mode", False)),
-                        is_cashback_coin=bool(row.get("is_cashback_coin", False)),
-                        is_holder_reward=bool(row.get("is_holder_reward", False)),
-                        creator_fee_bps=int(row.get("creator_fee_bps", 0) or 0),
-                        create_slot=(
-                            int(row["create_slot"]) if row.get("create_slot") else None
-                        ),
-                    )
+                    # Class-bound call (same stub-compat reason as serialize).
+                    info = UniversalTrader._token_info_from_row(row)
                     position = Position(
                         mint=info.mint,
                         symbol=info.symbol,
