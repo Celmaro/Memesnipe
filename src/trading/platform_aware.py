@@ -454,18 +454,6 @@ class PlatformAwareBuyer(Trader):
                 success=False, platform=token_info.platform, error_message=str(e)
             )
 
-    def _get_pool_address(
-        self, token_info: TokenInfo, address_provider: AddressProvider
-    ) -> Pubkey:
-        """Get the pool/curve address, from token_info or derived."""
-        if token_info.platform == Platform.PUMP_FUN:
-            if hasattr(token_info, "bonding_curve") and token_info.bonding_curve:
-                return token_info.bonding_curve
-        elif token_info.pool_state:
-            return token_info.pool_state
-
-        return address_provider.derive_pool_address(token_info.mint)
-
     async def _read_token_balance(self, token_info: TokenInfo) -> float | None:
         """Read how many of a coin the wallet actually holds.
 
@@ -645,21 +633,6 @@ class PlatformAwareBuyer(Trader):
             f"Add platform-specific logic to _get_sol_destination() to specify where "
             f"SOL is transferred during buy transactions for this platform."
         )
-
-    def _get_cu_override(self, operation: str, platform: Platform) -> int | None:
-        """Get compute unit override from configuration.
-
-        Args:
-            operation: "buy" or "sell"
-            platform: Trading platform (unused - each config is platform-specific)
-
-        Returns:
-            CU override value if configured, None otherwise
-        """
-        if not self.compute_units:
-            return None
-
-        return self.compute_units.get(operation)
 
 
 class PlatformAwareSeller(Trader):
@@ -1172,33 +1145,3 @@ class PlatformAwareSeller(Trader):
                 error_message=f"Sell outcome unknown for {tx_signature}: {e}",
                 failure_reason=TradeFailureReason.UNCONFIRMED,
             )
-
-    def _get_pool_address(
-        self, token_info: TokenInfo, address_provider: AddressProvider
-    ) -> Pubkey:
-        """Get the pool/curve address for price calculations using platform-agnostic method."""
-        # Try to get the address from token_info first, then derive if needed
-        if token_info.platform == Platform.PUMP_FUN:
-            if hasattr(token_info, "bonding_curve") and token_info.bonding_curve:
-                return token_info.bonding_curve
-        elif token_info.pool_state:
-            return token_info.pool_state
-
-        # Fallback to deriving the address using platform provider
-        return address_provider.derive_pool_address(token_info.mint)
-
-    def _get_cu_override(self, operation: str, platform: Platform) -> int | None:
-        """Get compute unit override from configuration.
-
-        Args:
-            operation: "buy" or "sell"
-            platform: Trading platform (unused - each config is platform-specific)
-
-        Returns:
-            CU override value if configured, None otherwise
-        """
-        if not self.compute_units:
-            return None
-
-        # Just check for operation override (buy/sell)
-        return self.compute_units.get(operation)

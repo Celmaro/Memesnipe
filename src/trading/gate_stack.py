@@ -91,105 +91,13 @@ class GateStackMixin:
         # come from wallets with prior disposable-token history. The cadence
         # clock records every detected launch for the creator; a rate above
         # factory_deploy_rate refuses the coin. Off by default (0).
-        creator_key = str(token_info.creator or "") or (
-            str(token_info.user) if token_info.user else ""
-        )
-        # C4.3: the launch observation is recorded HERE via the idempotent
-        # per-mint hook — never in the dynamic pre-buy recheck — so a mint
-        # that is re-evaluated (detection, backfill, pre-buy) can never
-        # double-count its creator's cadence. Called on the class so
-        # verifier stubs (SimpleNamespace doubles) run the real hook.
-        # Lazy import: gate_stack is imported BY universal_trader, so a
-        # module-level import here would be circular.
+        # C4.3: record the launch observation exactly once. Dynamic gates
+        # are evaluated by the helper below, avoiding a second identical
+        # factory/rug/coordination/wash pass in this detection call.
+        # Lazy import avoids a gate_stack -> universal_trader cycle.
         from trading.universal_trader import UniversalTrader
 
         UniversalTrader._record_creator_launch(self, token_info)
-        # Factory gate read: the trailing-hour window was just fed by the
-        # hook. A lone observation is still None (R5-P2-2 requires >= 2
-        # launches before a rate), so a creator's first launch never trips
-        # this gate.
-        if self.factory_deploy_rate > 0:
-            from screening.rug_score import cadence_mints_per_hour
-
-            window = self._creator_launch_ts.get(creator_key, [])
-            cadence = cadence_mints_per_hour(window, monotonic())
-            if cadence is not None and cadence > self.factory_deploy_rate:
-                return (
-                    f"creator {creator_key[:12]}... is a factory "
-                    f"({cadence:.1f} mints/hr > {self.factory_deploy_rate})"
-                )
-        # R4-P1-1: multi-dimensional rug-risk score (0 = off). Weighted sum
-        # over the features this path already has locally (creator cadence,
-        # holder snapshot, early-buyer set) — NO new RPC on the hot path.
-        # C4.7: the score refuses (None) when feature coverage is below
-        # min_coverage instead of treating unknowns as benign 0 — missing
-        # data must NOT read as a pass. This path observes 4 of 6
-        # dimensions (cadence, holder gini/top10, buyer set); curve
-        # progress and dev balance are not fed here, so the coverage bar
-        # is 0.6 (4/6): a coin it cannot score is REFUSED, never waved
-        # through. Calibrated on replay; ships off.
-        if self.rug_score_threshold > 0:
-            from screening.rug_score import (
-                RugScoreInput,
-                compute_rug_score,
-                rug_score_reason,
-            )
-
-            snap = self._holder_store.get(str(token_info.mint))
-            buyers = self._rug_buyers.get(str(token_info.mint))
-            # R5-P2-2: reuse the same cadence barrier — a lone observation
-            # is None, not 60/h, so the rug score never sees the artifact.
-            from screening.rug_score import cadence_mints_per_hour
-
-            window = self._creator_launch_ts.get(creator_key, [])
-            cadence_hr = cadence_mints_per_hour(window, monotonic())
-            score = compute_rug_score(
-                RugScoreInput(
-                    creator_cadence_mints_per_hour=cadence_hr,
-                    holder_gini=snap.gini if snap else None,
-                    top10_fraction=snap.top10_fraction if snap else None,
-                    unique_buyers=len(buyers) if buyers else None,
-                    # curve progress + dev balance unknown on this path:
-                    # pass None (excluded from coverage; see C4.7 note).
-                ),
-                min_coverage=0.6,
-            )
-            if score is None:
-                return (
-                    "rug score refused (feature coverage below 4/6: "
-                    f"cadence {cadence_hr if cadence_hr is not None else 0:.1f}/hr, "
-                    f"holders {snap.unique_holders if snap else 0}, "
-                    f"buyers {len(buyers) if buyers else 0})"
-                )
-            reason = rug_score_reason(score, self.rug_score_threshold)
-            if reason:
-                return (
-                    f"{reason} (cadence {cadence_hr if cadence_hr is not None else 0:.1f}/hr, "
-                    f"holders {snap.unique_holders if snap else 0}, "
-                    f"buyers {len(buyers) if buyers else 0})"
-                )
-        # R4-P1-3: insider-coordination supply gate (0 = off). Fraction of
-        # the mint's early buyers that co-fire across >= 3 OTHER launches is
-        # a coordination signal (MELT 36.5% average). Fail-open: no
-        # observations -> share 0.
-        if self.max_coordinated_supply_share > 0:
-            share = self._cofire.coordinated_share(str(token_info.mint))
-            if share > self.max_coordinated_supply_share:
-                return (
-                    f"insider-coordination: {share:.1%} of early buyers "
-                    f"co-fire across launches "
-                    f"(max_coordinated_supply_share="
-                    f"{self.max_coordinated_supply_share:.1%})"
-                )
-        # R4-P1-6: wash-trade share gate (0 = off). Recent quote volume from
-        # wallets that round-trip the same mint = fake volume (2507.01963).
-        if self.max_wash_share > 0:
-            wash = self._wash_lpi.wash_share(str(token_info.mint))
-            if wash > self.max_wash_share:
-                return (
-                    f"wash-trading: {wash:.1%} of quote volume is "
-                    f"round-trip (max_wash_share={self.max_wash_share:.1%})"
-                )
         if (
             self.allowed_quote_mints is not None
             and quote_mint not in self.allowed_quote_mints

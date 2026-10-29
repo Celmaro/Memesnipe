@@ -98,7 +98,11 @@ def main() -> None:
         f"-> {r2}",
     )
 
-    # Probe 2: dynamic re-eval fires on FRESH wash data pre-buy.
+    # Probe 2: dynamic re-eval fires on FRESH wash data pre-buy. The
+    # R5-P0-2 split puts the data-dependent gates in
+    # `_dynamic_screening_reason` — the pre-buy recheck entry — so this
+    # probe calls that helper directly (detection already proved the
+    # static path above).
     class _Wash:
         def wash_share(self, _mint: str) -> float:
             return 0.9  # fresh observation says 90% round-trip volume
@@ -106,7 +110,7 @@ def main() -> None:
     t3 = _trader()
     t3._wash_lpi = _Wash()  # noqa: SLF001
     t3.max_wash_share = 0.3  # 0.9 > 0.3 -> should refuse
-    reason = UniversalTrader._skip_reason(t3, _token())
+    reason = UniversalTrader._dynamic_screening_reason(t3, _token())
     check("dynamic wash gate fires on fresh data", reason is not None and "wash" in reason, f"-> {reason}")
 
     # Probe 3: dynamic re-eval does NOT re-record creator cadence.

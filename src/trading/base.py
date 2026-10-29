@@ -7,7 +7,12 @@ from typing import Any
 from solders.pubkey import Pubkey
 
 # Import from interfaces to avoid duplication
-from interfaces.core import Platform, TokenInfo, TradeFailureReason
+from interfaces.core import (
+    AddressProvider,
+    Platform,
+    TokenInfo,
+    TradeFailureReason,
+)
 
 
 @dataclass
@@ -47,6 +52,10 @@ class TradeResult:
 class Trader(ABC):
     """Enhanced base interface for trading operations with platform support."""
 
+    # CU overrides per operation ("buy"/"sell"); concrete traders set this
+    # from config in __init__.
+    compute_units: dict[str, int]
+
     @abstractmethod
     async def execute(self, token_info: TokenInfo, *args, **kwargs) -> TradeResult:
         """Execute trading operation.
@@ -58,6 +67,38 @@ class Trader(ABC):
             TradeResult with operation outcome including platform info
         """
         pass
+
+    def _get_pool_address(
+        self, token_info: TokenInfo, address_provider: "AddressProvider"
+    ) -> Pubkey:
+        """Get the pool/curve address, from token_info or derived.
+
+        Shared by the buyer and seller paths: the curve address is a
+        property of the token, not of the operation being performed.
+        """
+        if token_info.platform == Platform.PUMP_FUN:
+            if hasattr(token_info, "bonding_curve") and token_info.bonding_curve:
+                return token_info.bonding_curve
+        elif token_info.pool_state:
+            return token_info.pool_state
+
+        # Fallback to deriving the address using platform provider
+        return address_provider.derive_pool_address(token_info.mint)
+
+    def _get_cu_override(self, operation: str, platform: Platform) -> int | None:
+        """Get compute unit override from configuration.
+
+        Args:
+            operation: "buy" or "sell"
+            platform: Trading platform (unused - each config is platform-specific)
+
+        Returns:
+            CU override value if configured, None otherwise
+        """
+        if not self.compute_units:
+            return None
+
+        return self.compute_units.get(operation)
 
     def _get_relevant_accounts(self, token_info: TokenInfo) -> list[Pubkey]:
         """Get the list of accounts relevant for calculating the priority fee.
