@@ -273,7 +273,7 @@ class SolanaClient:
         # R3-P2-2/R3-P2-3: durable nonce + ALTs (off by default).
         self.durable_nonce_account = durable_nonce_account
         self.alt_addresses = alt_addresses or []
-        self._alt_cache_ts: dict[str, float] = {}
+        self._alt_cache: dict[str, tuple[float, AddressLookupTableAccount]] = {}
         self._rate_limiter = TokenBucketRateLimiter(
             max_rps=max_rps, burst_size=burst_size
         )
@@ -831,17 +831,21 @@ class SolanaClient:
         loaded: list[AddressLookupTableAccount] = []
         now = monotonic()
         for alt_b58 in self.alt_addresses:
-            # 60s cache per table.
-            ts = self._alt_cache_ts.get(alt_b58, 0.0)
-            if now - ts < 60.0:
+            # 60s cache per table: a hit returns the parsed table without a
+            # re-read (the message needs the bytes, not just a freshness
+            # stamp, so the cache holds the table itself).
+            cached = self._alt_cache.get(alt_b58)
+            if cached is not None and now - cached[0] < 60.0:
+                loaded.append(cached[1])
                 continue
             try:
                 pk = Pubkey.from_string(alt_b58)
                 info = await self.get_account_info(pk)
                 if not info or not info.data:
                     continue
-                loaded.append(AddressLookupTableAccount.from_bytes(info.data))
-                self._alt_cache_ts[alt_b58] = now
+                table = AddressLookupTableAccount.from_bytes(info.data)
+                self._alt_cache[alt_b58] = (now, table)
+                loaded.append(table)
             except Exception:  # noqa: BLE001
                 logger.warning("ALT %s could not be loaded; skipping", alt_b58)
                 continue

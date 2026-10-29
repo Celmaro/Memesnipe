@@ -39,7 +39,7 @@ def check(name: str, ok: bool, extra: str = "") -> None:
 
 
 class FakeClient:
-    async def post_rpc(self, body: dict):
+    async def post_rpc(self, body: dict, deadline_seconds: float | None = None):
         # 10 entries so the 70th-percentile quantiles(n=10)[-3] is defined.
         return {"result": [{"prioritizationFee": 250_000}] * 10}
 

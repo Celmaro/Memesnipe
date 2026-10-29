@@ -28,7 +28,9 @@ class DynamicPriorityFee(PriorityFeePlugin):
         """
         self.client = client
         self.cache_ttl = cache_ttl
-        self._cache: tuple[float, tuple[str, ...], int | None] | None = None
+        # Keyed on the accounts tuple: buy and sell pass different account
+        # lists, so a single-entry cache would miss on every alternate send.
+        self._cache: dict[tuple[str, ...], tuple[float, int | None]] = {}
 
     async def get_priority_fee(
         self, accounts: list[Pubkey] | None = None
@@ -47,13 +49,14 @@ class DynamicPriorityFee(PriorityFeePlugin):
         ) if accounts else ()
         now = time.monotonic()
 
-        if self._cache is not None:
-            cached_at, cache_key, cached_fee = self._cache
-            if key == cache_key and (now - cached_at) < self.cache_ttl:
-                return cached_fee
+        cached = self._cache.get(key)
+        if cached is not None and (now - cached[0]) < self.cache_ttl:
+            return cached[1]
 
         fee = await self._fetch_fee(accounts)
-        self._cache = (now, key, fee)
+        self._cache[key] = (now, fee)
+        if len(self._cache) > 16:  # bounded: at most a few account shapes
+            self._cache = {key: (now, fee)}
         return fee
 
     async def _fetch_fee(self, accounts: list[Pubkey] | None = None) -> int | None:
@@ -65,7 +68,9 @@ class DynamicPriorityFee(PriorityFeePlugin):
                 "params": [[str(account) for account in accounts]] if accounts else [],
             }
 
-            response = await self.client.post_rpc(body)
+            # A stalled endpoint must not hold up the buy: bound the sample at
+            # 1.5s. On timeout the caller falls back to the fixed fee.
+            response = await self.client.post_rpc(body, deadline_seconds=1.5)
             if not response or "result" not in response:
                 logger.error(
                     "Failed to fetch recent prioritization fees: invalid response"

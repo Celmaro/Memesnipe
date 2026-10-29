@@ -104,7 +104,7 @@ async def test_alt_loading() -> list[str]:
     client = FakeClient({alt_addr: b"\x01" * 120})
     sc = SolanaClient.__new__(SolanaClient)
     sc.alt_addresses = [alt_addr]
-    sc._alt_cache_ts = {}  # noqa: SLF001
+    sc._alt_cache = {}  # noqa: SLF001
     sc.get_account_info = client.get_account_info  # noqa: SLF001
 
     # The client decodes real on-chain data via solders.from_bytes; the
@@ -131,7 +131,7 @@ async def test_alt_loading() -> list[str]:
     missing_addr = str(_Kp().pubkey())
     sc2 = SolanaClient.__new__(SolanaClient)
     sc2.alt_addresses = [missing_addr]
-    sc2._alt_cache_ts = {}  # noqa: SLF001
+    sc2._alt_cache = {}  # noqa: SLF001
     sc2.get_account_info = FakeClient({}).get_account_info  # noqa: SLF001
     tables2 = await sc2._lookup_tables()  # noqa: SLF001
     check("unreadable ALT skipped", tables2 == [])

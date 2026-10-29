@@ -1022,6 +1022,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             except Exception:
                 logger.exception("Stuck-token sweep: wallet scan failed")
                 continue
+            traded = {str(m) for m in self.traded_mints}
             for acct in accounts:
                 try:
                     mint = acct.get("mint")
@@ -1032,7 +1033,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     if (
                         key in self.processed_tokens
                         or key in self._unsold_positions
-                        or key in {str(m) for m in self.traded_mints}
+                        or key in traded
                     ):
                         continue
                     # Orphaned: not tracked anywhere. Build a minimal TokenInfo
