@@ -77,29 +77,35 @@ async def start_bot(config_path: str):
                 cfg["rpc_endpoint"],
                 cfg.get("node", {}).get("max_rps", 25),
             )
-            samples: list[float] = []
-            for _ in range(3):
-                start = datetime.now()
-                slot = await probe.get_slot()
-                dt = (datetime.now() - start).total_seconds() * 1000.0
-                if slot is not None:
-                    samples.append(dt)
-            if samples:
-                avg = sum(samples) / len(samples)
-                logger.info(
-                    f"RPC latency self-test: avg {avg:.0f} ms "
-                    f"({len(samples)} get_slot samples)"
-                )
-                if avg > 200:
-                    logger.warning(
-                        f"RPC latency {avg:.0f} ms > 200 ms — snipe latency "
-                        f"will lose races; consider a co-located/dedicated "
-                        f"endpoint (5-15 ms Yellowstone gRPC co-located)"
+            try:
+                samples: list[float] = []
+                for _ in range(3):
+                    start = datetime.now()
+                    slot = await probe.get_slot()
+                    dt = (datetime.now() - start).total_seconds() * 1000.0
+                    if slot is not None:
+                        samples.append(dt)
+                if samples:
+                    avg = sum(samples) / len(samples)
+                    logger.info(
+                        f"RPC latency self-test: avg {avg:.0f} ms "
+                        f"({len(samples)} get_slot samples)"
                     )
+                    if avg > 200:
+                        logger.warning(
+                            f"RPC latency {avg:.0f} ms > 200 ms — snipe latency "
+                            f"will lose races; consider a co-located/dedicated "
+                            f"endpoint (5-15 ms Yellowstone gRPC co-located)"
+                        )
+                    else:
+                        logger.info("RPC latency within the 200 ms snipe budget")
                 else:
-                    logger.info("RPC latency within the 200 ms snipe budget")
-            else:
-                logger.error("RPC latency self-test: get_slot never succeeded")
+                    logger.error("RPC latency self-test: get_slot never succeeded")
+            finally:
+                # The probe owns aiohttp sessions + a blockhash updater task;
+                # close it so startup doesn't leak 2 sessions + 0.2 rps of the
+                # rate-limit budget for the whole process lifetime.
+                await probe.close()
         except Exception:
             logging.exception("Startup latency self-test failed (non-fatal)")
 

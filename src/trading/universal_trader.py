@@ -2650,6 +2650,11 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     if self.shadow_capture is not None:
                         fee_fields = await self._fee_estimate_fields()
                         race_fields = await self._race_kpi_fields(token_info)
+                        # One pool-state read shared by both shadow writers
+                        # (the strategies ledger is beside sim_open, so a single
+                        # snapshot avoids a duplicate get_pool_state RPC per
+                        # shadow buy on the entry hot path).
+                        snapshot = await self._pool_snapshot(token_info)
                         self.shadow_capture.sim_open(
                             mint=str(token_info.mint),
                             symbol=token_info.symbol,
@@ -2657,7 +2662,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                             price=sim_price,
                             amount_tokens=sim_amount,
                             quote_spent=sim_quote,
-                            pool_snapshot=await self._pool_snapshot(token_info),
+                            pool_snapshot=snapshot,
                             **fee_fields,
                             **race_fields,
                         )
@@ -2672,7 +2677,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                                 entry_price=sim_price,
                                 amount_tokens=sim_amount,
                                 quote_spent=sim_quote,
-                                pool_snapshot=await self._pool_snapshot(token_info),
+                                pool_snapshot=snapshot,
                                 **fee_fields,
                                 **race_fields,
                             )
@@ -4062,8 +4067,6 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     del self._unsold_positions[key]
                     self._persist_unsold()  # C7.2
                     entered.pop(key, None)
-            if self._unsold_positions:
-                await asyncio.sleep(self.persistent_exit_interval)
 
 
     def _get_pool_address(self, token_info: TokenInfo) -> Pubkey:

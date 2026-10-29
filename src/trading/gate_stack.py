@@ -203,15 +203,6 @@ class GateStackMixin:
             token_info, "is_holder_reward", False
         ):
             return "holder-reward coin (holder_reward_mode=skip)"
-        # Static config gates (creation-time fields; can never change between
-        # detection and buy, so they live here, not in the pre-buy recheck).
-        if (
-            self.allowed_quote_mints is not None
-            and quote_mint not in self.allowed_quote_mints
-        ):
-            return f"quote mint {quote_mint} not in allowed_quote_mints"
-        if quote_mint not in self.quote_amounts:
-            return f"no buy amount configured for quote mint {quote_mint}"
         if (
             self.max_transfer_fee_bps is not None
             and token_info.transfer_fee_bps > self.max_transfer_fee_bps
@@ -220,6 +211,8 @@ class GateStackMixin:
                 f"transfer fee {token_info.transfer_fee_bps} bps exceeds "
                 f"max_transfer_fee_bps {self.max_transfer_fee_bps}"
             )
+        # Static config gates (creation-time fields; can never change between
+        # detection and buy, so they live here, not in the pre-buy recheck).
         return self._dynamic_screening_reason(token_info, quote_mint)
 
     def _dynamic_screening_reason(

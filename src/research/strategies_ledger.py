@@ -78,13 +78,15 @@ def _tp_sl_evaluator(entry_price: float, **cfg: Any) -> Any:
 
 def _staged_trail_evaluator(entry_price: float, **cfg: Any) -> Any:
     """The staged-then-trail rule; wraps TrailExitState as an evaluator."""
+    # Fallback defaults mirror the LIVE config (bots/memesnipe.yaml trade.*);
+    # a partial spec must not silently evaluate a historical exit policy.
     st = TrailExitState(
         entry_price=entry_price,
         initial_tp_share=float(cfg.get("initial_tp_share", 0.4)),
-        initial_tp_pct=float(cfg.get("initial_tp_pct", 0.25)),
+        initial_tp_pct=float(cfg.get("initial_tp_pct", 0.20)),
         arm_pct=float(cfg.get("arm_pct", 0.10)),
-        trail_pct=float(cfg.get("trail_pct", 0.08)),
-        hard_stop_pct=float(cfg.get("hard_stop_pct", 0.20)),
+        trail_pct=float(cfg.get("trail_pct", 0.12)),
+        hard_stop_pct=float(cfg.get("hard_stop_pct", 0.25)),
     )
 
     class _StagedSim:
