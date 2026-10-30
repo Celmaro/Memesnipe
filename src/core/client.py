@@ -1368,9 +1368,13 @@ class SolanaClient:
                 logger.warning(f"RPC request {method} exceeded its {deadline}")
                 break
 
+            request_started: float | None = None
             try:
                 await self._rate_limiter.acquire()
                 session = await self._get_session()
+                metrics.incr("rpc.requests")
+                metrics.incr(f"rpc.method.{method}")
+                request_started = monotonic()
 
                 async with session.post(
                     self.rpc_endpoint,
@@ -1378,6 +1382,10 @@ class SolanaClient:
                     headers=self._rpc_headers or None,
                 ) as response:
                     if response.status == HTTP_TOO_MANY_REQUESTS:
+                        metrics.incr("rpc.http_429")
+                        if request_started is not None:
+                            metrics.record("rpc.latency", monotonic() - request_started)
+                            request_started = None
                         rate_limit_attempts += 1
                         if rate_limit_attempts >= max_429_retries:
                             logger.error(
@@ -1409,9 +1417,16 @@ class SolanaClient:
                         continue
 
                     response.raise_for_status()
-                    return await response.json()
+                    result = await response.json()
+                    metrics.incr("rpc.success")
+                    if request_started is not None:
+                        metrics.record("rpc.latency", monotonic() - request_started)
+                    return result
 
             except aiohttp.ContentTypeError:
+                metrics.incr("rpc.errors")
+                if request_started is not None:
+                    metrics.record("rpc.latency", monotonic() - request_started)
                 logger.exception(f"Failed to decode RPC response for {method}")
                 break
 
@@ -1420,6 +1435,9 @@ class SolanaClient:
             # here every RPC timeout propagated out of post_rpc unretried and
             # crashed the caller with an exception whose str() is empty.
             except (TimeoutError, aiohttp.ClientError):
+                metrics.incr("rpc.errors")
+                if request_started is not None:
+                    metrics.record("rpc.latency", monotonic() - request_started)
                 error_attempts += 1
                 if error_attempts >= max_retries:
                     logger.exception(
