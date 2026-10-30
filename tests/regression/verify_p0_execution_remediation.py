@@ -32,6 +32,7 @@ This verifier pins the FIXED contracts (R5-P0-1):
 
 import asyncio
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -186,6 +187,7 @@ def _trader(**overrides) -> UniversalTrader:
     # exit-engine wiring
     t._trail_states = {}
     t._trail_exit_attempts = {}
+    t._unreadable_curves = {}
     t.trail_initial_tp_share = 0.4
     t.trail_initial_tp_pct = 0.20
     t.trail_second_tp_share = 0.30
@@ -411,37 +413,175 @@ def main() -> int:
             rt._state_path = p
             rt.record_buy(0.01)
             rt.record_buy(0.01)
-            # A fresh trader boot restores open_positions=2, then config
-            # caps override the limits (3) but the RUNNING counters survive.
-            t = _trader()
-            loaded = RiskTracker.load_from(p)
+            # Live evidence 2026-10-30: restoring open_positions from disk
+            # AND adding rehydrated inventory each boot double-accumulated
+            # (32 open vs cap 3) and deadlocked every new buy. A fresh boot
+            # must re-derive open_positions from actual held inventory
+            # (rehydrate/sweeper), while the durable capital guards (budget,
+            # realized loss) survive the restart.
+            loaded = RiskTracker.load_from(p)  # disk: spend=0.02, open=2
             loaded.max_concurrent_positions = 3  # config wins for limit
-            return loaded.open_positions == 2 and loaded.max_concurrent_positions == 3
-    check("risk config-wins-for-limit, disk-wins-for-counters", risk3())
+            loaded.open_positions = 0  # boot semantics: no live monitors yet
+            return (
+                loaded.open_positions == 0
+                and loaded.max_concurrent_positions == 3
+                and _eps(loaded.session_spend_sol, 0.02)
+            )
+    check("risk config-wins-for-limit, boot re-derives open_positions", risk3())
 
-    # --- Risk: rehydrated unsold inventory occupies concurrency slots -------
+    # --- Risk: liquidation queue never touches the concurrent cap ----------
     async def risk4():
-        # The durable unsold registry is loaded at boot; every recovered
-        # position holds wallet capital and MUST occupy a risk slot, so the
-        # bot does not stack new buys on top of inventory still liquidating.
+        # Live evidence 2026-10-30: counting rehydrated/swept inventory
+        # against max_concurrent_positions wedged every new buy until the
+        # stale orphans cleared (never, for closed curves) — the exact
+        # opposite of the fixing loop. Recovery rows are a LIQUIDATION QUEUE:
+        # covering their PnL into realized loss is the durable guard
+        # (budget + loss limit persist across restarts), not slot counting.
         t = _trader()
         t.risk_tracker = RiskTracker(max_concurrent_positions=3)
         t.risk_tracker._state_path = None
         t.risk_tracker.record_buy(0.01)
         t.risk_tracker.record_buy(0.01)  # 2 live slots used
-        # Simulate _rehydrate_unsold finding 2 recovered positions.
-        recovered = 2
-        t.risk_tracker.open_positions += recovered  # 4 >= cap 3
-        blocked_while_recovered = t.risk_tracker.buy_allowed is False
-        # Slots are released on a successful watcher sell / TTL giveaway.
-        t.risk_tracker.record_close(0.0)
-        t.risk_tracker.record_close(0.0)  # 2 live remain
-        return (
-            blocked_while_recovered
-            and t.risk_tracker.open_positions == 2
-            and t.risk_tracker.buy_allowed is True  # freed below cap again
+        t.risk_tracker.record_buy(0.01)  # 3 live; cap reached
+        blocked_at_cap = t.risk_tracker.buy_allowed is False
+        # A liquidation-queue sell banks PnL WITHOUT releasing a slot:
+        # cap stays full (3 live), realized loss becomes truthful.
+        liq = Position(
+            mint=Pubkey.from_string(
+                "7nNvYvWZkGYLDdZrcYnQZXy4S2H3R6Gvh3RMgxCZqSHX"
+            ),
+            symbol="LIQ",
+            entry_price=1.0,
+            quantity=1.0,
+            entry_time=datetime.utcnow(),
         )
-    check("risk rehydrated inventory counts toward cap", asyncio.run(risk4()))
+        liq.is_liquidation_recovery = True
+        t._risk_record_close(liq, -0.05)
+        live_still_blocked = t.risk_tracker.buy_allowed is False
+        loss_still_truthful = _eps(t.risk_tracker.realized_pnl_sol, -0.05)
+        # A live position's close releases its slot normally.
+        live = Position(
+            mint=Pubkey.from_string(
+                "9Kc1HLTKS79C8JmGc2aXDTT6V8LxEkXFXkoCsWmD5nSX"
+            ),
+            symbol="LIVE",
+            entry_price=1.0,
+            quantity=1.0,
+            entry_time=datetime.utcnow(),
+        )
+        t._risk_record_close(live, 0.01)
+        freed = (
+            t.risk_tracker.open_positions == 2
+            and t.risk_tracker.buy_allowed is True
+            and _eps(t.risk_tracker.realized_pnl_sol, -0.04)
+        )
+        return blocked_at_cap and live_still_blocked and loss_still_truthful and freed
+    check("risk liquidation queue banks PnL w/o slot release", asyncio.run(risk4()))
+
+    # --- Risk: zero entry price must not fabricate realized PnL -------------
+    def zero_entry_degrades():
+        # Live evidence 2026-10-30: rehydrated orphans carry entry_price=0;
+        # (sold - 0) * qty fabricated +0.49 SOL of fake realized win and gave
+        # the daily-loss kill-switch false headroom. The close path must
+        # degrade the tail leg to 0.0 and bank only already-recorded legs.
+        from trading.exit_engine import _realized_pnl_for_close
+
+        p = Position(
+            mint=Pubkey.from_string("11111111111111111111111111111111"),
+            symbol="ZERO",
+            entry_price=0.0,
+            quantity=1000.0,
+            entry_time=datetime.utcnow(),
+        )
+        degraded = _realized_pnl_for_close(p, 99.0, 1000.0)  # 99000 if unguarded
+        p2 = Position(
+            mint=Pubkey.from_string("11111111111111111111111111111111"),
+            symbol="BANKED",
+            entry_price=1.0,
+            quantity=100.0,
+            entry_time=datetime.utcnow(),
+        )
+        p2.realized_pnl_quote = 0.25  # banked legs always survive
+        blended = _realized_pnl_for_close(p2, 1.1, 100.0)  # 0.25 + 10.0
+        return (
+            _eps(degraded, 0.0)
+            and _eps(banked_ok := _realized_pnl_for_close(p2, 0.0, 100.0), 0.25)
+            and _eps(blended, 10.25)
+        )
+    check("risk zero entry price degrades realized PnL", zero_entry_degrades())
+
+    # --- Risk: boot must NOT restore open_positions from disk ---------------
+    def risk5_boot_reset():
+        # Live evidence 2026-10-30: persisting open_positions AND adding the
+        # rehydrated inventory each boot double-accumulated across restarts
+        # (32 open from 10 real orphans -> every buy deadlocked on the cap).
+        # The trader init sets open_positions = 0 after load_from; budget and
+        # loss limits restore. Rehydrate/sweeper then count ACTUAL holdings.
+        with tempfile.TemporaryDirectory() as d:
+            p = str(Path(d) / "risk.json")
+            rt = RiskTracker(max_concurrent_positions=3)
+            rt._state_path = p
+            rt.record_buy(0.01)
+            rt.record_buy(0.01)  # persisted open_positions=2, spend=0.02
+            rt.record_close(0.003)
+            loaded = RiskTracker.load_from(p)
+            # Boot semantics (mirrors the trader init): limits from config,
+            # durable spend/loss from disk, open_positions re-derived to 0.
+            loaded.max_concurrent_positions = 3
+            loaded.open_positions = 0
+            return (
+                loaded.open_positions == 0
+                and abs(loaded.session_spend_sol - 0.02) < 1e-9
+                and abs(loaded.realized_pnl_sol - 0.003) < 1e-9
+                and loaded.max_concurrent_positions == 3
+            )
+    check("boot resets open_positions, keeps spend/loss", risk5_boot_reset())
+
+    # --- Negative cache: unreadable curve skips re-reads for 300s ----------
+    async def neg_cache():
+        # Live evidence 2026-10-30: every watcher interval re-read a closed
+        # curve (get_pool_state -> ValueError + traceback). After one
+        # unreadable verdict, the helper must serve the negative result from
+        # cache without any further curve read for 300s.
+        from interfaces.core import Platform
+
+        t = _trader()
+
+        class ExplodingCurveManager:
+            def __init__(self):
+                self.reads = 0
+
+            async def get_pool_state(self, pool, commitment=None):
+                self.reads += 1
+                raise ValueError("curve closed")
+
+        cm = ExplodingCurveManager()
+        impls = SimpleNamespace(address_provider=_FakeProvider(), curve_manager=cm)
+
+        def fake_get(platform, client):
+            return impls
+
+        import trading.exit_engine as _ee
+
+        orig_ee = _ee.get_platform_implementations
+        _ee.get_platform_implementations = fake_get
+        try:
+            token = _token()
+            token.platform = Platform.PUMP_FUN
+            token.bonding_curve = None
+            token.creator = None
+            token.creator_vault = None
+            first = await t._ensure_sellable_orphan(token)
+            second = await t._ensure_sellable_orphan(token)  # cached
+            return (
+                first is False
+                and second is False
+                and cm.reads == 1
+                and str(token.mint) in t._unreadable_curves
+            )
+        finally:
+            _ee.get_platform_implementations = orig_ee
+    check("unreadable curve cached 300s (1 RPC)", asyncio.run(neg_cache()))
 
     # --- Watcher: STOP verdict keeps the position in the registry ------------
     async def watcher_stop():

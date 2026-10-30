@@ -782,6 +782,10 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         # episodes. The old path passed attempt=1 on every tick, so the
         # persistent watcher handoff could never be reached.
         self._trail_exit_attempts: dict[str, int] = {}
+        # Un-enrichable curves (closed/graduated): mint -> monotonic ts. The
+        # persistent watcher retries every interval; without this the closed
+        # curve is re-read (and traceback-logged) on every attempt until TTL.
+        self._unreadable_curves: dict[str, float] = {}
         self.take_profit_percentage = take_profit_percentage
         self.stop_loss_percentage = stop_loss_percentage
         # R3-P1-2: staged exits. Parse once at construction; [] = feature off
@@ -881,14 +885,25 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         self._metadata_store = MetadataStore()
         # R3-P2-10: session risk guards (off by default: 0).
         # P0 restart reconciliation: restore the persisted session counters
-        # (open positions, spend, realized PnL) so a restart cannot reset the
+        # (session spend, realized PnL) so a restart cannot reset the
         # exposure/loss guards to zero while the wallet still holds positions.
+        # open_positions is NOT restored (see the assignment below — rehydrate
+        # and the sweeper count actual held inventory instead, so the cap
+        # cannot be double-accumulated across restarts).
         # Config values are authoritative for the LIMITS; the persisted file
-        # contributes the RUNNING counters.
+        # contributes the RUNNING spend/loss counters.
         from trading.risk_guard import RiskTracker
 
         self.risk_tracker = RiskTracker.load_from("state/risk_state.json")
         self.risk_tracker._state_path = "state/risk_state.json"  # noqa: SLF001
+        # open_positions is deliberately NOT restored from disk: persisting it
+        # AND adding the rehydrated inventory each boot double-accumulates
+        # across restarts (observed live: 32 open from 10 actual orphans,
+        # deadlocking every buy against the cap). The durable guards are
+        # budget_sol + daily_loss_limit_sol (restored above); the concurrency
+        # counter is re-derived from what this boot actually holds —
+        # rehydrated registry rows and sweeper-found orphans.
+        self.risk_tracker.open_positions = 0
         self.risk_tracker.max_concurrent_positions = max_concurrent_positions or 0
         self.risk_tracker.daily_loss_limit_sol = daily_loss_limit_sol or 0.0
         self.risk_tracker.budget_sol = budget_sol or 0.0
@@ -1086,6 +1101,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                         entry_price=0.0,
                         quantity=float(balance) / 1e6,
                     )
+                    # Recovery inventory; never took a concurrency slot.
+                    position.is_liquidation_recovery = True
                     logger.warning(
                         f"Stuck-token sweep found orphan {token_info.symbol} "
                         f"({key[:16]}...); handing to persistent exit watcher"
@@ -4098,6 +4115,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                         )
                         continue
                     self._unsold_positions[mint] = (info, position)
+                    position.is_liquidation_recovery = True
                     recovered += 1
                 except Exception:
                     logger.exception(
@@ -4108,23 +4126,13 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     f"Rehydrated {recovered} unsold position(s) from "
                     f"{self._unsold_persist_path}; re-arming persistent watcher"
                 )
-                # P0 restart reconciliation: recovered positions hold real
-                # wallet capital, so they MUST occupy the same concurrency
-                # slots as live positions — otherwise the bot stacks new buys
-                # on top of inventory still being liquidated (the audit's
-                # "restore risk exposure from persisted positions on startup").
-                # Slots are released when the watcher sells a recovered
-                # position (record_close) or gives up at TTL expiry.
-                try:
-                    self.risk_tracker.open_positions += recovered
-                    self.risk_tracker._maybe_persist()  # noqa: SLF001
-                    logger.warning(
-                        f"Risk tracker open_positions += {recovered} for "
-                        f"rehydrated inventory (now "
-                        f"{self.risk_tracker.open_positions})"
-                    )
-                except Exception:
-                    logger.exception("Failed to count rehydrated inventory in risk tracker")
+                # R5-P0-1: rehydrated inventory is a LIQUIDATION QUEUE, not a
+                # live position — it never takes a concurrency slot. Counting
+                # it against the cap deadlocked every new buy until the stale
+                # orphans cleared (live evidence 2026-10-30: 32 open vs 3).
+                # Durable capital guards are budget_sol + realized loss, both
+                # persisted in risk_state.json across restarts. The watcher
+                # banks their realized PnL with record_liquidation_close.
                 if self._unsold_watcher_task is None or self._unsold_watcher_task.done():
                     self._unsold_watcher_task = asyncio.create_task(
                         self._unsold_position_watcher()
@@ -4159,10 +4167,12 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     del self._unsold_positions[key]
                     self._persist_unsold()  # C7.2
                     # The position is no longer being watched; release the
-                    # concurrency slot even though the wallet residual remains
-                    # for the periodic sweeper to rediscover.
+                    # concurrency slot if it held one (live handoffs took a
+                    # slot at buy; liquidation-queue rows never did), even
+                    # though the wallet residual remains for the periodic
+                    # sweeper to rediscover.
                     try:
-                        self.risk_tracker.record_close(0.0)
+                        self._risk_record_close(position, 0.0)
                     except Exception:
                         logger.exception("Failed to release expired unsold risk slot")
                     continue

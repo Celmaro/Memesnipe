@@ -60,6 +60,13 @@ class Position:
     # protection advisory fires once for this position.
     _advisory_fired: bool = False
 
+    # R5-P0-1: liquidation-queue marker. True for rehydrated registry rows
+    # and sweeper-found orphans — recovery inventory that never took a
+    # concurrency slot this session. The exit engine banks their realized
+    # PnL via record_liquidation_close (no slot release) instead of
+    # record_close. Live buys keep this False.
+    is_liquidation_recovery: bool = False
+
     @classmethod
     def create_from_buy_result(
         cls,

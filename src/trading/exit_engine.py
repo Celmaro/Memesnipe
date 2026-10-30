@@ -84,8 +84,42 @@ def _exit_sell_verdict_for(reason: TradeFailureReason | None) -> ExitSellVerdict
     return None
 
 
+def _realized_pnl_for_close(
+    position: Position, price: float | None, quantity: float
+) -> float:
+    """Blend banked legs with the tail leg's realized PnL for a close.
+
+    Zero/unset entry prices degrade the tail leg to 0.0: rehydrated orphans
+    carry entry_price=0, and (sold - 0) * qty fabricates fake realized wins
+    (observed live: +0.49 SOL of phantom profit giving the daily-loss
+    kill-switch dangerous headroom). Banked-leg PnL is always kept.
+    """
+    banked = getattr(position, "realized_pnl_quote", 0.0) or 0.0
+    entry = getattr(position, "entry_price", None)
+    if not entry or entry <= 0 or not price or price <= 0 or not quantity:
+        return banked
+    return banked + (price - entry) * quantity
+
+
 class ExitEngineMixin:
     """Position-exit methods mixed into UniversalTrader (C12.3)."""
+
+    def _risk_record_close(
+        self, position: Position, realized_pnl_sol: float
+    ) -> None:
+        """Record a final close in the risk tracker, slot-aware.
+
+        Live positions took a concurrency slot at record_buy, so their close
+        releases it (record_close). Liquidation-queue positions (rehydrated
+        registry rows, sweeper-found orphans) never took a slot this session
+        — their close banks realized PnL via record_liquidation_close so the
+        loss limit stays truthful without ever wedging or over-releasing the
+        concurrent cap.
+        """
+        if getattr(position, "is_liquidation_recovery", False):
+            self.risk_tracker.record_liquidation_close(realized_pnl_sol)
+        else:
+            self.risk_tracker.record_close(realized_pnl_sol)
 
     def _log_attempt(
         self,
@@ -315,6 +349,18 @@ class ExitEngineMixin:
             # targets exactly the sweeper/rehydrate path and leaves every
             # normal exit untouched (zero-crash, zero extra RPC).
             return True
+        mint_key = str(token_info.mint)
+
+        def _mark_unreadable() -> None:
+            try:
+                getattr(self, "_unreadable_curves", {})[mint_key] = monotonic()
+            except Exception:
+                pass
+        last_fail = getattr(self, "_unreadable_curves", {}).get(mint_key)
+        if last_fail is not None and monotonic() - last_fail < 300:
+            # Closed/graduated curve already confirmed this window; skip the
+            # RPC re-read. The watcher TTL bounds the total retry budget.
+            return False
         try:
             implementations = get_platform_implementations(
                 token_info.platform, self.solana_client
@@ -324,39 +370,57 @@ class ExitEngineMixin:
             pool = token_info.bonding_curve or provider.derive_bonding_curve_v2(
                 token_info.mint
             )
-            token_info.bonding_curve = pool
             token_program = getattr(token_info, "token_program_id", None)
+            # Commit ONLY at the end: half-mutating bonding_curve before the
+            # curve read makes the NEXT call early-return True and the sell
+            # crash on the still-missing creator_vault (verified live).
+            creator = token_info.creator
+            if creator is None:
+                state = await curve_manager.get_pool_state(pool)
+                creator_raw = state.get("creator") or state.get(
+                    "creator_address", ""
+                )
+                if not creator_raw:
+                    logger.warning(
+                        "Curve for %s has no creator; orphan stays un-sellable",
+                        token_info.symbol,
+                    )
+                    _mark_unreadable()
+                    return False
+                creator = (
+                    Pubkey.from_string(str(creator_raw))
+                    if not isinstance(creator_raw, Pubkey)
+                    else creator_raw
+                )
+            creator_vault = token_info.creator_vault or provider.derive_creator_vault(
+                creator
+            )
+            if creator_vault is None:
+                logger.warning(
+                    "Could not derive creator_vault for %s", token_info.symbol
+                )
+                _mark_unreadable()
+                return False
+            # Atomic commit: only now are all v2 sell fields available.
+            token_info.bonding_curve = pool
             token_info.associated_bonding_curve = (
                 provider.derive_associated_bonding_curve(
                     token_info.mint,
                     pool,
                     token_program or SystemAddresses.TOKEN_2022_PROGRAM,
                 )
+                if token_info.associated_bonding_curve is None
+                else token_info.associated_bonding_curve
             )
-            if getattr(token_info, "creator", None) is None:
-                state = await curve_manager.get_pool_state(pool)
-                creator_raw = state.get("creator") or state.get(
-                    "creator_address", ""
-                )
-                if creator_raw:
-                    token_info.creator = (
-                        Pubkey.from_string(str(creator_raw))
-                        if not isinstance(creator_raw, Pubkey)
-                        else creator_raw
-                    )
-                    token_info.creator_vault = provider.derive_creator_vault(
-                        token_info.creator
-                    )
-            elif getattr(token_info, "creator_vault", None) is None:
-                token_info.creator_vault = provider.derive_creator_vault(
-                    token_info.creator
-                )
+            token_info.creator = creator
+            token_info.creator_vault = creator_vault
+            return True
         except Exception:
+            _mark_unreadable()
             logger.warning(
                 "Could not enrich orphan TokenInfo for %s; sell skipped this "
                 "round (curve unreadable)",
                 token_info.symbol,
-                exc_info=True,
             )
             return False
         # Enrichment may end with fields still unset if the curve state had
@@ -493,8 +557,10 @@ class ExitEngineMixin:
                 )
         # Reduce position quantity by the ACTUAL sold amount (keep entry
         # price). C4.8: bank the leg's realized PnL BEFORE shrinking quantity
-        # so the final close can report the blended result.
-        leg_realized = (sold_price - position.entry_price) * sold_amount
+        # so the final close can report the blended result. A zero entry
+        # price (rehydrated orphans) degrades the leg to 0.0 — selling a
+        # token whose entry is unknown must not fabricate realized PnL.
+        leg_realized = _realized_pnl_for_close(position, sold_price, sold_amount)
         position.realized_pnl_quote += leg_realized
         remaining_after = position.quantity - sold_amount
         position.quantity = max(0.0, remaining_after)
@@ -503,7 +569,7 @@ class ExitEngineMixin:
         # close records its own tail + decrements).
         try:
             if remaining_after <= 0.0:
-                self.risk_tracker.record_close(leg_realized)
+                self._risk_record_close(position, leg_realized)
             else:
                 self.risk_tracker.record_partial_close(leg_realized)
         except Exception:
@@ -756,15 +822,16 @@ class ExitEngineMixin:
             # R3-P2-10: track REALIZED PnL for the risk guards — recovered
             # from the actual fill, not the pre-sell estimate (the estimate
             # only reflects the trigger price and can understate the loss).
-            # Banked staged legs are included via real_pnl_quote.
-            realized_pnl = position.realized_pnl_quote + (
-                (sold_price - position.entry_price) * actual_sold
+            # Banked staged legs are included; zero entry price degrades the
+            # tail leg (see _realized_pnl_for_close).
+            realized_pnl = _realized_pnl_for_close(
+                position, sold_price, actual_sold
             )
             position.realized_pnl_quote = realized_pnl
             try:
-                self.risk_tracker.record_close(realized_pnl)
+                self._risk_record_close(position, realized_pnl)
             except Exception:
-                self.risk_tracker.record_close(0.0)
+                self._risk_record_close(position, 0.0)
 
             logger.info(f"Successfully exited position: {exit_reason.value}")
             self._log_trade(
@@ -816,15 +883,16 @@ class ExitEngineMixin:
             logger.info(f"Position for {token_info.symbol} closed by a late fill")
             # Record the close in the risk tracker with the best PnL evidence
             # available (the floored price; the actual fill was never read).
-            # Banked staged legs are included.
-            realized_pnl = position.realized_pnl_quote + (
-                (price - position.entry_price) * position.quantity
+            # Banked staged legs are included; zero entry price degrades the
+            # tail leg to 0.0 (same rule as the confirmed-fill path).
+            realized_pnl = _realized_pnl_for_close(
+                position, price, position.quantity
             )
             position.realized_pnl_quote = realized_pnl
             try:
-                self.risk_tracker.record_close(realized_pnl)
+                self._risk_record_close(position, realized_pnl)
             except Exception:
-                self.risk_tracker.record_close(0.0)
+                self._risk_record_close(position, 0.0)
             await self._record_creator_pnl(token_info, position)
             await self._cleanup_after_exit(token_info)
         elif verdict is ExitSellVerdict.STOP:

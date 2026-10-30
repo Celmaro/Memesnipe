@@ -63,6 +63,22 @@ class RiskTracker:
         self.history.append(f"partial-close {realized_pnl_sol:+.6f}")
         self._maybe_persist()
 
+    def record_liquidation_close(self, realized_pnl_sol: float) -> None:
+        """Bank a liquidation-queue sell's realized PnL WITHOUT a slot release.
+
+        Rehydrated and sweeper-found orphans never took a concurrency slot
+        this session (they are recovery inventory, not live buys), so their
+        final sell must bank PnL — the loss limit stays truthful — but must
+        NOT decrement open_positions. Decrementing would either go negative
+        (clamped) or, worse, release a LIVE position's slot and let the bot
+        exceed the concurrent cap (the live-deadlock seen on 2026-10-30 was
+        the opposite error: inventory counted against the cap wedged every
+        buy until the stale orphans cleared).
+        """
+        self.realized_pnl_sol += realized_pnl_sol
+        self.history.append(f"liquidation-close {realized_pnl_sol:+.6f}")
+        self._maybe_persist()
+
     def record_spend(self, quote_spent_sol: float) -> None:
         """Register quote spent WITHOUT opening a tracked position.
 
