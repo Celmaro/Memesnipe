@@ -24,9 +24,16 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from core.pubkeys import WSOL_MINT, normalize_quote_mint, quote_symbol
+from core.pubkeys import (
+    SystemAddresses,
+    WSOL_MINT,
+    normalize_quote_mint,
+    quote_symbol,
+)
 from cleanup.modes import handle_cleanup_after_sell
-from interfaces.core import TokenInfo
+from interfaces.core import Platform, TokenInfo
+from platforms import get_platform_implementations
+from solders.pubkey import Pubkey
 from trading.base import TradeFailureReason, TradeResult
 from trading.position import ExitReason, Position
 from trading.trail_exit import TrailExitState
@@ -279,6 +286,68 @@ class ExitEngineMixin:
                 return True
         return fired_any
 
+    async def _ensure_sellable_orphan(self, token_info: TokenInfo) -> None:
+        """Best-effort enrich a wallet-derived TokenInfo so the sell can build.
+
+        Sweeper-found and rehydrated orphans only carry mint/platform/quote
+        basics — the pump.fun v2 sell requires bonding_curve, creator and
+        creator_vault, and without them `derive_quote_token_account` receives
+        None and every liquidation attempt crashes (observed live 2026-10-30,
+        46 tracebacks before the fleet was stopped).
+
+        The bonding-curve PDA is deterministic from the mint (zero RPC); the
+        creator (and thus creator_vault) comes from the curve state read,
+        which the curve manager caches. Fail-open: if the curve cannot be
+        read (graduated/closed), the subsequent sell attempt yields a normal
+        RETRY and the watcher TTL bounds the churn.
+        """
+        if getattr(token_info, "platform", None) != Platform.PUMP_FUN:
+            return
+        if token_info.bonding_curve and token_info.creator_vault:
+            return
+        try:
+            implementations = await get_platform_implementations(
+                token_info.platform, self.solana_client
+            )
+            provider = implementations.address_provider
+            curve_manager = implementations.curve_manager
+            pool = token_info.bonding_curve or provider.derive_bonding_curve_v2(
+                token_info.mint
+            )
+            token_info.bonding_curve = pool
+            token_program = getattr(token_info, "token_program_id", None)
+            token_info.associated_bonding_curve = (
+                provider.derive_associated_bonding_curve(
+                    token_info.mint,
+                    pool,
+                    token_program or SystemAddresses.TOKEN_2022_PROGRAM,
+                )
+            )
+            if getattr(token_info, "creator", None) is None:
+                state = await curve_manager.get_pool_state(pool)
+                creator_raw = state.get("creator") or state.get(
+                    "creator_address", ""
+                )
+                if creator_raw:
+                    token_info.creator = (
+                        Pubkey.from_string(str(creator_raw))
+                        if not isinstance(creator_raw, Pubkey)
+                        else creator_raw
+                    )
+                    token_info.creator_vault = provider.derive_creator_vault(
+                        token_info.creator
+                    )
+            elif getattr(token_info, "creator_vault", None) is None:
+                token_info.creator_vault = provider.derive_creator_vault(
+                    token_info.creator
+                )
+        except Exception:
+            logger.warning(
+                "Could not enrich orphan TokenInfo for %s; sell will retry",
+                token_info.symbol,
+                exc_info=True,
+            )
+
     async def _staged_partial_sell(
         self,
         token_info: TokenInfo,
@@ -345,6 +414,11 @@ class ExitEngineMixin:
                 f"@ {price:.3e} (no tx sent)"
             )
         else:
+            # Wallet-derived orphans may lack pump.fun v2 account fields
+            # (bonding_curve/creator_vault); enrich before building the
+            # instruction or the ATA derivation crashes with None (observed
+            # live 2026-10-30 as 46 tracebacks on liquidation attempts).
+            await self._ensure_sellable_orphan(token_info)
             # P0-1: partial sells ride the SAME serialization lock as buys and
             # full exits — a partial TP racing an in-flight buy/sell can corrupt
             # the WSOL wrap/unwrap balance exactly like the full-sell race the
@@ -550,6 +624,10 @@ class ExitEngineMixin:
                     )
         else:
             # R3-P2-13: serialize the exit sell against any in-flight buy.
+            # Wallet-derived orphans lack pump.fun v2 account fields that the
+            # instruction builder requires; enrich first (best-effort, cached
+            # curve read) or the sell crashes on None (2026-10-30 live).
+            await self._ensure_sellable_orphan(token_info)
             async with self._trade_serialization_lock:
                 sell_result = await self.seller.execute(
                     token_info,

@@ -40,6 +40,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from core.pubkeys import DEFAULT_PUBKEY
+from solders.pubkey import Pubkey
 from trading.base import TradeResult
 from trading.exit_engine import ExitSellVerdict
 from trading.position import Position
@@ -154,6 +155,7 @@ def _trader(**overrides) -> UniversalTrader:
     t._cleanup_after_exit = _cleanup_stub
     t._record_creator_pnl = _creator_stub
     t._read_price = None
+    t.solana_client = None
 
     # exit-engine wiring
     t._trail_states = {}
@@ -476,6 +478,90 @@ def main() -> int:
             and info.quote_mint == WSOL_MINT
         )
     check("rehydrate defaults missing token program ids", rehydrate_program_ids())
+
+    # --- Orphan enrichment: v2 sell fields derivable from mint + curve ------
+    async def orphan_enrichment():
+        # Live evidence 2026-10-30: liquidation of wallet-derived orphans
+        # crashed 46x because bonding_curve/creator_vault were None and the
+        # v2 sell account metas require them. _ensure_sellable_orphan must
+        # derive the pool PDA from the mint and pull creator from curve state.
+        from core.pubkeys import SystemAddresses
+        from interfaces.core import Platform
+        from platforms import get_platform_implementations
+
+        t = _trader()
+        # Fake curve state via the real curve manager? Cheaper: fabricate a
+        # provider + manager pair so the test pins the DERIVATION math, not
+        # the RPC layer.
+        token = _token()
+        token.platform = Platform.PUMP_FUN
+        token.bonding_curve = None
+        token.associated_bonding_curve = None
+        token.creator = None
+        token.creator_vault = None
+        token.token_program_id = SystemAddresses.TOKEN_2022_PROGRAM
+
+        calls = {"state_reads": 0}
+
+        class FakeProvider:
+            def derive_bonding_curve_v2(self, mint):
+                from platforms.pumpfun.address_provider import PumpFunAddresses
+
+                return PumpFunAddresses.find_bonding_curve_v2(mint)
+
+            def derive_associated_bonding_curve(self, mint, pool, token_program):
+                from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID
+
+                addr, _ = Pubkey.find_program_address(
+                    [bytes(pool), bytes(token_program), bytes(mint)],
+                    ASSOCIATED_TOKEN_PROGRAM_ID,
+                )
+                return addr
+
+            def derive_creator_vault(self, creator):
+                from platforms.pumpfun.address_provider import PumpFunAddresses
+
+                addr, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(creator)], PumpFunAddresses.PROGRAM
+                )
+                return addr
+
+        class FakeCurveManager:
+            async def get_pool_state(self, pool, commitment=None):
+                calls["state_reads"] += 1
+                return {"creator": str(SystemAddresses.TOKEN_2022_PROGRAM)}
+
+        import types as _types
+
+        impls = _types.SimpleNamespace(
+            address_provider=FakeProvider(), curve_manager=FakeCurveManager()
+        )
+
+        async def fake_get_platform_implementations(platform, client):
+            return impls
+
+        get_platform_implementations.__dict__
+        import platforms as _platforms_mod
+
+        orig = _platforms_mod.get_platform_implementations
+        _platforms_mod.get_platform_implementations = fake_get_platform_implementations
+        try:
+            # Rebind into the exit-engine module namespace too.
+            import trading.exit_engine as _ee
+
+            orig_ee = _ee.get_platform_implementations
+            _ee.get_platform_implementations = fake_get_platform_implementations
+            await t._ensure_sellable_orphan(token)
+            return (
+                token.bonding_curve is not None
+                and token.associated_bonding_curve is not None
+                and token.creator_vault is not None
+                and calls["state_reads"] == 1
+            )
+        finally:
+            _platforms_mod.get_platform_implementations = orig
+            _ee.get_platform_implementations = orig_ee
+    check("orphan enrich derives v2 sell fields", asyncio.run(orphan_enrichment()))
 
     if failures:
         print(f"\nR5-P0-1 FAILED ({len(failures)}): {failures}")
