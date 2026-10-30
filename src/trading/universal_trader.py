@@ -1481,10 +1481,10 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
     def _should_track_mint_buyers(self, mint: str) -> bool:
         """True only while the mint is a candidate or has an owned position."""
         return (
-            mint in self.token_timestamps
-            or mint in self._buy_reservations
-            or mint in self._active_exit_mints
-            or mint in self._unsold_positions
+            mint in getattr(self, "token_timestamps", {})
+            or mint in getattr(self, "_buy_reservations", set())
+            or mint in getattr(self, "_active_exit_mints", set())
+            or mint in getattr(self, "_unsold_positions", {})
         )
 
     def _clear_mint_tracking_state(self, mint: str) -> None:
