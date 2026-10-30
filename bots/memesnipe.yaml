@@ -183,7 +183,10 @@ trade:
   # buy/sell produced simulated fills; with it OFF the real buyer/seller fire.
   # Research capture (shadow_data/ + strategies ledger) stays ON in live mode
   # so every real trade is recorded for calibration.
-  shadow_mode: false # LIVE TRADING ON — real funds (0.01 SOL/buy, risk cut below). RPC-remediation code fixes landed without the branch's shadow flip; wallet must be refilled before buys can land.
+  # First rollout of the RPC/resource fix is read-only shadow mode. This
+  # exercises Geyser, queueing, price reads and telemetry without spending SOL.
+  # Re-arm live sends only after a stable provider window and explicit canary.
+  shadow_mode: true
 # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
 # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
 backfill:
@@ -237,8 +240,8 @@ jito:
 # R3-P2-10: session risk guards (0 = off). The loss limit blocks NEW buys
 # while sells still run — it never traps money in a falling position.
 risk:
-  # User-set live exposure cap; RPC remediation meters and cools all requests.
-  max_concurrent_positions: 10
+  # Temporary resource/risk cap for the shared 2-RPS endpoint.
+  max_concurrent_positions: 2
   daily_loss_limit_sol: 0.098 # ~$10 realized portfolio loss (SOL @ $102.15 on 2026-10-29): blocks NEW buys, sells still run (never traps money)
   budget_sol: 0.15 # user-set live cap (was 0 = off): total quote spent on buys this session
 
