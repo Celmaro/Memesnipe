@@ -16,7 +16,7 @@ from core.client import SolanaClient  # noqa: E402
 from interfaces.core import ConfirmationStatus  # noqa: E402
 
 SIGNATURE = (
-    "2bHRaovWyYNTX3K1KfMbMBSvefuT34ZExL2JjN83DDh9aB3Fynjyae5bcaCdRuQoihHAMHK4PzcRYoqc9hYypWb2"
+    "2bHRaovWyYNTX3K1KfMbMBSvefuT34ZExL2J2N83DDh9aB3Fynjyae5bcaCdRuQoihHAMHK4PzcRYoqc9hYypWb2"
 )
 
 
