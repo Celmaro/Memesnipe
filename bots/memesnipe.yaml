@@ -182,7 +182,10 @@ trade:
   # buy/sell produced simulated fills; with it OFF the real buyer/seller fire.
   # Research capture (shadow_data/ + strategies ledger) stays ON in live mode
   # so every real trade is recorded for calibration.
-  shadow_mode: false # LIVE TRADING ON — real funds (0.01 SOL/buy, risk cut below)
+  # First rollout of the RPC/resource fix is read-only shadow mode. This
+  # exercises Geyser, queueing, price reads and telemetry without spending SOL.
+  # Re-arm live sends only after a stable provider window and explicit canary.
+  shadow_mode: true
 # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
 # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
 backfill:
