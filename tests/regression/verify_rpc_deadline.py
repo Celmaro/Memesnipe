@@ -303,6 +303,30 @@ async def check_spent_deadline_sends_nothing() -> bool:
     )
 
 
+async def check_rate_limiter_wait_obeys_deadline() -> bool:
+    """A shared 429 cooldown must not outlive a latency-sensitive call budget."""
+    class SlowLimiter:
+        async def acquire(self) -> None:
+            await asyncio.sleep(5.0)
+
+        async def defer(self, _seconds: float) -> None:
+            pass
+
+    session = StubSession([StubResponse(200, {"result": "unexpected"})])
+    solana_client = _make_client(session)
+    solana_client._rate_limiter = SlowLimiter()  # noqa: SLF001
+    started = client_module.monotonic()
+    result = await solana_client.post_rpc(
+        BODY, deadline_seconds=0.05
+    )
+    elapsed = client_module.monotonic() - started
+    return _check(
+        "deadline: limiter/cooldown wait is included in the wall-clock budget",
+        result is None and session.requests == 0 and elapsed < 0.5,
+        f"{session.requests} HTTP request(s), {elapsed:.3f}s elapsed, 0.05s budget",
+    )
+
+
 async def check_success_is_unaffected() -> bool:
     """A deadline does not disturb the happy path.
 
@@ -369,6 +393,7 @@ async def main() -> None:
         await check_backoff_never_overshoots(),
         await check_429_honours_deadline(),
         await check_spent_deadline_sends_nothing(),
+        await check_rate_limiter_wait_obeys_deadline(),
         await check_success_is_unaffected(),
         await check_tx_result_passes_remaining_budget(),
     ]
