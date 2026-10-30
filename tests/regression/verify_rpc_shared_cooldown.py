@@ -50,10 +50,27 @@ async def check_cooldown_only_extends() -> bool:
     return passed
 
 
+async def check_cooldown_does_not_release_a_full_burst() -> bool:
+    limiter = TokenBucketRateLimiter(max_rps=100.0, burst_size=10)
+    await limiter.acquire()
+    await limiter.defer(0.05)
+
+    started = time.monotonic()
+    await asyncio.gather(*(limiter.acquire() for _ in range(10)))
+    elapsed = time.monotonic() - started
+    passed = elapsed >= 0.13
+    print(
+        f"[{'PASS' if passed else 'FAIL'}] cooldown does not release a full bucket "
+        f"(elapsed={elapsed:.3f}s, required>=0.130s)"
+    )
+    return passed
+
+
 async def main() -> None:
     results = [
         await check_cooldown_pauses_all_callers(),
         await check_cooldown_only_extends(),
+        await check_cooldown_does_not_release_a_full_burst(),
     ]
     print(
         f"\n{'ALL CHECKS PASSED' if all(results) else 'SOME CHECKS FAILED'} "
