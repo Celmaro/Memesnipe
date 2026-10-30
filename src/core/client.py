@@ -659,16 +659,17 @@ class SolanaClient:
         )
 
     async def get_token_accounts_by_owner_all_programs(
-        self, owner: Pubkey, commitment: str = "confirmed", retries: int = 3
+        self, owner: Pubkey, commitment: str = "confirmed", retries: int = 2
     ) -> list[dict]:
         """List token accounts across SPL and Token-2022 programs.
 
         The stuck sweeper needs Token-2022 coverage too: reward coins (and
         older dust like the DICE position) live under TokenzQdBNbLqP...
 
-        PublicNode intermittently answers token-account scans with HTTP 403
-        under load; retry each program's scan with backoff rather than
-        dropping the whole sweep on a transient.
+        Keep the retry budget deliberately small: a second full wallet scan
+        after a rate-limited request multiplies provider load. A failed program
+        scan is deferred to the next scheduled sweep rather than recursively
+        amplified here.
         """
         import asyncio as _asyncio
 
@@ -678,7 +679,10 @@ class SolanaClient:
             for attempt in range(retries):
                 try:
                     accounts = await self._token_accounts_raw(
-                        owner, prog, commitment=commitment
+                        owner,
+                        prog,
+                        commitment=commitment,
+                        deadline_seconds=8.0,
                     )
                 except Exception as error:  # noqa: BLE001
                     last_error = error
@@ -687,9 +691,10 @@ class SolanaClient:
                     continue
                 if accounts is None:
                     last_error = RuntimeError("token-account RPC returned no response")
-                    if attempt < retries - 1:
-                        await _asyncio.sleep(3 * (attempt + 1))
-                    continue
+                    # post_rpc has already exhausted its bounded retry/deadline
+                    # policy and armed the shared provider cooldown on 429.
+                    # Do not immediately issue another full scan.
+                    break
                 combined.extend(accounts)
                 break
             else:
@@ -704,6 +709,8 @@ class SolanaClient:
         owner: Pubkey,
         program_id: Pubkey,
         commitment: str = "confirmed",
+        *,
+        deadline_seconds: float = 8.0,
     ) -> list[dict] | None:
         """Raw jsonParsed token-account scan via post_rpc.
 
@@ -730,8 +737,9 @@ class SolanaClient:
                     {"encoding": "jsonParsed", "commitment": commitment},
                 ],
             },
-            max_retries=3,
-            max_429_retries=8,
+            max_retries=2,
+            max_429_retries=2,
+            deadline_seconds=deadline_seconds,
         )
         if response is None:
             return None
