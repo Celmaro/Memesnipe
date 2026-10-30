@@ -1467,6 +1467,35 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 self._own_trade_prompt.add(mint_key)
         return trade
 
+    def _clear_mint_tracking_state(self, mint: str) -> None:
+        """Drop transient per-mint screening/monitor state once it is no longer live.
+
+        The Geyser trade feed can see transactions for every mint on the
+        subscribed program, not just positions owned by this bot. Keep the
+        expensive per-wallet buyer map only while a mint is a tracked
+        candidate or an active/unsold position.
+        """
+        for name in (
+            "_rug_buyers",
+            "_creator_sellers",
+            "_rug_entry",
+            "_momentum_peak_rate",
+            "_momentum_peak_price",
+        ):
+            state = getattr(self, name, None)
+            if isinstance(state, dict):
+                state.pop(mint, None)
+        for name in ("_creator_sold_for_exit", "_own_trade_prompt"):
+            state = getattr(self, name, None)
+            if isinstance(state, set):
+                state.discard(mint)
+        graduated = getattr(self, "_graduated_mints", None)
+        if isinstance(graduated, set):
+            try:
+                graduated.discard(Pubkey.from_string(mint))
+            except ValueError:
+                pass
+
     def _holder_gates_on(self) -> bool:
         """R3-P1-5: whether either holder-concentration gate is configured."""
         return (
@@ -2096,6 +2125,14 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             )
             del self.token_timestamps[oldest_key]
             self.token_launch_timestamps.pop(oldest_key, None)
+            # A queued candidate that aged out is no longer used by screening.
+            # Preserve state for an in-flight buy, open position, or unsold tail.
+            if (
+                oldest_key not in self._buy_reservations
+                and oldest_key not in self._active_exit_mints
+                and oldest_key not in self._unsold_positions
+            ):
+                self._clear_mint_tracking_state(oldest_key)
             logger.debug(
                 f"Tracked-token cap ({self.max_tracked_tokens}) reached; "
                 f"dropping oldest {oldest_key[:12]}..."
@@ -2955,10 +2992,14 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         try:
             await self._tp_sl_exit_inner(token_info, buy_result)
         finally:
-            self._active_exit_mints.discard(str(token_info.mint))
+            mint_key = str(token_info.mint)
+            self._active_exit_mints.discard(mint_key)
             # trail states are per-position; a stale one would give a
             # re-opened mint the previous run's floor/peak
-            self._trail_states.pop(str(token_info.mint), None)
+            self._trail_states.pop(mint_key, None)
+            # The persistent unsold watcher needs TokenInfo + Position only;
+            # transient buyer/advisory maps are safe to release here too.
+            self._clear_mint_tracking_state(mint_key)
 
     async def _tp_sl_exit_inner(
         self, token_info: TokenInfo, buy_result: TradeResult
