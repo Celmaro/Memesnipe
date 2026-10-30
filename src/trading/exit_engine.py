@@ -104,6 +104,26 @@ def _realized_pnl_for_close(
 class ExitEngineMixin:
     """Position-exit methods mixed into UniversalTrader (C12.3)."""
 
+    def _risk_record_recovery(
+        self, token_info: TokenInfo, price: float | None, amount: float | None
+    ) -> None:
+        """Report GROSS SOL returned to the wallet from a close (WSOL only).
+
+        The unrecovered-spend loss guard needs money-back, not PnL: a held
+        position that dumped still counts its buy spend as at-risk until the
+        proceeds actually return. Non-WSOL quotes are skipped (spend is
+        tracked in quote units; mixing assets would corrupt the cut).
+        """
+        try:
+            if (
+                price
+                and amount
+                and normalize_quote_mint(token_info.quote_mint) == WSOL_MINT
+            ):
+                self.risk_tracker.record_recovery(price * amount)
+        except Exception:
+            pass
+
     def _risk_record_close(
         self, position: Position, realized_pnl_sol: float
     ) -> None:
@@ -566,12 +586,14 @@ class ExitEngineMixin:
         position.quantity = max(0.0, remaining_after)
         # P0-6: feed the risk guard the leg's REALIZED PnL (partial legs bank
         # realized results without closing a concurrency slot; the final
-        # close records its own tail + decrements).
+        # close records its own tail + decrements). R5-P0-3: also report the
+        # GROSS proceeds back so the unrecovered-spend cut sees money return.
         try:
             if remaining_after <= 0.0:
                 self._risk_record_close(position, leg_realized)
             else:
                 self.risk_tracker.record_partial_close(leg_realized)
+            self._risk_record_recovery(token_info, sold_price, sold_amount)
         except Exception:
             self.risk_tracker.record_partial_close(0.0)
         if remaining_after <= 0.0:
@@ -830,6 +852,7 @@ class ExitEngineMixin:
             position.realized_pnl_quote = realized_pnl
             try:
                 self._risk_record_close(position, realized_pnl)
+                self._risk_record_recovery(token_info, sold_price, actual_sold)
             except Exception:
                 self._risk_record_close(position, 0.0)
 
@@ -891,6 +914,7 @@ class ExitEngineMixin:
             position.realized_pnl_quote = realized_pnl
             try:
                 self._risk_record_close(position, realized_pnl)
+                self._risk_record_recovery(token_info, price, position.quantity)
             except Exception:
                 self._risk_record_close(position, 0.0)
             await self._record_creator_pnl(token_info, position)

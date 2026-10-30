@@ -3235,6 +3235,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                         )
                 # R3-P2-10: track realized PnL for the risk guards. The
                 # time-based path has the buy price; PnL = (sell-buy)*amount.
+                # R5-P0-3: also report GROSS proceeds so the
+                # unrecovered-spend cut sees this money return.
                 try:
                     _buy_px = buy_result.price or 0.0
                     _qty = sell_result.amount or buy_result.amount or 0.0
@@ -3244,6 +3246,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                         else 0.0
                     )
                     self.risk_tracker.record_close(_pnl)
+                    self._risk_record_recovery(token_info, sell_result.price, _qty)
                 except Exception:
                     self.risk_tracker.record_close(0.0)
                 self._log_trade(

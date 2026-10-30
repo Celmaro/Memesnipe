@@ -33,6 +33,15 @@ class RiskTracker:
     blocked_reason: str | None = None
     history: list[str] = field(default_factory=list)
 
+    # R5-P0-3: gross SOL recovered from closes (WSOL quote only). The loss
+    # guard used to check realized_pnl_sol alone, which stays positive while
+    # buys are still held — the wallet drained 19→12 USD with realized
+    # +0.0038 (live evidence 2026-10-30). Net unrecovered spend
+    # (session_spend - gross_recovered) is the truthful "portfolio down $X"
+    # cut: it counts money out vs money back regardless of whether a losing
+    # position was sold yet.
+    gross_recovered_sol: float = 0.0
+
     def record_buy(self, quote_spent_sol: float) -> bool:
         """Register a buy; returns False when a guard blocks it first."""
         reason = self._block_reason()
@@ -44,6 +53,21 @@ class RiskTracker:
         self.history.append(f"buy {quote_spent_sol:.6f}")
         self._maybe_persist()
         return True
+
+    def record_recovery(self, quote_received_sol: float) -> None:
+        """Bank SOL actually received back from a close (WSOL quote only).
+
+        Called alongside record_close / record_liquidation_close /
+        record_partial_close with the GROSS proceeds (sold_price * amount),
+        not the PnL — the unrecovered-spend guard needs money-back, not the
+        realized result, so held-but-dumped positions still count as spend
+        until their value actually returns to the wallet.
+        """
+        if not quote_received_sol or quote_received_sol <= 0:
+            return
+        self.gross_recovered_sol += quote_received_sol
+        self.history.append(f"recover {quote_received_sol:.6f}")
+        self._maybe_persist()
 
     def record_close(self, realized_pnl_sol: float) -> None:
         self.open_positions = max(0, self.open_positions - 1)
@@ -117,6 +141,7 @@ class RiskTracker:
             "budget_sol": self.budget_sol,
             "realized_pnl_sol": self.realized_pnl_sol,
             "session_spend_sol": self.session_spend_sol,
+            "gross_recovered_sol": self.gross_recovered_sol,
             "open_positions": self.open_positions,
             "blocked_reason": self.blocked_reason,
             "history": list(self.history[-500:]),
@@ -139,6 +164,9 @@ class RiskTracker:
         tracker.budget_sol = float(data.get("budget_sol", 0.0) or 0.0)
         tracker.realized_pnl_sol = float(data.get("realized_pnl_sol", 0.0) or 0.0)
         tracker.session_spend_sol = float(data.get("session_spend_sol", 0.0) or 0.0)
+        tracker.gross_recovered_sol = float(
+            data.get("gross_recovered_sol", 0.0) or 0.0
+        )
         tracker.open_positions = int(data.get("open_positions", 0) or 0)
         tracker.blocked_reason = data.get("blocked_reason")
         tracker.history = list(data.get("history", []) or [])
@@ -152,13 +180,25 @@ class RiskTracker:
                 f"max_concurrent_positions {self.max_concurrent_positions} "
                 f"reached ({self.open_positions} open)"
             )
-        if self.daily_loss_limit_sol > 0 and (
-            self.realized_pnl_sol <= -self.daily_loss_limit_sol
-        ):
-            return (
-                f"daily loss limit {-self.daily_loss_limit_sol:.4f} SOL hit "
-                f"(realized {self.realized_pnl_sol:+.4f})"
-            )
+        if self.daily_loss_limit_sol > 0:
+            # R5-P0-3: net unrecovered spend is the truthful portfolio-down
+            # cut. realized_pnl_sol alone stays positive while buys are held
+            # (live evidence 2026-10-30: 19→12 USD with realized +0.0038).
+            # Money out minus money back counts the damage whether or not
+            # the losing position was sold yet.
+            net_unrecovered = self.session_spend_sol - self.gross_recovered_sol
+            if net_unrecovered >= self.daily_loss_limit_sol:
+                return (
+                    f"daily loss limit {-self.daily_loss_limit_sol:.4f} SOL hit "
+                    f"(net unrecovered spend {net_unrecovered:.4f}: spent "
+                    f"{self.session_spend_sol:.4f}, recovered "
+                    f"{self.gross_recovered_sol:.4f})"
+                )
+            if self.realized_pnl_sol <= -self.daily_loss_limit_sol:
+                return (
+                    f"daily loss limit {-self.daily_loss_limit_sol:.4f} SOL hit "
+                    f"(realized {self.realized_pnl_sol:+.4f})"
+                )
         if self.budget_sol > 0 and self.session_spend_sol >= self.budget_sol:
             return (
                 f"budget {self.budget_sol:.4f} SOL spent "

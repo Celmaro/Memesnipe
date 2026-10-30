@@ -479,6 +479,35 @@ def main() -> int:
         return blocked_at_cap and live_still_blocked and loss_still_truthful and freed
     check("risk liquidation queue banks PnL w/o slot release", asyncio.run(risk4()))
 
+    # --- Risk: unrealized spend counts against the loss cut -----------------
+    def unrecovered_spend_guard():
+        # Live evidence 2026-10-30: the loss kill-switch only checked
+        # realized_pnl_sol, which stayed +0.0038 while 0.11 SOL went out to
+        # positions that dumped and stayed held — the wallet drained 19→12
+        # USD with the guard silent. Net unrecovered spend
+        # (session_spend - gross_recovered) must block new buys once it
+        # crosses daily_loss_limit_sol, whether or not the losers were sold.
+        rt = RiskTracker(
+            max_concurrent_positions=20,  # isolate the loss guard
+            daily_loss_limit_sol=0.098,
+            budget_sol=0.15,
+        )
+        rt._state_path = None
+        # 11 buys, most still held, only ~0.02 recovered via small sells.
+        for _ in range(11):
+            rt.record_buy(0.01)  # 10 succeed; the 11th crosses the cut
+        hit_by_unrecovered = rt.buy_allowed is False
+        # 0.10 spent - 0 recovered = 0.10 >= 0.098 -> blocked.
+        blocked_msg = "net unrecovered spend" in (rt.blocked_reason or "")
+        # Recovering brings the cut back below the limit.
+        rt.record_recovery(0.005)
+        rt.record_recovery(0.003)
+        rt.record_recovery(0.002)
+        rt.record_recovery(0.02)
+        freed = rt.buy_allowed is True
+        return hit_by_unrecovered and blocked_msg and freed
+    check("risk net unrecovered spend hits loss cut", unrecovered_spend_guard())
+
     # --- Risk: zero entry price must not fabricate realized PnL -------------
     def zero_entry_degrades():
         # Live evidence 2026-10-30: rehydrated orphans carry entry_price=0;
