@@ -26,6 +26,7 @@ from solders.transaction import VersionedTransaction
 
 from core.pubkeys import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, is_sol_paired
 from core.rpc_rate_limiter import TokenBucketRateLimiter
+from monitoring.metrics import metrics
 from interfaces.core import ConfirmationStatus, Platform
 from utils.idl_manager import get_idl_parser
 from utils.logger import get_logger
@@ -414,6 +415,21 @@ class SolanaClient:
             await self._session.close()
             self._session = None
 
+    async def _metered_sdk_rpc(self, method: str, request):
+        """Await an SDK RPC and record its count, latency and outcome."""
+        metrics.incr("rpc.sdk.requests")
+        metrics.incr(f"rpc.method.{method}")
+        started = monotonic()
+        try:
+            result = await request
+            metrics.incr("rpc.success")
+            return result
+        except Exception:
+            metrics.incr("rpc.errors")
+            raise
+        finally:
+            metrics.record("rpc.latency", monotonic() - started)
+
     async def get_health(self) -> str | None:
         body = {
             "jsonrpc": "2.0",
@@ -447,7 +463,9 @@ class SolanaClient:
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
-        response = await client.get_account_info(pubkey, **kwargs)
+        response = await self._metered_sdk_rpc(
+            "getAccountInfo", client.get_account_info(pubkey, **kwargs)
+        )
         if not response.value:
             raise ValueError(f"Account {pubkey} not found")
         return response.value
@@ -473,7 +491,9 @@ class SolanaClient:
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
-        response = await client.get_multiple_accounts(pubkeys, **kwargs)
+        response = await self._metered_sdk_rpc(
+            "getMultipleAccounts", client.get_multiple_accounts(pubkeys, **kwargs)
+        )
         return list(response.value)
 
     async def get_token_largest_accounts(
@@ -482,8 +502,9 @@ class SolanaClient:
         """Fetch the largest token accounts through the shared RPC budget."""
         await self._rate_limiter.acquire()
         client = await self.get_client()
-        return await client.get_token_largest_accounts(
-            mint, commitment=commitment
+        return await self._metered_sdk_rpc(
+            "getTokenLargestAccounts",
+            client.get_token_largest_accounts(mint, commitment=commitment),
         )
 
     async def get_token_supply(
@@ -505,7 +526,9 @@ class SolanaClient:
         if commitment is not None:
             kwargs["commitment"] = commitment
         try:
-            response = await client.get_token_supply(mint, **kwargs)
+            response = await self._metered_sdk_rpc(
+                "getTokenSupply", client.get_token_supply(mint, **kwargs)
+            )
             if not response.value:
                 return None
             return response.value.amount
@@ -528,7 +551,9 @@ class SolanaClient:
         try:
             await self._rate_limiter.acquire()
             client = await self.get_client()
-            response = await client.get_slot(commitment=commitment)
+            response = await self._metered_sdk_rpc(
+                "getSlot", client.get_slot(commitment=commitment)
+            )
             return int(response.value)
         except Exception:
             logger.exception("get_slot failed")
@@ -557,8 +582,11 @@ class SolanaClient:
         try:
             await self._rate_limiter.acquire()
             client = await self.get_client()
-            response = await client.get_program_accounts(
-                program_id, commitment=commitment, filters=filters
+            response = await self._metered_sdk_rpc(
+                "getProgramAccounts",
+                client.get_program_accounts(
+                    program_id, commitment=commitment, filters=filters
+                ),
             )
             return [(acc.pubkey, acc.account) for acc in response.value]
         except Exception:
@@ -582,8 +610,11 @@ class SolanaClient:
         """
         await self._rate_limiter.acquire()
         client = await self.get_client()
-        response = await client.get_token_account_balance(
-            token_account, commitment=commitment
+        response = await self._metered_sdk_rpc(
+            "getTokenAccountBalance",
+            client.get_token_account_balance(
+                token_account, commitment=commitment
+            ),
         )
         if response.value:
             return int(response.value.amount)
@@ -706,7 +737,10 @@ class SolanaClient:
         """Get the latest blockhash."""
         await self._rate_limiter.acquire()
         client = await self.get_client()
-        response = await client.get_latest_blockhash(commitment="processed")
+        response = await self._metered_sdk_rpc(
+            "getLatestBlockhash",
+            client.get_latest_blockhash(commitment="processed"),
+        )
         val = response.value
         # C2.2: record lastValidBlockHeight next to the hash — the RPC
         # reports it and the cached-blockhash path uses it (see
@@ -800,7 +834,9 @@ class SolanaClient:
                 tx_opts = TxOptsModel(
                     skip_preflight=skip_preflight, preflight_commitment=Processed
                 )
-                response = await client.send_transaction(transaction, tx_opts)
+                response = await self._metered_sdk_rpc(
+                    "sendTransaction", client.send_transaction(transaction, tx_opts)
+                )
                 return response.value
 
             except Exception as e:
