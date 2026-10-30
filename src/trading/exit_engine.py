@@ -643,3 +643,6 @@ class ExitEngineMixin:
             self.cleanup_with_priority_fee,
             self.cleanup_force_close_with_burn,
         )
+        clear_state = getattr(self, "_clear_mint_tracking_state", None)
+        if clear_state is not None:
+            clear_state(str(token_info.mint))
