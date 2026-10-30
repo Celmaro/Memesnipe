@@ -67,6 +67,7 @@ uv run tests/regression/verify_rpc_shared_cooldown.py
 uv run tests/regression/verify_metered_confirmation.py
 uv run tests/regression/verify_curve_state_cache_bounds.py
 uv run tests/regression/verify_mint_tracking_cleanup.py
+uv run tests/regression/verify_shadow_cleanup_is_read_only.py
 uv run tests/regression/verify_tx_status_checks.py
 uv run tests/regression/verify_t1_hardening.py
 uv run tests/regression/verify_curve_refresh_buy_path.py
