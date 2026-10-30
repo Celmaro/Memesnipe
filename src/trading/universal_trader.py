@@ -1460,12 +1460,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             # Co-fire and wash/LPI are explicitly bounded cross-launch windows.
             # The rug-buyer set is position/candidate state, so do NOT retain
             # every buyer for every token on the whole subscribed program.
-            if (
-                mint_key in self.token_timestamps
-                or mint_key in self._buy_reservations
-                or mint_key in self._active_exit_mints
-                or mint_key in self._unsold_positions
-            ):
+            if self._should_track_mint_buyers(mint_key):
                 self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
             self._cofire.observe_buy(mint_key, trader_key)
         # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
@@ -1482,6 +1477,15 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             ):
                 self._own_trade_prompt.add(mint_key)
         return trade
+
+    def _should_track_mint_buyers(self, mint: str) -> bool:
+        """True only while the mint is a candidate or has an owned position."""
+        return (
+            mint in self.token_timestamps
+            or mint in self._buy_reservations
+            or mint in self._active_exit_mints
+            or mint in self._unsold_positions
+        )
 
     def _clear_mint_tracking_state(self, mint: str) -> None:
         """Drop transient per-mint screening/monitor state once it is no longer live.
