@@ -156,13 +156,13 @@ def main() -> int:
 
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML default min_unique_holders 0",
-        cfg["filters"].get("min_unique_holders") == 0,
+        "YAML min_unique_holders armed (fixing loop)",
+        cfg["filters"].get("min_unique_holders") == 10,
         f"-> {cfg['filters'].get('min_unique_holders')!r}",
     )
     check(
-        "YAML default max_top10_concentration 0.0",
-        cfg["filters"].get("max_top10_concentration") == 0.0,
+        "YAML max_top10_concentration armed (fixing loop)",
+        cfg["filters"].get("max_top10_concentration") == 0.6,
         f"-> {cfg['filters'].get('max_top10_concentration')!r}",
     )
     rule_paths = [r[0] for r in config_loader.CONFIG_VALIDATION_RULES]

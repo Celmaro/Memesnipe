@@ -160,19 +160,24 @@ class ExitEngineMixin:
                 )
             self._trail_states[mint_key] = state
 
+        # Snapshot state because on_tick arms a TP before the transaction is
+        # confirmed. A failed sell must restore the pre-decision state.
+        state_before = (
+            state.peak_price,
+            state.floor_price,
+            state.initial_tp_fired,
+            state.second_tp_fired,
+            state.armed,
+        )
         decision = state.on_tick(current_price)
 
         if decision.action == "sell_share":
-            # Initial TP: sell the configured share of the REMAINING
-            # position at the trigger price (floored to the trigger if the
-            # re-read price is unreadable — same convention as staged).
-            await self._staged_partial_sell(
-                token_info,
-                position,
-                decision.share,
-                "trail_initial_tp",
-                decision.price,
+            sold = await self._staged_partial_sell(
+                token_info, position, decision.share, "trail_initial_tp", decision.price
             )
+            if not sold:
+                (state.peak_price, state.floor_price, state.initial_tp_fired,
+                 state.second_tp_fired, state.armed) = state_before
             return not position.is_active
 
         if decision.action == "exit_all":
@@ -185,18 +190,30 @@ class ExitEngineMixin:
                 f"Trail exit for {token_info.symbol}: {reason.value} "
                 f"@ {decision.price:.3e}"
             )
+            # Cumulative attempts for THIS exit episode: the old path passed
+            # attempt=1 on every tick, so max_exit_sell_attempts never
+            # tripped and the persistent watcher handoff was unreachable.
+            # Reset is handled on state-map cleanup (position close) and by
+            # the hold path below (price recovered = new episode).
+            attempts = self._trail_exit_attempts.get(mint_key, 0) + 1
+            self._trail_exit_attempts[mint_key] = attempts
             if await self._run_exit_attempt(
                 token_info,
                 position,
                 reason,
                 decision.price,
-                attempt=1,
+                attempt=attempts,
             ):
                 return True
             # Exit sell failed: keep monitoring, the floor stays armed and
-            # the next tick will retry against a fresh price.
+            # the next tick will retry against a fresh price. The counter
+            # persists so the retry budget eventually hands off.
             return False
 
+        # Hold / new high / no-price: price recovered (or nothing due). A new
+        # exit episode starts fresh — reset the cumulative attempt counter so
+        # a later hard-stop retry gets the full budget again.
+        self._trail_exit_attempts.pop(mint_key, None)
         return False
 
     async def _handle_staged_exit(
@@ -227,11 +244,14 @@ class ExitEngineMixin:
             position.entry_price, current_price, self.tp_ranges, self._tp_fired
         )
         for step in tp_due:
-            self._tp_fired.add((step.band_index, step.trigger_price))
-            fired_any = True
-            await self._staged_partial_sell(
+            # P0-2: mark a step fired only AFTER its sell succeeded — a
+            # failed leg must stay armed for the next tick.
+            sold = await self._staged_partial_sell(
                 token_info, position, step.share, "staged_tp", step.trigger_price
             )
+            if sold:
+                self._tp_fired.add((step.band_index, step.trigger_price))
+                fired_any = True
             if not position.is_active:
                 return True
 
@@ -239,8 +259,6 @@ class ExitEngineMixin:
             position.entry_price, current_price, self.sl_ranges, self._sl_fired
         )
         for step in sl_due:
-            self._sl_fired.add((step.band_index, step.trigger_price))
-            fired_any = True
             if step.is_final:
                 # Band bottom: close the position in full.
                 await self._run_exit_attempt(
@@ -251,9 +269,12 @@ class ExitEngineMixin:
                     1,
                 )
                 return True
-            await self._staged_partial_sell(
+            sold = await self._staged_partial_sell(
                 token_info, position, step.share, "staged_sl", step.trigger_price
             )
+            if sold:
+                self._sl_fired.add((step.band_index, step.trigger_price))
+                fired_any = True
             if not position.is_active:
                 return True
         return fired_any
@@ -265,78 +286,102 @@ class ExitEngineMixin:
         share: float,
         exit_reason: str,
         trigger_price: float,
-    ) -> None:
-        """Sell ``share`` of the position at the current price (staged)."""
+    ) -> bool:
+        """Sell ``share`` of the position at the current price (staged).
+
+        Returns True when the leg sold (real or simulated). A failed leg
+        returns False so the caller keeps the exit state armed for retry —
+        a TP step must never be considered fired before its sell succeeds.
+        """
         qty = position.quantity * share
         if qty <= 0:
-            return
+            return True  # nothing to sell is not a failure
         price = await self._read_price(token_info)
         if price <= 0:
             price = trigger_price  # floor the partial at the trigger level
-        # P0-2: a leg that drains the position to zero IS the final close —
-        # only non-draining legs are "partial" for downstream aggregation.
-        remaining_after = position.quantity - qty
-        drained = remaining_after <= 0.0
-        if self.shadow_mode and self.shadow_capture is not None:
-            fee_fields = await self._fee_estimate_fields()
-            self.shadow_capture.sim_close(
-                mint=str(token_info.mint),
-                symbol=token_info.symbol,
-                platform=token_info.platform.value,
-                price=price,
-                amount_tokens=qty,
-                quote_received=price * qty,
-                exit_reason=exit_reason,
-                pnl_quote=(price - position.entry_price) * qty,
-                # Percent, matching get_pnl().price_change_pct used by final
-                # closes — partial legs and final closes must share units.
-                pnl_pct=(price - position.entry_price) / position.entry_price * 100
-                if position.entry_price > 0
-                else 0.0,
-                hold_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
-                pool_snapshot=await self._pool_snapshot(token_info),
-                **fee_fields,
-                reordering_bps=0,  # R4-P0-1: shadow fills at observed price
-                # C8.1/P0-2: a staged partial leg must not be counted as a
-                # full close downstream (net_metrics / sweep_zombies /
-                # rug_memory). Tag it with the shared position identity and
-                # mark non-draining legs as partial so aggregators can group.
-                is_partial=not drained,
-                position_id=position.position_id,
-                leg_exit_reason=exit_reason,
-            )
-            logger.info(
-                f"[SHADOW] staged {exit_reason} sell {qty:.6f} {token_info.symbol} "
-                f"@ {price:.3e} (no tx sent)"
-            )
-        else:
-            sell_result = await self.seller.execute(
-                token_info, token_amount=qty, token_price=price
-            )
-            if not sell_result.success:
-                logger.warning(
-                    f"Staged {exit_reason} sell failed for {token_info.symbol}: "
-                    f"{sell_result.error_message}"
-                )
-                return
-            # Live research capture: record the real partial leg using the
-            # same schema as shadow sim_close, tagged for calibration.
-            if not self.shadow_mode and self.shadow_capture is not None:
+        # Whether the REQUESTED leg drains the position (used only to tag
+        # captures as partial/final; the actual bookkeeping below re-derives
+        # drained from the ACTUAL sold amount).
+        drained = (position.quantity - qty) <= 0.0
+        # P0-2: successful real sells (and shadow sims) report the amount
+        # actually sold — the seller may clamp it (max_safe_sell_amount /
+        # impact cap). Bookkeeping below always uses the ACTUAL amount so a
+        # clamped leg can never understate the held quantity.
+        sold_amount = qty
+        sold_price = price
+        if self.shadow_mode:
+            # Shadow mode is unconditionally read-only: the simulated
+            # partial path must not depend on shadow_capture being enabled.
+            if self.shadow_capture is not None:
                 fee_fields = await self._fee_estimate_fields()
                 self.shadow_capture.sim_close(
                     mint=str(token_info.mint),
                     symbol=token_info.symbol,
                     platform=token_info.platform.value,
-                    price=sell_result.price,
+                    price=price,
                     amount_tokens=qty,
-                    quote_received=sell_result.price * qty,
+                    quote_received=price * qty,
                     exit_reason=exit_reason,
-                    pnl_quote=(sell_result.price - position.entry_price) * qty,
+                    pnl_quote=(price - position.entry_price) * qty,
+                    # Percent, matching get_pnl().price_change_pct used by final
+                    # closes — partial legs and final closes must share units.
+                    pnl_pct=(price - position.entry_price) / position.entry_price * 100
+                    if position.entry_price > 0
+                    else 0.0,
+                    hold_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
+                    pool_snapshot=await self._pool_snapshot(token_info),
+                    **fee_fields,
+                    reordering_bps=0,  # R4-P0-1: shadow fills at observed price
+                    # C8.1/P0-2: a staged partial leg must not be counted as a
+                    # full close downstream (net_metrics / sweep_zombies /
+                    # rug_memory). Tag it with the shared position identity and
+                    # mark non-draining legs as partial so aggregators can group.
+                    is_partial=not drained,
+                    position_id=position.position_id,
+                    leg_exit_reason=exit_reason,
+                )
+            logger.info(
+                f"[SHADOW] staged {exit_reason} sell {qty:.6f} {token_info.symbol} "
+                f"@ {price:.3e} (no tx sent)"
+            )
+        else:
+            # P0-1: partial sells ride the SAME serialization lock as buys and
+            # full exits — a partial TP racing an in-flight buy/sell can corrupt
+            # the WSOL wrap/unwrap balance exactly like the full-sell race the
+            # lock was built for.
+            async with self._trade_serialization_lock:
+                sell_result = await self.seller.execute(
+                    token_info, token_amount=qty, token_price=price
+                )
+            if not sell_result.success:
+                logger.warning(
+                    f"Staged {exit_reason} sell failed for {token_info.symbol}: "
+                    f"{sell_result.error_message}"
+                )
+                return False
+            sold_amount = (
+                sell_result.amount if sell_result.amount is not None else qty
+            )
+            sold_amount = min(sold_amount, position.quantity)
+            sold_price = sell_result.price or price
+            # Live research capture: record the real partial leg using the
+            # same schema as shadow sim_close, tagged for calibration.
+            if self.shadow_capture is not None:
+                fee_fields = await self._fee_estimate_fields()
+                self.shadow_capture.sim_close(
+                    mint=str(token_info.mint),
+                    symbol=token_info.symbol,
+                    platform=token_info.platform.value,
+                    price=sold_price,
+                    amount_tokens=sold_amount,
+                    quote_received=sold_price * sold_amount,
+                    exit_reason=exit_reason,
+                    pnl_quote=(sold_price - position.entry_price) * sold_amount,
                     # Percent, matching get_pnl().price_change_pct used by
                     # final closes — partial legs and final closes must share
                     # units.
                     pnl_pct=(
-                        (sell_result.price - position.entry_price)
+                        (sold_price - position.entry_price)
                         / position.entry_price
                         * 100
                         if position.entry_price > 0
@@ -354,20 +399,32 @@ class ExitEngineMixin:
                     mode="live",
                     tx_signature=sell_result.tx_signature,
                 )
-        # Reduce position quantity by the sold share (keep entry price).
-        # C4.8: bank the leg's realized PnL BEFORE shrinking quantity so the
-        # final close (here for a draining leg, or via _attempt_position_exit
-        # for a tail leg) can report the whole position's blended result.
-        position.realized_pnl_quote += (price - position.entry_price) * qty
+        # Reduce position quantity by the ACTUAL sold amount (keep entry
+        # price). C4.8: bank the leg's realized PnL BEFORE shrinking quantity
+        # so the final close can report the blended result.
+        leg_realized = (sold_price - position.entry_price) * sold_amount
+        position.realized_pnl_quote += leg_realized
+        remaining_after = position.quantity - sold_amount
         position.quantity = max(0.0, remaining_after)
-        if drained:
-            position.close_position(price, ExitReason.TAKE_PROFIT)
+        # P0-6: feed the risk guard the leg's REALIZED PnL (partial legs bank
+        # realized results without closing a concurrency slot; the final
+        # close records its own tail + decrements).
+        try:
+            if remaining_after <= 0.0:
+                self.risk_tracker.record_close(leg_realized)
+            else:
+                self.risk_tracker.record_partial_close(leg_realized)
+        except Exception:
+            self.risk_tracker.record_partial_close(0.0)
+        if remaining_after <= 0.0:
+            drained = True
+            position.close_position(sold_price, ExitReason.TAKE_PROFIT)
             # R4-P1-7: a staged ladder that drains the position is also a
             # close — finalize the strategies-ledger entry here (shadow).
             if self.strategies_ledger is not None:
                 self.strategies_ledger.close_position(
                     mint=str(token_info.mint),
-                    close_price=price,
+                    close_price=sold_price,
                     exit_reason="staged_drain",
                     hold_seconds=(
                         datetime.utcnow() - position.entry_time
@@ -378,6 +435,8 @@ class ExitEngineMixin:
             # (banked legs + this one), same guarded contract as the
             # tail-leg close in _attempt_position_exit.
             await self._record_creator_pnl(token_info, position)
+            await self._cleanup_after_exit(token_info)
+        return True
 
     async def _run_exit_attempt(
         self,
@@ -499,6 +558,57 @@ class ExitEngineMixin:
                 )
 
         if sell_result.success:
+            # P0-5: the seller can clamp the amount (max_safe_sell_amount /
+            # sell-impact cap), so the ACTUAL sold quantity is authoritative.
+            # A full exit that sold less than the held quantity must NOT mark
+            # the position closed — the residual stays in the wallet and is
+            # handed to the durable watcher (or retried).
+            actual_sold = (
+                getattr(sell_result, "amount", None)
+                if getattr(sell_result, "amount", None) is not None
+                else position.quantity
+            )
+            actual_sold = min(actual_sold, position.quantity)
+            sold_price = sell_result.price or price
+            residual = position.quantity - actual_sold
+            if residual > 1e-12:
+                logger.warning(
+                    f"Exit sell for {token_info.symbol} filled only "
+                    f"{actual_sold:.9f} of {position.quantity:.9f} tokens "
+                    f"(clamped); {residual:.9f} remain — handing residual to "
+                    f"the persistent watcher instead of marking closed."
+                )
+                # Bank the sold leg's realized PnL for the blended close.
+                position.realized_pnl_quote += (
+                    (sold_price - position.entry_price) * actual_sold
+                )
+                position.quantity = residual
+                try:
+                    self.risk_tracker.record_partial_close(
+                        (sold_price - position.entry_price) * actual_sold
+                    )
+                except Exception:
+                    self.risk_tracker.record_partial_close(0.0)
+                await self._register_unsold_position(token_info, position)
+                self._log_trade(
+                    "sell",
+                    token_info,
+                    sold_price,
+                    actual_sold,
+                    sell_result.tx_signature,
+                    quote_received_sol=(
+                        sold_price * actual_sold
+                        if sold_price
+                        and actual_sold
+                        and (
+                            normalize_quote_mint(token_info.quote_mint)
+                            == WSOL_MINT
+                        )
+                        else None
+                    ),
+                )
+                return ExitSellVerdict.SOLD  # handoff owns the residual
+
             # Live research capture: the real closing fill, same schema as
             # the shadow sim_close, tagged for calibration. Placed right
             # after success so the strategies ledger finalizes against the
@@ -512,12 +622,20 @@ class ExitEngineMixin:
                     mint=str(token_info.mint),
                     symbol=token_info.symbol,
                     platform=token_info.platform.value,
-                    price=sell_result.price,
-                    amount_tokens=position.quantity,
-                    quote_received=sell_result.price * position.quantity,
+                    price=sold_price,
+                    amount_tokens=actual_sold,
+                    quote_received=sold_price * actual_sold,
                     exit_reason=exit_reason.value,
-                    pnl_quote=float(pnl.get("unrealized_pnl_quote", 0.0)),
-                    pnl_pct=float(pnl.get("price_change_pct", 0.0)),
+                    pnl_quote=(
+                        (sold_price - position.entry_price) * actual_sold
+                    ),
+                    pnl_pct=(
+                        (sold_price - position.entry_price)
+                        / position.entry_price
+                        * 100
+                        if position.entry_price > 0
+                        else 0.0
+                    ),
                     hold_seconds=hold_seconds,
                     pool_snapshot=await self._pool_snapshot(token_info),
                     **fee_fields,
@@ -529,18 +647,23 @@ class ExitEngineMixin:
                 if self.strategies_ledger is not None:
                     self.strategies_ledger.close_position(
                         mint=str(token_info.mint),
-                        close_price=sell_result.price,
+                        close_price=sold_price,
                         exit_reason=exit_reason.value,
                         hold_seconds=hold_seconds,
                         **fee_fields,
                     )
             # Close position with actual exit price
-            position.close_position(sell_result.price, exit_reason)
-            # R3-P2-10: track realized PnL for the risk guards.
+            position.close_position(sold_price, exit_reason)
+            # R3-P2-10: track REALIZED PnL for the risk guards — recovered
+            # from the actual fill, not the pre-sell estimate (the estimate
+            # only reflects the trigger price and can understate the loss).
+            # Banked staged legs are included via real_pnl_quote.
+            realized_pnl = position.realized_pnl_quote + (
+                (sold_price - position.entry_price) * actual_sold
+            )
+            position.realized_pnl_quote = realized_pnl
             try:
-                self.risk_tracker.record_close(
-                    float(pnl.get("unrealized_pnl_quote", 0.0))
-                )
+                self.risk_tracker.record_close(realized_pnl)
             except Exception:
                 self.risk_tracker.record_close(0.0)
 
@@ -548,13 +671,13 @@ class ExitEngineMixin:
             self._log_trade(
                 "sell",
                 token_info,
-                sell_result.price,
-                sell_result.amount,
+                sold_price,
+                actual_sold,
                 sell_result.tx_signature,
                 quote_received_sol=(
-                    sell_result.price * sell_result.amount
-                    if sell_result.price
-                    and sell_result.amount
+                    sold_price * actual_sold
+                    if sold_price
+                    and actual_sold
                     and (normalize_quote_mint(token_info.quote_mint) == WSOL_MINT)
                     else None
                 ),
@@ -592,13 +715,32 @@ class ExitEngineMixin:
             # price it was floored at; the real fill was never read back.
             position.close_position(price, exit_reason)
             logger.info(f"Position for {token_info.symbol} closed by a late fill")
+            # Record the close in the risk tracker with the best PnL evidence
+            # available (the floored price; the actual fill was never read).
+            # Banked staged legs are included.
+            realized_pnl = position.realized_pnl_quote + (
+                (price - position.entry_price) * position.quantity
+            )
+            position.realized_pnl_quote = realized_pnl
+            try:
+                self.risk_tracker.record_close(realized_pnl)
+            except Exception:
+                self.risk_tracker.record_close(0.0)
+            await self._record_creator_pnl(token_info, position)
             await self._cleanup_after_exit(token_info)
         elif verdict is ExitSellVerdict.STOP:
             logger.error(
                 f"Stopping exit attempts for {token_info.symbol} - the last "
-                f"sell could not be resolved. Position stays open and is no "
-                f"longer monitored."
+                f"sell could not be resolved. Handing the position to the "
+                f"persistent exit watcher (durable reconciliation) instead "
+                f"of silently abandoning it."
             )
+            # P0-4: an unresolved sell must not end monitoring silently. The
+            # persistent watcher re-reads the price and retries, and its TTL
+            # bounds repeated attempts. This is the durable handoff the old
+            # code skipped.
+            if position.quantity > 0:
+                await self._register_unsold_position(token_info, position)
         return verdict
 
     async def _record_creator_pnl(self, token_info: TokenInfo, position: Position) -> None:

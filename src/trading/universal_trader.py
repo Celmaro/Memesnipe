@@ -776,6 +776,10 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         self.trail_hard_stop_pct = float(trail_hard_stop_pct)
         # Per-position trail state for exit_mode == "staged_trail".
         self._trail_states: dict[str, Any] = {}
+        # Cumulative exit-attempt counters for staged-trail hard-stop/floor
+        # episodes. The old path passed attempt=1 on every tick, so the
+        # persistent watcher handoff could never be reached.
+        self._trail_exit_attempts: dict[str, int] = {}
         self.take_profit_percentage = take_profit_percentage
         self.stop_loss_percentage = stop_loss_percentage
         # R3-P1-2: staged exits. Parse once at construction; [] = feature off
@@ -874,13 +878,18 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
 
         self._metadata_store = MetadataStore()
         # R3-P2-10: session risk guards (off by default: 0).
+        # P0 restart reconciliation: restore the persisted session counters
+        # (open positions, spend, realized PnL) so a restart cannot reset the
+        # exposure/loss guards to zero while the wallet still holds positions.
+        # Config values are authoritative for the LIMITS; the persisted file
+        # contributes the RUNNING counters.
         from trading.risk_guard import RiskTracker
 
-        self.risk_tracker = RiskTracker(
-            max_concurrent_positions=max_concurrent_positions or 0,
-            daily_loss_limit_sol=daily_loss_limit_sol or 0.0,
-            budget_sol=budget_sol or 0.0,
-        )
+        self.risk_tracker = RiskTracker.load_from("state/risk_state.json")
+        self.risk_tracker._state_path = "state/risk_state.json"  # noqa: SLF001
+        self.risk_tracker.max_concurrent_positions = max_concurrent_positions or 0
+        self.risk_tracker.daily_loss_limit_sol = daily_loss_limit_sol or 0.0
+        self.risk_tracker.budget_sol = budget_sol or 0.0
         # R3-P2-13: strict buy/sell serialization. One lock guards the
         # buy-vs-sell overlap (WSOL wrap/unwrap balance races): a sell never
         # starts while a buy is in flight and vice versa. Off-by-default
@@ -3022,6 +3031,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             # trail states are per-position; a stale one would give a
             # re-opened mint the previous run's floor/peak
             self._trail_states.pop(mint_key, None)
+            # trail exit attempts are per-position; reset with the state map.
+            self._trail_exit_attempts.pop(mint_key, None)
             # The persistent unsold watcher needs TokenInfo + Position only;
             # transient buyer/advisory maps are safe to release here too.
             self._clear_mint_tracking_state(mint_key)

@@ -204,8 +204,8 @@ def main() -> int:
 
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML default exit_on_creator_sell false",
-        cfg["filters"].get("exit_on_creator_sell") is False,
+        "YAML fixing-loop live exit_on_creator_sell true",
+        cfg["filters"].get("exit_on_creator_sell") is True,
         f"-> {cfg['filters'].get('exit_on_creator_sell')!r}",
     )
     check(

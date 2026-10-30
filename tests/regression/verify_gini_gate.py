@@ -217,8 +217,8 @@ def main() -> int:
     )
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML max_gini_coefficient 0 (off)",
-        cfg["filters"].get("max_gini_coefficient") == 0.0,
+        "YAML max_gini_coefficient armed (fixing loop)",
+        cfg["filters"].get("max_gini_coefficient") == 0.85,
         f"-> {cfg['filters'].get('max_gini_coefficient')!r}",
     )
     runner = Path("src/bot_runner.py").read_text()

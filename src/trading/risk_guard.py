@@ -15,7 +15,9 @@ The tracker is pure and offline-testable; the trader wires it into
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -40,12 +42,26 @@ class RiskTracker:
         self.open_positions += 1
         self.session_spend_sol += quote_spent_sol
         self.history.append(f"buy {quote_spent_sol:.6f}")
+        self._maybe_persist()
         return True
 
     def record_close(self, realized_pnl_sol: float) -> None:
         self.open_positions = max(0, self.open_positions - 1)
         self.realized_pnl_sol += realized_pnl_sol
         self.history.append(f"close {realized_pnl_sol:+.6f}")
+        self._maybe_persist()
+
+    def record_partial_close(self, realized_pnl_sol: float) -> None:
+        """Bank a staged/partial leg's realized PnL WITHOUT releasing a slot.
+
+        A partial TP/SL leg realizes PnL but the position stays open, so the
+        concurrency count must not decrement; the final close releases it.
+        Keeping the loss limit live as legs realize prevents the guard from
+        understating damage while money is still being extracted.
+        """
+        self.realized_pnl_sol += realized_pnl_sol
+        self.history.append(f"partial-close {realized_pnl_sol:+.6f}")
+        self._maybe_persist()
 
     def record_spend(self, quote_spent_sol: float) -> None:
         """Register quote spent WITHOUT opening a tracked position.
@@ -58,6 +74,59 @@ class RiskTracker:
         """
         self.session_spend_sol += quote_spent_sol
         self.history.append(f"mirror-spend {quote_spent_sol:.6f}")
+        self._maybe_persist()
+
+    # ------------------------------------------------------------------
+    # Durable state (restart reconciliation): the tracker's session
+    # counters are persisted on every mutation so a process restart does
+    # not reset the concurrency/budget/loss guards to zero while the
+    # wallet still holds open positions (the P0 restart gap).
+    # ------------------------------------------------------------------
+    _state_path: str | None = None  # set explicitly by the trader (opt-in)
+
+    def _maybe_persist(self) -> None:
+        if not self._state_path:
+            return
+        try:
+            p = Path(self._state_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(self.to_dict(), indent=2))
+        except OSError:
+            pass  # best-effort; guards still work in-memory
+
+    def to_dict(self) -> dict:
+        return {
+            "max_concurrent_positions": self.max_concurrent_positions,
+            "daily_loss_limit_sol": self.daily_loss_limit_sol,
+            "budget_sol": self.budget_sol,
+            "realized_pnl_sol": self.realized_pnl_sol,
+            "session_spend_sol": self.session_spend_sol,
+            "open_positions": self.open_positions,
+            "blocked_reason": self.blocked_reason,
+            "history": list(self.history[-500:]),
+        }
+
+    @classmethod
+    def load_from(cls, path: str | None) -> "RiskTracker":
+        """Restore a tracker from persisted state (missing/corrupt = fresh)."""
+        tracker = cls()
+        if not path:
+            return tracker
+        try:
+            data = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            return tracker
+        tracker.max_concurrent_positions = int(
+            data.get("max_concurrent_positions", 0) or 0
+        )
+        tracker.daily_loss_limit_sol = float(data.get("daily_loss_limit_sol", 0.0) or 0.0)
+        tracker.budget_sol = float(data.get("budget_sol", 0.0) or 0.0)
+        tracker.realized_pnl_sol = float(data.get("realized_pnl_sol", 0.0) or 0.0)
+        tracker.session_spend_sol = float(data.get("session_spend_sol", 0.0) or 0.0)
+        tracker.open_positions = int(data.get("open_positions", 0) or 0)
+        tracker.blocked_reason = data.get("blocked_reason")
+        tracker.history = list(data.get("history", []) or [])
+        return tracker
 
     def _block_reason(self) -> str | None:
         if self.max_concurrent_positions > 0 and (

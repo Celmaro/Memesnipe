@@ -83,10 +83,15 @@ trade:
   sell_slippage_inflation_bps: 10 # P2-EXIT-3: extra sell-only bps so exits land
   # P2-EXIT-1: absolute pool-depth floor (SOL). Exit immediately when depth
   # drops below this (0 = off). A shallow pool may not absorb the sell later.
-  min_pool_depth_sol: 0.0
+  # Fixing-loop live: 0.05 SOL floor — the curve-progress gate (>=1.0 SOL)
+  # buys only pools with reserves above this, so the floor only fires on
+  # genuinely dying liquidity (incident exit had 17 lamports).
+  min_pool_depth_sol: 0.05
   # P2-EXIT-2: cap single-sell price impact (bps of pool depth); 0 = off.
-  # Remaining balance drains on later monitor passes.
-  max_sell_impact_bps: 0
+  # Remaining balance drains on later monitor passes. Fixing-loop live:
+  # 3000 bps (30%) — with P0-5 residual reconciliation the clamp is safe and
+  # the leftover is handed to the persistent watcher, never stranded.
+  max_sell_impact_bps: 3000
   # P2-STRUC-1: background blockhash refresh cadence (seconds). Lower = fresher
   # sends, more RPC pressure; 0.05 floor, public-RPC-friendly default 5.0.
   # 15s lowers the background RPC baseline to ~0.067 requests/sec while
@@ -159,11 +164,12 @@ trade:
   #   sl_ranges: [{from_pct: -0.1, to_pct: -0.3, step: 0.2, share: 0.5}]
   tp_ranges: []
   sl_ranges: []
-  max_hold_time: null # removed 2026-10-26: TP/SL now govern exits (shadow test)
+  max_hold_time: 3600 # fixing-loop live: 1h absolute cap (runners ride, zombies exit)
   # R4-P1-9: stagnation exit (opt-in, 0 = off). If price stays inside
   # stagnation_band_pct of entry for stagnation_exit_min minutes, exit —
   # a flat token's hype window passed (53-trade cohort: median hold <15m).
-  stagnation_exit_min: 0 # minutes; 0 = off
+  # Fixing-loop live: 20 min flat inside +/-2% = hype gone, exit.
+  stagnation_exit_min: 20 # minutes; 0 = off
   stagnation_band_pct: 0.02 # +/-2% band around the entry price
   # RPC-remediation: cap monitor reads under the request budget.
   # At the user-set 10-position cap this is ~3.3 price reads/sec worst case;
@@ -183,10 +189,11 @@ trade:
   # buy/sell produced simulated fills; with it OFF the real buyer/seller fire.
   # Research capture (shadow_data/ + strategies ledger) stays ON in live mode
   # so every real trade is recorded for calibration.
-  # First rollout of the RPC/resource fix is read-only shadow mode. This
-  # exercises Geyser, queueing, price reads and telemetry without spending SOL.
-  # Re-arm live sends only after a stable provider window and explicit canary.
-  shadow_mode: true
+  # LIVE MODE (user-approved 2026-10-30 fixing loop): real sends, max 3
+  # concurrent. P0 execution remediation + RiskTracker restart persistence
+  # landed (113/113). The $10 realized-loss cut bounds the downside; sells
+  # always run, buys only. Flip back to shadow after each data window.
+  shadow_mode: false
 # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
 # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
 backfill:
@@ -240,8 +247,10 @@ jito:
 # R3-P2-10: session risk guards (0 = off). The loss limit blocks NEW buys
 # while sells still run — it never traps money in a falling position.
 risk:
-  # Temporary resource/risk cap for the shared 2-RPS endpoint.
-  max_concurrent_positions: 2
+  # P0 execution remediation + fixing-loop iteration 1 (user-approved): live
+  # cap is 3 concurrent / 0.15 SOL budget / $10 realized-loss cut. Raising the
+  # cap must wait for a clean live data window AND restart-safe counters.
+  max_concurrent_positions: 3
   daily_loss_limit_sol: 0.098 # ~$10 realized portfolio loss (SOL @ $102.15 on 2026-10-29): blocks NEW buys, sells still run (never traps money)
   budget_sol: 0.15 # user-set live cap (was 0 = off): total quote spent on buys this session
 
@@ -262,10 +271,10 @@ filters:
   creator_pnl_db_path: state/creator_pnl.db
   creator_pnl_min_trades: 10 # R5-P0-3: evidence strength (was 3) — net-of-fees, sufficient sample before a persistent ban
   creator_pnl_max_net_sol: 0.0
-  # P2-EXIT-4: slot-delta rug heuristics (off). On: exits immediately when the
+  # P2-EXIT-4: slot-delta rug heuristics (ON in fixing loop). Exits when the
   # pool drains below early_drain_ratio of its entry depth, or the coin has
   # fewer than min_unique_buyers check_slots after our buy.
-  rug_heuristics_enabled: false
+  rug_heuristics_enabled: true
   rug_min_unique_buyers: 2
   rug_check_slots: 12
   rug_early_drain_ratio: 0.5
@@ -275,7 +284,7 @@ filters:
   # the $10 realized-loss cut bounds the downside. Re-tighten after ~20-30
   # live fills if the mode=live PF collapses vs the backtest.
   max_market_cap_sol: 60.0
-  min_curve_progress_sol: 0.25 # Phase 5 trial: skip dead launches
+  min_curve_progress_sol: 1.0 # fixing-loop live: skip dead launches (was 0.25; a 4x raise still admits the floor, kills the truly dead)
   # Improvement #4: buy-on-breakout — buy only after MC rises through this.
   # Leave null to keep pure launch sniping (max cap only).
   min_market_cap_sol: null
@@ -288,9 +297,10 @@ filters:
   # pump.fun address). Trading is identical, so default is "trade"; "skip"
   # refuses them. cashback is legacy-only and never gated.
   holder_reward_mode: "trade"
-  # R3-P1-4: exit when the coin's creator wallet sells (off by default).
-  # The monitor loop watches the listener trade feed for a creator sell.
-  exit_on_creator_sell: false
+  # R3-P1-4: exit when the coin's creator wallet sells (ON in fixing loop).
+  # Also registers creator wallets so the post-entry creator-sell advisory
+  # can populate; a creator dumping is the strongest rug signal on pump.fun.
+  exit_on_creator_sell: true
   # R5-P2-3: post-entry protection signals as LOG-ONLY advisories (off).
   # When on, the monitor evaluates creator-sell/rug-drain/buyer-stall on
   # open positions, logs a warning, and NEVER exits — shadow evidence
@@ -298,12 +308,14 @@ filters:
   post_entry_advisories_enabled: true # log-only research: creator/rug/buyer-stall signals; never exits
   # R3-P1-5: holder-concentration gates (0 = off). Background refresher
   # fills the holder snapshot; fail-open until it has data for a mint.
-  min_unique_holders: 0
-  max_top10_concentration: 0.0
+  # Fixing-loop live: refuse coins that demonstrably lack a holder base
+  # once a snapshot exists (rugs and bundled launches have few holders).
+  min_unique_holders: 10
+  max_top10_concentration: 0.6
   # R4-P1-10: Gini-coefficient gate (0 = off). Refuses coins whose OBSERVED
   # holder distribution is too unequal — rugs run Gini > 0.8, normal < 0.5
   # (2608.01609). Same holder snapshot as the top-10 gate.
-  max_gini_coefficient: 0.0
+  max_gini_coefficient: 0.85
   # R4-P1-1: multi-dimensional rug-risk score gate (0 = off). Weighted sum
   # over creator cadence / holder concentration / buyer set (local features
   # only — no hot-path RPC); refuses when the score exceeds the threshold.
@@ -349,7 +361,9 @@ filters:
   fail_closed_gates: true # RPC error in a gate = refuse the coin, not pass it
   # T2.4 confirmation window: consecutive curve-gate passes before buying.
   # 1 = single check. >1 guards against a transient RPC-blip false pass.
-  consecutive_match_count: 1
+  # Fixing-loop live: 2 confirmations (gate_recheck_interval 0.5s apart)
+  # reject a stale/glitched single read; cheap and decision-blocking.
+  consecutive_match_count: 2
   gate_recheck_interval: 0.5 # seconds between confirmation rechecks
   # T2.5 honeypot gates (off by default; fail-open on read errors).
   # Freeze-authority: reject mints whose account carries a freeze authority.

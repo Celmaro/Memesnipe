@@ -84,8 +84,8 @@ def main() -> int:
         "rug_heuristics_enabled" in cfg.get("filters", {}),
     )
     check(
-        "YAML default off",
-        cfg["filters"].get("rug_heuristics_enabled", False) is False,
+        "YAML rug_heuristics_enabled armed (fixing loop)",
+        cfg["filters"].get("rug_heuristics_enabled", False) is True,
     )
     check(
         "BOOL_FIELDS includes it",

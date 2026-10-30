@@ -127,8 +127,8 @@ def main() -> int:
     )
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML stagnation_exit_min 0 (off)",
-        cfg["trade"].get("stagnation_exit_min") == 0,
+        "YAML stagnation_exit_min armed (fixing loop)",
+        cfg["trade"].get("stagnation_exit_min") == 20,
         f"-> {cfg['trade'].get('stagnation_exit_min')!r}",
     )
     check(
