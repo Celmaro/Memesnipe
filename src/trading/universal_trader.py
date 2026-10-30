@@ -1522,15 +1522,16 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
     async def _refresh_one_holder_snapshot(self, mint: str) -> None:
         """Pull largest accounts + supply for one mint and store a snapshot."""
         try:
-            client = await self.solana_client.get_client()
             mint_pk = Pubkey.from_string(mint)
-            largest = await client.get_token_largest_accounts(mint_pk)
-            supply = await client.get_token_supply(mint_pk)
+            # Both reads use SolanaClient wrappers so the holder refresher
+            # cannot bypass the process-wide rate limiter under live load.
+            largest = await self.solana_client.get_token_largest_accounts(mint_pk)
+            supply = await self.solana_client.get_token_supply(mint_pk)
             rows = [
                 (str(item.address), int(str(item.amount)))
                 for item in (largest.value or [])
             ]
-            total_raw = int(str(supply.value.amount)) if supply.value else 0
+            total_raw = int(supply) if supply is not None else 0
             slot = largest.context.slot if largest.context else 0
             from screening.holder_snapshot import compute_snapshot
 
