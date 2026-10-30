@@ -2252,7 +2252,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             logger.info(
                 "metrics: received=%d detected=%d processed=%d queue_depth=%d "
                 "proc_avg=%ss proc_p95=%ss errors=%d stale=%d "
-                "rpc_requests=%d rpc_429=%d rpc_p95=%ss",
+                "rpc_requests=%d rpc_429=%d rpc_p95=%ss "
+                "geyser_reconnects=%d grpc_exhausted=%d",
                 snap["counters"].get("geyser.updates_received", 0),
                 snap["counters"].get("geyser.tokens_detected", 0),
                 snap["counters"].get("tokens.dequeued", 0),
@@ -2264,6 +2265,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 snap["counters"].get("rpc.requests", 0),
                 snap["counters"].get("rpc.http_429", 0),
                 snap["hist"].get("rpc.latency", {}).get("p95", 0.0),
+                snap["counters"].get("geyser.reconnects", 0),
+                snap["counters"].get("geyser.grpc_resource_exhausted", 0),
             )
 
     async def _drain_token_queue(self, max_age: float) -> None:
