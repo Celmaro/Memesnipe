@@ -1021,7 +1021,10 @@ class SolanaClient:
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "getSignatureStatuses",
-                    "params": [[str(signature)], {"searchTransactionHistory": True}],
+                    # The signature has just been submitted, so the recent
+                    # status cache is sufficient. Avoid ledger-history search
+                    # on every poll; it is heavier and unnecessary here.
+                    "params": [[str(signature)]],
                 },
                 max_retries=2,
                 max_429_retries=3,
