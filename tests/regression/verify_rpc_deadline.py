@@ -159,6 +159,9 @@ def _make_client(session: StubSession) -> SolanaClient:
         async def acquire(self) -> None:
             pass
 
+        async def defer(self, _seconds: float) -> None:
+            pass
+
     solana_client = object.__new__(SolanaClient)
     solana_client.rpc_endpoint = "https://stub.invalid"
     solana_client._rate_limiter = _NoRateLimit()  # noqa: SLF001
