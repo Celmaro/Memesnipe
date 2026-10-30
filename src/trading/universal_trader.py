@@ -2068,7 +2068,9 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
 
     async def _cleanup_resources(self) -> None:
         """Perform cleanup operations before shutting down."""
-        if self.traded_mints:
+        # Shadow mode must never mutate the real wallet, including a
+        # post-session cleanup configured independently of the exit path.
+        if self.traded_mints and not getattr(self, "shadow_mode", False):
             try:
                 logger.info(f"Cleaning up {len(self.traded_mints)} traded token(s)...")
                 # Build parallel lists of mints and token_program_ids
