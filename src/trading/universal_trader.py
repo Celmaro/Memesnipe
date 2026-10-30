@@ -4079,6 +4079,23 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     f"Rehydrated {recovered} unsold position(s) from "
                     f"{self._unsold_persist_path}; re-arming persistent watcher"
                 )
+                # P0 restart reconciliation: recovered positions hold real
+                # wallet capital, so they MUST occupy the same concurrency
+                # slots as live positions — otherwise the bot stacks new buys
+                # on top of inventory still being liquidated (the audit's
+                # "restore risk exposure from persisted positions on startup").
+                # Slots are released when the watcher sells a recovered
+                # position (record_close) or gives up at TTL expiry.
+                try:
+                    self.risk_tracker.open_positions += recovered
+                    self.risk_tracker._maybe_persist()  # noqa: SLF001
+                    logger.warning(
+                        f"Risk tracker open_positions += {recovered} for "
+                        f"rehydrated inventory (now "
+                        f"{self.risk_tracker.open_positions})"
+                    )
+                except Exception:
+                    logger.exception("Failed to count rehydrated inventory in risk tracker")
                 if self._unsold_watcher_task is None or self._unsold_watcher_task.done():
                     self._unsold_watcher_task = asyncio.create_task(
                         self._unsold_position_watcher()
@@ -4112,6 +4129,13 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     )
                     del self._unsold_positions[key]
                     self._persist_unsold()  # C7.2
+                    # The position is no longer being watched; release the
+                    # concurrency slot even though the wallet residual remains
+                    # for the periodic sweeper to rediscover.
+                    try:
+                        self.risk_tracker.record_close(0.0)
+                    except Exception:
+                        logger.exception("Failed to release expired unsold risk slot")
                     continue
                 try:
                     price = await self._read_price(token_info)
@@ -4133,9 +4157,19 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     ExitReason.MANUAL,
                     price,
                 )
-                if verdict is ExitSellVerdict.RETRY:
+                if (
+                    verdict is ExitSellVerdict.RETRY
+                    or verdict is ExitSellVerdict.STOP
+                ):
+                    # RETRY = provably nothing landed; STOP = outcome still
+                    # ambiguous but no proof of a fill. In BOTH cases the
+                    # position is still held, so the watcher keeps re-pricing
+                    # and re-attempting within the TTL bound (a STOP must not
+                    # be mistaken for a close — the exit engine's durable
+                    # handoff expects the registry to keep the position).
                     logger.debug(
-                        f"Persistent exit retry needed for {token_info.symbol}"
+                        f"Persistent exit retry needed for {token_info.symbol} "
+                        f"(verdict {verdict.value})"
                     )
                 else:
                     del self._unsold_positions[key]

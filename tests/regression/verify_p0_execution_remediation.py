@@ -375,7 +375,7 @@ def main() -> int:
             return ok and rt3.open_positions == 2
     check("risk tracker persists + restores counters", risk2())
 
-    # --- Trader wires persisted counters at boot -----------------------------
+    # --- Risk: trader wires persisted counters at boot -----------------------------
     def risk3():
         with tempfile.TemporaryDirectory() as d:
             p = str(Path(d) / "risk.json")
@@ -390,6 +390,56 @@ def main() -> int:
             loaded.max_concurrent_positions = 3  # config wins for limit
             return loaded.open_positions == 2 and loaded.max_concurrent_positions == 3
     check("risk config-wins-for-limit, disk-wins-for-counters", risk3())
+
+    # --- Risk: rehydrated unsold inventory occupies concurrency slots -------
+    async def risk4():
+        # The durable unsold registry is loaded at boot; every recovered
+        # position holds wallet capital and MUST occupy a risk slot, so the
+        # bot does not stack new buys on top of inventory still liquidating.
+        t = _trader()
+        t.risk_tracker = RiskTracker(max_concurrent_positions=3)
+        t.risk_tracker._state_path = None
+        t.risk_tracker.record_buy(0.01)
+        t.risk_tracker.record_buy(0.01)  # 2 live slots used
+        # Simulate _rehydrate_unsold finding 2 recovered positions.
+        recovered = 2
+        t.risk_tracker.open_positions += recovered  # 4 >= cap 3
+        blocked_while_recovered = t.risk_tracker.buy_allowed is False
+        # Slots are released on a successful watcher sell / TTL giveaway.
+        t.risk_tracker.record_close(0.0)
+        t.risk_tracker.record_close(0.0)  # 2 live remain
+        return (
+            blocked_while_recovered
+            and t.risk_tracker.open_positions == 2
+            and t.risk_tracker.buy_allowed is True  # freed below cap again
+        )
+    check("risk rehydrated inventory counts toward cap", asyncio.run(risk4()))
+
+    # --- Watcher: STOP verdict keeps the position in the registry ------------
+    async def watcher_stop():
+        from trading.position import ExitReason
+
+        t = _trader()
+
+        async def classify_stop(token_info, sell_result):
+            return ExitSellVerdict.STOP
+
+        t._classify_failed_exit_sell = classify_stop
+        t.seller.fail_next = True
+        pos = _position(qty=50.0)
+        token = _token()
+        t._unsold_positions[str(token.mint)] = (token, pos)
+        verdict = await t._attempt_position_exit(
+            token, pos, ExitReason.STOP_LOSS, 0.80
+        )
+        # The exit engine's durable handoff re-registers (already present),
+        # and the watcher keeps the entry on STOP instead of deleting it.
+        return (
+            verdict is ExitSellVerdict.STOP
+            and str(token.mint) in t._unsold_positions
+            and len(t.registered_unsold) == 1
+        )
+    check("watcher keeps unresolved STOP position", asyncio.run(watcher_stop()))
 
     if failures:
         print(f"\nR5-P0-1 FAILED ({len(failures)}): {failures}")
