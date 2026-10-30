@@ -672,6 +672,13 @@ class SolanaClient:
         The stuck sweeper needs Token-2022 coverage too: reward coins (and
         older dust like the DICE position) live under TokenzQdBNbLqP...
 
+        Every returned account carries ``token_program`` (the program that
+        owns the ATA) so the sweeper can build a sellable TokenInfo — the
+        seller must derive the ATA with the CORRECT program id, and the
+        combined scan previously dropped which program each account came
+        from, leaving token_program_id=None and every liquidation attempt
+        crashing on ATA derivation.
+
         Keep the retry budget deliberately small: a second full wallet scan
         after a rate-limited request multiplies provider load. A failed program
         scan is deferred to the next scheduled sweep rather than recursively
@@ -701,6 +708,8 @@ class SolanaClient:
                     # policy and armed the shared provider cooldown on 429.
                     # Do not immediately issue another full scan.
                     break
+                for acct in accounts:
+                    acct["token_program"] = str(prog)
                 combined.extend(accounts)
                 break
             else:

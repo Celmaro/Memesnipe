@@ -25,7 +25,9 @@ from cleanup.modes import (
 from core.client import SolanaClient
 from core.priority_fee.manager import PriorityFeeManager
 from core.pubkeys import (
+    SystemAddresses,
     WSOL_MINT,
+    cached_quote_token_program,
     normalize_quote_mint,
     quote_decimals,
     quote_symbol,
@@ -1058,6 +1060,16 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     # Orphaned: not tracked anywhere. Build a minimal TokenInfo
                     # and hand it to the persistent watcher (which re-prices
                     # and sells). The watcher's TTL bounds repeated attempts.
+                    # token_program MUST be carried from the scan: the seller
+                    # derives the ATA with it and crashes on None (observed
+                    # live 2026-10-30 — every liquidation attempt failed until
+                    # the program id was restored from the account owner).
+                    token_program = acct.get("token_program")
+                    token_program_id = (
+                        Pubkey.from_string(token_program)
+                        if token_program
+                        else SystemAddresses.TOKEN_2022_PROGRAM
+                    )
                     token_info = TokenInfo(
                         name=key[:8],
                         symbol=key[:6],
@@ -1065,6 +1077,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                         mint=mint,
                         platform=self.platform,
                         quote_mint=WSOL_MINT,
+                        token_program_id=token_program_id,
+                        quote_token_program_id=SystemAddresses.TOKEN_PROGRAM,
                     )
                     position = Position.create_from_buy_result(
                         mint=mint,
@@ -3959,6 +3973,21 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             field: Pubkey.from_string(value) if (value := row.get(field)) else None
             for field in pubkey_fields
         })
+        # Rows written by sweeper/orphan paths (and pre-remediation registry
+        # dumps) may lack the token program ids; the seller derives ATAs with
+        # them and crashes on None (verified live 2026-10-30). Default to
+        # pump.fun's conventions so rehydrated orphans are sellable. WSOL is
+        # always SPL Token; deterministic here, never an RPC fallback.
+        if kwargs.get("token_program_id") is None:
+            kwargs["token_program_id"] = SystemAddresses.TOKEN_2022_PROGRAM
+        if kwargs.get("quote_mint") is None:
+            kwargs["quote_mint"] = WSOL_MINT
+        if kwargs.get("quote_token_program_id") is None:
+            kwargs["quote_token_program_id"] = (
+                SystemAddresses.TOKEN_PROGRAM
+                if kwargs["quote_mint"] == WSOL_MINT
+                else cached_quote_token_program(kwargs["quote_mint"])
+            )
         return TokenInfo(**kwargs)
 
     def _serialize_unsold(self) -> list[dict]:

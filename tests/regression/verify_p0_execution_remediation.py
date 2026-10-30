@@ -452,6 +452,31 @@ def main() -> int:
         return pnl["price_change_pct"] == 0.0 and pnl["unrealized_pnl_quote"] == 0.0
     check("position pnl survives zero entry price", malformed_entry())
 
+    # --- Rehydrate: orphan rows without token program ids are sellable ------
+    def rehydrate_program_ids():
+        # Live evidence 2026-10-30: registry rows written by old sweeper
+        # paths have token_program_id/quote_token_program_id missing; the
+        # seller derived the ATA with None and EVERY liquidation attempt
+        # crashed. _token_info_from_row must default them so rehydrated
+        # orphans never re-enter the watcher unsellable.
+        from core.pubkeys import SystemAddresses, WSOL_MINT
+        from interfaces.core import Platform
+
+        row = {
+            "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+            "symbol": "BONK",
+            "platform": Platform.PUMP_FUN.value,
+            "entry_price": 0.0,
+            "quantity": 100.0,
+        }
+        info = UniversalTrader._token_info_from_row(row)
+        return (
+            info.token_program_id == SystemAddresses.TOKEN_2022_PROGRAM
+            and info.quote_token_program_id == SystemAddresses.TOKEN_PROGRAM
+            and info.quote_mint == WSOL_MINT
+        )
+    check("rehydrate defaults missing token program ids", rehydrate_program_ids())
+
     if failures:
         print(f"\nR5-P0-1 FAILED ({len(failures)}): {failures}")
         return 1
