@@ -27,12 +27,15 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from core.client import SolanaClient, SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID  # noqa: E402
-from solders.pubkey import Pubkey  # noqa: E402
+from core.client import (
+    SPL_TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
+    SolanaClient,
+)
+from solders.pubkey import Pubkey
 
 
 def _fake_response(payload: dict) -> dict:
