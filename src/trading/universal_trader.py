@@ -1457,13 +1457,29 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             if creators and trader_key in creators:
                 self._creator_sold_for_exit.add(mint_key)
         if trade.get("is_buy") and mint_key and trader_key:
-            self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
+            # Co-fire and wash/LPI are explicitly bounded cross-launch windows.
+            # The rug-buyer set is position/candidate state, so do NOT retain
+            # every buyer for every token on the whole subscribed program.
+            if (
+                mint_key in self.token_timestamps
+                or mint_key in self._buy_reservations
+                or mint_key in self._active_exit_mints
+                or mint_key in self._unsold_positions
+            ):
+                self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
             self._cofire.observe_buy(mint_key, trader_key)
         # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
         # is the bot's wallet prompts the monitor for an immediate
         # exit evaluation (off by default = current polling).
         if self.event_driven_exits_enabled and self.wallet is not None:
-            if str(trade.get("trader") or "") == str(self.wallet.public_key):
+            if (
+                mint_key
+                and (
+                    mint_key in self._active_exit_mints
+                    or mint_key in self._unsold_positions
+                )
+                and str(trade.get("trader") or "") == str(self.wallet.public_key)
+            ):
                 self._own_trade_prompt.add(mint_key)
         return trade
 
