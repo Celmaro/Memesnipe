@@ -266,8 +266,11 @@ class UniversalGeyserListener(BaseTokenListener):
             self.geyser_endpoint,
             creds,
             options=[
-                ("grpc.max_receive_message_length", 128 * 1024 * 1024),
-                ("grpc.max_send_message_length", 128 * 1024 * 1024),
+                # Transaction updates are much smaller than whole-block
+                # snapshots. Keep a defensive ceiling without reserving a
+                # 128 MiB receive window for a single stream message.
+                ("grpc.max_receive_message_length", 16 * 1024 * 1024),
+                ("grpc.max_send_message_length", 1 * 1024 * 1024),
                 ("grpc.keepalive_time_ms", 30000),
                 ("grpc.keepalive_timeout_ms", 10000),
                 ("grpc.keepalive_permit_without_calls", 1),
@@ -370,7 +373,7 @@ class UniversalGeyserListener(BaseTokenListener):
                     f"Continuity revision -> {self.continuity_revision}"
                 )
                 self._stream_healthy = True
-                self._reconnect_delay = 1.0
+                connection_started = asyncio.get_running_loop().time()
 
                 try:
                     # One stream for the whole connection; iterate it with a
@@ -404,6 +407,15 @@ class UniversalGeyserListener(BaseTokenListener):
                             timeout=max(2.0, self._watchdog_idle_threshold),
                         )
                         self._last_event_time = asyncio.get_event_loop().time()
+                        # Do not reset reconnect backoff merely because TCP/gRPC
+                        # connected. A stream that reconnects and drops every few
+                        # seconds otherwise hammers the provider forever at 1s.
+                        if (
+                            self._reconnect_delay > 1.0
+                            and self._last_event_time - connection_started >= 60.0
+                        ):
+                            self._reconnect_delay = 1.0
+                            logger.info("Geyser stream stable for 60s; reconnect backoff reset")
                         metrics.incr("geyser.updates_received")
                         token_info = await self._process_update(update)
                         if not token_info:
@@ -435,9 +447,20 @@ class UniversalGeyserListener(BaseTokenListener):
 
                 except Exception as e:
                     if isinstance(e, grpc.aio.AioRpcError):
-                        logger.exception(f"gRPC error: {e.details()}")
+                        code = e.code()
+                        logger.error("Geyser gRPC error code=%s details=%s", code, e.details())
+                        if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                            metrics.incr("geyser.grpc_resource_exhausted")
+                            # Provider quota/flow-control exhaustion deserves
+                            # the longest backoff, not rapid reconnect attempts.
+                            self._reconnect_delay = self._reconnect_delay_max
+                        elif code == grpc.StatusCode.UNAVAILABLE:
+                            metrics.incr("geyser.grpc_unavailable")
+                        elif code == grpc.StatusCode.DEADLINE_EXCEEDED:
+                            metrics.incr("geyser.grpc_deadline_exceeded")
                     else:
                         logger.exception("Geyser error occurred")
+                    metrics.incr("geyser.reconnects")
                     await self._backoff_sleep()
                     self._stream_healthy = False
 
