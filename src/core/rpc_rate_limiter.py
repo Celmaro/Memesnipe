@@ -50,7 +50,11 @@ class TokenBucketRateLimiter:
         async with self._lock:
             now = time.monotonic()
             self._cooldown_until = max(self._cooldown_until, now + delay)
-            self._refill()
+            # Drop accumulated capacity. Refill starts only after the shared
+            # cooldown expires, so the first post-cooldown second is not a
+            # full-bucket burst against a provider that just throttled us.
+            self._tokens = 0.0
+            self._last_refill = self._cooldown_until
             logger.warning(
                 "RPC provider cooldown armed for %.1fs (remaining %.1fs)",
                 delay,
@@ -77,7 +81,11 @@ class TokenBucketRateLimiter:
     def _refill(self) -> None:
         """Refill tokens based on elapsed time since last refill."""
         now = time.monotonic()
-        elapsed = now - self._last_refill
+        if now <= self._cooldown_until:
+            self._tokens = 0.0
+            return
+        refill_started = max(self._last_refill, self._cooldown_until)
+        elapsed = max(0.0, now - refill_started)
         self._tokens = min(
             self._burst_size,
             self._tokens + elapsed * self._max_rps,
