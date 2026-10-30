@@ -416,7 +416,8 @@ class SolanaClient:
             self._session = None
 
     async def _metered_sdk_rpc(self, method: str, request):
-        """Await an SDK RPC and record its count, latency and outcome."""
+        """Await an SDK RPC, record it, and propagate provider throttling."""
+        metrics.incr("rpc.requests")
         metrics.incr("rpc.sdk.requests")
         metrics.incr(f"rpc.method.{method}")
         started = monotonic()
@@ -424,8 +425,22 @@ class SolanaClient:
             result = await request
             metrics.incr("rpc.success")
             return result
-        except Exception:
+        except Exception as error:
             metrics.incr("rpc.errors")
+            response = getattr(error, "response", None)
+            status = getattr(response, "status_code", None) or getattr(
+                error, "status_code", None
+            )
+            error_text = str(error).lower()
+            if status == HTTP_TOO_MANY_REQUESTS or "429" in error_text or (
+                "too many requests" in error_text
+            ):
+                metrics.incr("rpc.http_429")
+                headers = getattr(response, "headers", {}) or {}
+                retry_after = _retry_after_seconds(
+                    headers.get("Retry-After"), 1
+                )
+                await self._rate_limiter.defer(max(1.0, retry_after))
             raise
         finally:
             metrics.record("rpc.latency", monotonic() - started)
@@ -1400,6 +1415,9 @@ class SolanaClient:
                         # request. Pause every coroutine sharing this client,
                         # including SDK calls that use the same token bucket.
                         await self._rate_limiter.defer(total_wait)
+                        metrics.set_gauge(
+                            "rpc.cooldown_remaining_s", total_wait
+                        )
                         logger.warning(
                             f"RPC rate limited (429) on {method}, "
                             f"429 retry {rate_limit_attempts}/{max_429_retries}, "
