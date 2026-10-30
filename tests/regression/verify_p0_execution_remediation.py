@@ -75,6 +75,32 @@ def _position(qty=100.0, entry=1.0) -> Position:
     )
 
 
+class _FakeProvider:
+    """Real pump.fun PDA derivation math for orphan enrichment — no RPC."""
+
+    def derive_bonding_curve_v2(self, mint):
+        from platforms.pumpfun.address_provider import PumpFunAddresses
+
+        return PumpFunAddresses.find_bonding_curve_v2(mint)
+
+    def derive_associated_bonding_curve(self, mint, pool, token_program):
+        from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID
+
+        addr, _ = Pubkey.find_program_address(
+            [bytes(pool), bytes(token_program), bytes(mint)],
+            ASSOCIATED_TOKEN_PROGRAM_ID,
+        )
+        return addr
+
+    def derive_creator_vault(self, creator):
+        from platforms.pumpfun.address_provider import PumpFunAddresses
+
+        addr, _ = Pubkey.find_program_address(
+            [b"creator-vault", bytes(creator)], PumpFunAddresses.PROGRAM
+        )
+        return addr
+
+
 class StubSeller:
     def __init__(self):
         self.calls = []
@@ -503,29 +529,6 @@ def main() -> int:
 
         calls = {"state_reads": 0}
 
-        class FakeProvider:
-            def derive_bonding_curve_v2(self, mint):
-                from platforms.pumpfun.address_provider import PumpFunAddresses
-
-                return PumpFunAddresses.find_bonding_curve_v2(mint)
-
-            def derive_associated_bonding_curve(self, mint, pool, token_program):
-                from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID
-
-                addr, _ = Pubkey.find_program_address(
-                    [bytes(pool), bytes(token_program), bytes(mint)],
-                    ASSOCIATED_TOKEN_PROGRAM_ID,
-                )
-                return addr
-
-            def derive_creator_vault(self, creator):
-                from platforms.pumpfun.address_provider import PumpFunAddresses
-
-                addr, _ = Pubkey.find_program_address(
-                    [b"creator-vault", bytes(creator)], PumpFunAddresses.PROGRAM
-                )
-                return addr
-
         class FakeCurveManager:
             async def get_pool_state(self, pool, commitment=None):
                 calls["state_reads"] += 1
@@ -534,10 +537,10 @@ def main() -> int:
         import types as _types
 
         impls = _types.SimpleNamespace(
-            address_provider=FakeProvider(), curve_manager=FakeCurveManager()
+            address_provider=_FakeProvider(), curve_manager=FakeCurveManager()
         )
 
-        async def fake_get_platform_implementations(platform, client):
+        def fake_get_platform_implementations(platform, client):
             return impls
 
         get_platform_implementations.__dict__
@@ -562,6 +565,44 @@ def main() -> int:
             _platforms_mod.get_platform_implementations = orig
             _ee.get_platform_implementations = orig_ee
     check("orphan enrich derives v2 sell fields", asyncio.run(orphan_enrichment()))
+
+    # --- Orphan skip: un-enrichable (closed curve) must NOT crash -----------
+    async def orphan_skip_no_crash():
+        # Live evidence 2026-10-30: a closed/graduated curve makes enrichment
+        # fail; the old call site then ran straight into the instruction
+        # builder and crashed on None (86 tracebacks). The exit path must
+        # turn an un-enrichable orphan into a clean RETRY instead.
+        from core.pubkeys import SystemAddresses
+        from interfaces.core import Platform
+
+        t = _trader()
+
+        class ExplodingCurveManager:
+            async def get_pool_state(self, pool, commitment=None):
+                raise ValueError("curve closed")
+
+        impls = SimpleNamespace(
+            address_provider=_FakeProvider(), curve_manager=ExplodingCurveManager()
+        )
+
+        def fake_get(platform, client):
+            return impls
+
+        import trading.exit_engine as _ee
+
+        orig_ee = _ee.get_platform_implementations
+        _ee.get_platform_implementations = fake_get
+        try:
+            token = _token()
+            token.platform = Platform.PUMP_FUN
+            token.bonding_curve = None
+            token.creator = None
+            token.creator_vault = None
+            ok = await t._ensure_sellable_orphan(token)
+            return ok is False  # explicit "cannot sell", not a crash
+        finally:
+            _ee.get_platform_implementations = orig_ee
+    check("orphan skip when curve unreadable", asyncio.run(orphan_skip_no_crash()))
 
     if failures:
         print(f"\nR5-P0-1 FAILED ({len(failures)}): {failures}")

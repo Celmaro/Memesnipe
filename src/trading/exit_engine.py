@@ -286,27 +286,37 @@ class ExitEngineMixin:
                 return True
         return fired_any
 
-    async def _ensure_sellable_orphan(self, token_info: TokenInfo) -> None:
+    async def _ensure_sellable_orphan(self, token_info: TokenInfo) -> bool:
         """Best-effort enrich a wallet-derived TokenInfo so the sell can build.
 
         Sweeper-found and rehydrated orphans only carry mint/platform/quote
         basics — the pump.fun v2 sell requires bonding_curve, creator and
         creator_vault, and without them `derive_quote_token_account` receives
         None and every liquidation attempt crashes (observed live 2026-10-30,
-        46 tracebacks before the fleet was stopped).
+        46+ tracebacks before the fleet was stopped).
 
         The bonding-curve PDA is deterministic from the mint (zero RPC); the
         creator (and thus creator_vault) comes from the curve state read,
-        which the curve manager caches. Fail-open: if the curve cannot be
-        read (graduated/closed), the subsequent sell attempt yields a normal
-        RETRY and the watcher TTL bounds the churn.
+        which the curve manager caches.
+
+        Returns:
+            True if the TokenInfo can build a v2 sell (either it already had
+            the fields, or enrichment succeeded). False means the curve is
+            unreadable (closed/graduated/legacy-v1) — the caller MUST skip
+            the sell attempt this round instead of letting the instruction
+            builder crash on None.
         """
         if getattr(token_info, "platform", None) != Platform.PUMP_FUN:
-            return
-        if token_info.bonding_curve and token_info.creator_vault:
-            return
+            return True
+        if token_info.bonding_curve:
+            # Event-parsed and test-fixture positions carry the v2 account
+            # set (bonding_curve, creator, creator_vault). Only true
+            # wallet-derived orphans lack bonding_curve — keying on it here
+            # targets exactly the sweeper/rehydrate path and leaves every
+            # normal exit untouched (zero-crash, zero extra RPC).
+            return True
         try:
-            implementations = await get_platform_implementations(
+            implementations = get_platform_implementations(
                 token_info.platform, self.solana_client
             )
             provider = implementations.address_provider
@@ -343,10 +353,15 @@ class ExitEngineMixin:
                 )
         except Exception:
             logger.warning(
-                "Could not enrich orphan TokenInfo for %s; sell will retry",
+                "Could not enrich orphan TokenInfo for %s; sell skipped this "
+                "round (curve unreadable)",
                 token_info.symbol,
                 exc_info=True,
             )
+            return False
+        # Enrichment may end with fields still unset if the curve state had
+        # no creator (closed/graduated). Be explicit about sellability.
+        return bool(token_info.bonding_curve and token_info.creator_vault)
 
     async def _staged_partial_sell(
         self,
@@ -417,8 +432,11 @@ class ExitEngineMixin:
             # Wallet-derived orphans may lack pump.fun v2 account fields
             # (bonding_curve/creator_vault); enrich before building the
             # instruction or the ATA derivation crashes with None (observed
-            # live 2026-10-30 as 46 tracebacks on liquidation attempts).
-            await self._ensure_sellable_orphan(token_info)
+            # live 2026-10-30). Un-enrichable (curve closed/graduated)
+            # orphans are skipped this round — the retry path re-reads price
+            # and re-attempts, and the watcher TTL bounds the churn.
+            if not await self._ensure_sellable_orphan(token_info):
+                return False
             # P0-1: partial sells ride the SAME serialization lock as buys and
             # full exits — a partial TP racing an in-flight buy/sell can corrupt
             # the WSOL wrap/unwrap balance exactly like the full-sell race the
@@ -625,9 +643,12 @@ class ExitEngineMixin:
         else:
             # R3-P2-13: serialize the exit sell against any in-flight buy.
             # Wallet-derived orphans lack pump.fun v2 account fields that the
-            # instruction builder requires; enrich first (best-effort, cached
-            # curve read) or the sell crashes on None (2026-10-30 live).
-            await self._ensure_sellable_orphan(token_info)
+            # instruction builder requires; enrich first (best-effort). If the
+            # curve is unreadable, skip this round — a RETRY verdict keeps the
+            # position with the monitor/watcher instead of crashing the
+            # instruction builder on None (2026-10-30 live evidence).
+            if not await self._ensure_sellable_orphan(token_info):
+                return ExitSellVerdict.RETRY
             async with self._trade_serialization_lock:
                 sell_result = await self.seller.execute(
                     token_info,
