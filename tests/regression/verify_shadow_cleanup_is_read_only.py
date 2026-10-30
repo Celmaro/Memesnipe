@@ -9,7 +9,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import trading.exit_engine as exit_engine  # noqa: E402
+import trading.universal_trader as universal_trader_module  # noqa: E402
 from trading.exit_engine import ExitEngineMixin  # noqa: E402
+from trading.universal_trader import UniversalTrader  # noqa: E402
 
 
 async def main() -> None:
@@ -44,6 +46,27 @@ async def main() -> None:
         print("[PASS] live exit retains configured ATA cleanup")
     finally:
         exit_engine.handle_cleanup_after_sell = original
+
+    # The post-session path must obey the same read-only contract.
+    post_session_calls: list[tuple] = []
+
+    async def fake_post_session_cleanup(*args) -> None:
+        post_session_calls.append(args)
+
+    original_post_session = universal_trader_module.handle_cleanup_post_session
+    universal_trader_module.handle_cleanup_post_session = fake_post_session_cleanup
+    try:
+        trader = object.__new__(UniversalTrader)
+        trader.shadow_mode = True
+        trader.traded_mints = {"mint"}
+        trader.token_timestamps = {}
+        trader.processed_tokens = set()
+        trader.solana_client = SimpleNamespace(close=lambda: asyncio.sleep(0))
+        await UniversalTrader._cleanup_resources(trader)
+        assert not post_session_calls, post_session_calls
+        print("[PASS] shadow shutdown performs no post-session cleanup transaction")
+    finally:
+        universal_trader_module.handle_cleanup_post_session = original_post_session
 
     print("ALL CHECKS PASSED")
 
