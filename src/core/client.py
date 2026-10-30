@@ -966,8 +966,6 @@ class SolanaClient:
                 values = response["result"].get("value") or []
                 status = values[0] if values else None
                 if status is not None:
-                    if status.get("err") is not None:
-                        return ConfirmationStatus.REVERTED
                     confirmation = status.get("confirmationStatus")
                     rank = {
                         "processed": 0,
@@ -975,6 +973,8 @@ class SolanaClient:
                         "finalized": 2,
                     }.get(confirmation, -1)
                     if rank >= commitment_rank:
+                        if status.get("err") is not None:
+                            return ConfirmationStatus.REVERTED
                         return await self.verify_transaction_status(signature)
             remaining = deadline - monotonic()
             if remaining <= 0:
