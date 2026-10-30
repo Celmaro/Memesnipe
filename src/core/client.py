@@ -476,6 +476,16 @@ class SolanaClient:
         response = await client.get_multiple_accounts(pubkeys, **kwargs)
         return list(response.value)
 
+    async def get_token_largest_accounts(
+        self, mint: Pubkey, commitment: str = "confirmed"
+    ):
+        """Fetch the largest token accounts through the shared RPC budget."""
+        await self._rate_limiter.acquire()
+        client = await self.get_client()
+        return await client.get_token_largest_accounts(
+            mint, commitment=commitment
+        )
+
     async def get_token_supply(
         self, mint: Pubkey, commitment: str | None = None
     ) -> int | None:
@@ -929,17 +939,54 @@ class SolanaClient:
                 logger.exception(f"Malformed transaction signature: {signature}")
                 return ConfirmationStatus.UNCONFIRMED
 
-        await self._rate_limiter.acquire()
-        client = await self.get_client()
-        try:
-            await client.confirm_transaction(
-                signature, commitment=commitment, sleep_seconds=1
+        # solana-py's confirm_transaction performs its own repeated
+        # getSignatureStatuses (and sometimes getBlockHeight) calls without
+        # going through this application's token bucket. Poll through post_rpc
+        # instead so every confirmation read is metered and 429-cooldown aware.
+        commitment_rank = {
+            "processed": 0,
+            "confirmed": 1,
+            "finalized": 2,
+        }.get(commitment, 1)
+        deadline = monotonic() + 20.0
+        poll_interval = 1.0
+        while monotonic() < deadline:
+            response = await self.post_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getSignatureStatuses",
+                    "params": [[str(signature)], {"searchTransactionHistory": True}],
+                },
+                max_retries=2,
+                max_429_retries=3,
+                deadline_seconds=max(0.0, deadline - monotonic()),
             )
-        except Exception:
-            logger.exception(f"Failed to confirm transaction {signature}")
-            return ConfirmationStatus.UNCONFIRMED
+            if response and isinstance(response.get("result"), dict):
+                values = response["result"].get("value") or []
+                status = values[0] if values else None
+                if status is not None:
+                    if status.get("err") is not None:
+                        return ConfirmationStatus.REVERTED
+                    confirmation = status.get("confirmationStatus")
+                    rank = {
+                        "processed": 0,
+                        "confirmed": 1,
+                        "finalized": 2,
+                    }.get(confirmation, -1)
+                    if rank >= commitment_rank:
+                        return await self.verify_transaction_status(signature)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
 
-        return await self.verify_transaction_status(signature)
+        logger.warning(
+            "Timed out waiting for transaction %s to reach %s; outcome remains unknown",
+            str(signature)[:16],
+            commitment,
+        )
+        return ConfirmationStatus.UNCONFIRMED
 
     async def verify_transaction_succeeded(self, signature: str | Signature) -> bool:
         """Check whether a landed transaction actually executed successfully.
@@ -1305,10 +1352,14 @@ class SolanaClient:
                         total_wait = _retry_after_seconds(
                             response.headers.get("Retry-After"), rate_limit_attempts
                         )
+                        # Throttling belongs to the provider, not just this
+                        # request. Pause every coroutine sharing this client,
+                        # including SDK calls that use the same token bucket.
+                        await self._rate_limiter.defer(total_wait)
                         logger.warning(
                             f"RPC rate limited (429) on {method}, "
                             f"429 retry {rate_limit_attempts}/{max_429_retries}, "
-                            f"waiting {total_wait:.1f}s"
+                            f"shared cooldown {total_wait:.1f}s"
                         )
                         if not deadline.allows(total_wait):
                             logger.warning(
@@ -1316,7 +1367,9 @@ class SolanaClient:
                                 f"(next retry would wait {total_wait:.1f}s)"
                             )
                             break
-                        await asyncio.sleep(total_wait)
+                        # Re-enter through acquire(); the shared cooldown is
+                        # enforced centrally and no concurrent caller can keep
+                        # hitting the same throttled provider.
                         continue
 
                     response.raise_for_status()
