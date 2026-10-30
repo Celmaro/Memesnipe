@@ -1402,22 +1402,18 @@ class SolanaClient:
                             metrics.record("rpc.latency", monotonic() - request_started)
                             request_started = None
                         rate_limit_attempts += 1
+                        total_wait = _retry_after_seconds(
+                            response.headers.get("Retry-After"), rate_limit_attempts
+                        )
+                        # Arm the provider-wide cooldown even when this
+                        # particular request has exhausted its retry budget.
+                        await self._rate_limiter.defer(total_wait)
                         if rate_limit_attempts >= max_429_retries:
                             logger.error(
                                 f"RPC rate limited (429) on {method}, "
                                 f"exhausted {max_429_retries} rate-limit retries"
                             )
                             break
-                        total_wait = _retry_after_seconds(
-                            response.headers.get("Retry-After"), rate_limit_attempts
-                        )
-                        # Throttling belongs to the provider, not just this
-                        # request. Pause every coroutine sharing this client,
-                        # including SDK calls that use the same token bucket.
-                        await self._rate_limiter.defer(total_wait)
-                        metrics.set_gauge(
-                            "rpc.cooldown_remaining_s", total_wait
-                        )
                         logger.warning(
                             f"RPC rate limited (429) on {method}, "
                             f"429 retry {rate_limit_attempts}/{max_429_retries}, "
