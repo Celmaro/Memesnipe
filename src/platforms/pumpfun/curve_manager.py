@@ -238,7 +238,13 @@ class PumpFunCurveManager(CurveManager):
             return curve_state_data
 
         except Exception as e:
-            logger.exception("Failed to get curve state")
+            # Normal outcome for graduated/closed curves: the account no
+            # longer exists, so the read fails. Callers decide whether that
+            # is actionable (sell skip) — a full traceback per watcher tick
+            # across a wallet full of leftover dust spams the log with
+            # hundreds of lines (observed live 2026-10-30, ~90-120 lines).
+            # The exception class + message is enough for this expected case.
+            logger.warning(f"Failed to get curve state: {e!s}")
             raise ValueError(f"Invalid bonding curve state: {e!s}")
 
     async def get_pool_state_and_token_program(

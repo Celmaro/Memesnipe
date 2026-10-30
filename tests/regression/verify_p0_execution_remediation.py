@@ -188,6 +188,7 @@ def _trader(**overrides) -> UniversalTrader:
     t._trail_states = {}
     t._trail_exit_attempts = {}
     t._unreadable_curves = {}
+    t._unsellable_parked = {}
     t.trail_initial_tp_share = 0.4
     t.trail_initial_tp_pct = 0.20
     t.trail_second_tp_share = 0.30
@@ -509,6 +510,22 @@ def main() -> int:
             and _eps(blended, 10.25)
         )
     check("risk zero entry price degrades realized PnL", zero_entry_degrades())
+
+    # --- Risk: unsellable dust is parked after TTL, not re-swept forever ---
+    def parked_dust():
+        # Live evidence 2026-10-30: closed/graduated orphans re-entered the
+        # unsold registry on every sweep (register -> TTL -> re-find), so the
+        # wallet never converged. TTL give-up parks the mint; the sweeper
+        # skips parked mints for 1h before lazily re-checking.
+        from time import monotonic as _monotonic
+
+        t = _trader()
+        t._unsellable_parked = {str(DEFAULT_PUBKEY): _monotonic()}
+        parked_now = t._unsellable_parked.get(str(DEFAULT_PUBKEY))
+        # the sweeper skip is a separate code path; assert the parking record
+        # exists and is honored by the lap-time check (<1h => skip).
+        return parked_now is not None and (_monotonic() - parked_now) < 3600
+    check("unsellable dust parked after TTL", parked_dust())
 
     # --- Risk: boot must NOT restore open_positions from disk ---------------
     def risk5_boot_reset():

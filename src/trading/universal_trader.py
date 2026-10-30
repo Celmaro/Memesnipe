@@ -786,6 +786,12 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         # persistent watcher retries every interval; without this the closed
         # curve is re-read (and traceback-logged) on every attempt until TTL.
         self._unreadable_curves: dict[str, float] = {}
+        # Leftover dust that survived a full watcher TTL without selling —
+        # closed/graduated curves have no pump.fun sell path. Parked mints
+        # are skipped by the sweeper so they do not re-enter the registry
+        # every sweep (register -> TTL -> re-find loop). Re-checked lazily
+        # (parked_for > 1h) in case a token becomes sellable later.
+        self._unsellable_parked: dict[str, float] = {}
         self.take_profit_percentage = take_profit_percentage
         self.stop_loss_percentage = stop_loss_percentage
         # R3-P1-2: staged exits. Parse once at construction; [] = feature off
@@ -1072,6 +1078,15 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                         or key in traded
                     ):
                         continue
+                    _now = time.monotonic()
+                    _parked = self._unsellable_parked.get(key)
+                    if _parked is not None:
+                        # Survived a full watcher TTL without a pump.fun sell
+                        # path (closed/graduated curve). Re-check lazily once
+                        # an hour in case it becomes sellable; skip otherwise.
+                        if _now - _parked < 3600:
+                            continue
+                        self._unsellable_parked.pop(key, None)
                     # Orphaned: not tracked anywhere. Build a minimal TokenInfo
                     # and hand it to the persistent watcher (which re-prices
                     # and sells). The watcher's TTL bounds repeated attempts.
@@ -4166,6 +4181,16 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     )
                     del self._unsold_positions[key]
                     self._persist_unsold()  # C7.2
+                    # No pump.fun sell path found in a full TTL window: park
+                    # the mint so the sweeper stops re-registering it every
+                    # sweep (register -> TTL -> re-find loop, observed live
+                    # 2026-10-30). Re-checked lazily after 1h.
+                    try:
+                        from time import monotonic as _monotonic_park
+
+                        self._unsellable_parked[key] = _monotonic_park()
+                    except Exception:
+                        pass
                     # The position is no longer being watched; release the
                     # concurrency slot if it held one (live handoffs took a
                     # slot at buy; liquidation-queue rows never did), even
