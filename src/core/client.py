@@ -115,6 +115,12 @@ class _Deadline:
         """
         return self._expires_at is not None and monotonic() >= self._expires_at
 
+    def remaining(self) -> float | None:
+        """Seconds left, or None when this request has no wall-clock budget."""
+        if self._expires_at is None:
+            return None
+        return max(0.0, self._expires_at - monotonic())
+
     def allows(self, wait: float) -> bool:
         """Check whether a backoff fits in what is left of the budget.
 
@@ -1393,63 +1399,102 @@ class SolanaClient:
 
             request_started: float | None = None
             try:
-                await self._rate_limiter.acquire()
+                remaining = deadline.remaining()
+                if remaining is None:
+                    await self._rate_limiter.acquire()
+                else:
+                    if remaining <= 0:
+                        break
+                    # A provider-wide cooldown can be much longer than a
+                    # latency-sensitive caller's deadline. Bound the limiter
+                    # wait itself so fee sampling/confirmation cannot sit
+                    # blocked beyond the budget they explicitly requested.
+                    try:
+                        await asyncio.wait_for(
+                            self._rate_limiter.acquire(), timeout=remaining
+                        )
+                    except TimeoutError:
+                        logger.warning(
+                            "RPC request %s exhausted its %s waiting for rate-limit capacity",
+                            method,
+                            deadline,
+                        )
+                        break
+
                 session = await self._get_session()
                 metrics.incr("rpc.requests")
                 metrics.incr(f"rpc.method.{method}")
                 request_started = monotonic()
 
-                async with session.post(
-                    self.rpc_endpoint,
-                    json=body,
-                    headers=self._rpc_headers or None,
-                ) as response:
-                    if response.status == HTTP_TOO_MANY_REQUESTS:
-                        metrics.incr("rpc.http_429")
-                        if request_started is not None:
-                            metrics.record("rpc.latency", monotonic() - request_started)
-                            request_started = None
-                        rate_limit_attempts += 1
-                        total_wait = _retry_after_seconds(
-                            response.headers.get("Retry-After"), rate_limit_attempts
-                        )
-                        # Arm the provider-wide cooldown even when this
-                        # particular request has exhausted its retry budget.
-                        await self._rate_limiter.defer(total_wait)
-                        if rate_limit_attempts >= max_429_retries:
-                            logger.error(
-                                f"RPC rate limited (429) on {method}, "
-                                f"exhausted {max_429_retries} rate-limit retries"
-                            )
-                            break
-                        logger.warning(
-                            f"RPC rate limited (429) on {method}, "
-                            f"429 retry {rate_limit_attempts}/{max_429_retries}, "
-                            f"shared cooldown {total_wait:.1f}s"
-                        )
-                        if not deadline.allows(total_wait):
-                            logger.warning(
-                                f"RPC request {method} gave up on its {deadline} "
-                                f"(next retry would wait {total_wait:.1f}s)"
-                            )
-                            break
-                        # Re-enter through acquire(); the shared cooldown is
-                        # enforced centrally and no concurrent caller can keep
-                        # hitting the same throttled provider.
-                        continue
+                async def _send_one():
+                    async with session.post(
+                        self.rpc_endpoint,
+                        json=body,
+                        headers=self._rpc_headers or None,
+                    ) as response:
+                        if response.status == HTTP_TOO_MANY_REQUESTS:
+                            return None, True, response.headers.get("Retry-After")
+                        response.raise_for_status()
+                        return await response.json(), False, None
 
-                    response.raise_for_status()
-                    result = await response.json()
-                    metrics.incr("rpc.success")
+                # Include the HTTP request and JSON decode in the same
+                # per-call budget, not only the retry sleeps between attempts.
+                remaining = deadline.remaining()
+                if remaining is None:
+                    result, rate_limited, retry_after = await _send_one()
+                else:
+                    if remaining <= 0:
+                        break
+                    async with asyncio.timeout(remaining):
+                        result, rate_limited, retry_after = await _send_one()
+
+                if rate_limited:
+                    metrics.incr("rpc.http_429")
                     if request_started is not None:
                         metrics.record("rpc.latency", monotonic() - request_started)
-                    return result
+                        request_started = None
+                    rate_limit_attempts += 1
+                    total_wait = _retry_after_seconds(retry_after, rate_limit_attempts)
+                    # Arm the provider-wide cooldown even when this particular
+                    # request has exhausted its retry budget.
+                    await self._rate_limiter.defer(total_wait)
+                    if rate_limit_attempts >= max_429_retries:
+                        logger.error(
+                            "RPC rate limited (429) on %s, exhausted %d rate-limit retries",
+                            method,
+                            max_429_retries,
+                        )
+                        break
+                    logger.warning(
+                        "RPC rate limited (429) on %s, retry %d/%d, shared cooldown %.1fs",
+                        method,
+                        rate_limit_attempts,
+                        max_429_retries,
+                        total_wait,
+                    )
+                    if not deadline.allows(total_wait):
+                        logger.warning(
+                            "RPC request %s gave up on its %s (next retry would wait %.1fs)",
+                            method,
+                            deadline,
+                            total_wait,
+                        )
+                        break
+                    # Re-enter through acquire(); the shared cooldown is
+                    # enforced centrally and no concurrent caller can keep
+                    # hitting the same throttled provider.
+                    continue
+
+                metrics.incr("rpc.success")
+                if request_started is not None:
+                    metrics.record("rpc.latency", monotonic() - request_started)
+                return result
 
             except aiohttp.ContentTypeError:
                 metrics.incr("rpc.errors")
                 if request_started is not None:
                     metrics.record("rpc.latency", monotonic() - request_started)
-                logger.exception(f"Failed to decode RPC response for {method}")
+                logger.exception("Failed to decode RPC response for %s", method)
                 break
 
             # asyncio.TimeoutError is what aiohttp raises when the request
@@ -1460,24 +1505,37 @@ class SolanaClient:
                 metrics.incr("rpc.errors")
                 if request_started is not None:
                     metrics.record("rpc.latency", monotonic() - request_started)
+                if deadline.expired():
+                    logger.warning(
+                        "RPC request %s exhausted its %s during request execution",
+                        method,
+                        deadline,
+                    )
+                    break
                 error_attempts += 1
                 if error_attempts >= max_retries:
                     logger.exception(
-                        f"RPC request {method} failed after {max_retries} attempts"
+                        "RPC request %s failed after %d attempts",
+                        method,
+                        max_retries,
                     )
                     break
 
                 wait_time = min(2 ** (error_attempts - 1), 16)
                 jitter = wait_time * random.uniform(0, 0.25)  # noqa: S311
                 logger.warning(
-                    f"RPC request {method} failed "
-                    f"(attempt {error_attempts}/{max_retries}), "
-                    f"retrying in {wait_time + jitter:.1f}s"
+                    "RPC request %s failed (attempt %d/%d), retrying in %.1fs",
+                    method,
+                    error_attempts,
+                    max_retries,
+                    wait_time + jitter,
                 )
                 if not deadline.allows(wait_time + jitter):
                     logger.warning(
-                        f"RPC request {method} gave up on its {deadline} "
-                        f"(next retry would wait {wait_time + jitter:.1f}s)"
+                        "RPC request %s gave up on its %s (next retry would wait %.1fs)",
+                        method,
+                        deadline,
+                        wait_time + jitter,
                     )
                     break
                 await asyncio.sleep(wait_time + jitter)
