@@ -26,6 +26,7 @@ from solders.transaction import VersionedTransaction
 
 from core.pubkeys import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, is_sol_paired
 from core.rpc_rate_limiter import TokenBucketRateLimiter
+from monitoring.metrics import metrics
 from interfaces.core import ConfirmationStatus, Platform
 from utils.idl_manager import get_idl_parser
 from utils.logger import get_logger
@@ -113,6 +114,12 @@ class _Deadline:
             True if there is a deadline and it has passed
         """
         return self._expires_at is not None and monotonic() >= self._expires_at
+
+    def remaining(self) -> float | None:
+        """Seconds left, or None when this request has no wall-clock budget."""
+        if self._expires_at is None:
+            return None
+        return max(0.0, self._expires_at - monotonic())
 
     def allows(self, wait: float) -> bool:
         """Check whether a backoff fits in what is left of the budget.
@@ -414,6 +421,36 @@ class SolanaClient:
             await self._session.close()
             self._session = None
 
+    async def _metered_sdk_rpc(self, method: str, request):
+        """Await an SDK RPC, record it, and propagate provider throttling."""
+        metrics.incr("rpc.requests")
+        metrics.incr("rpc.sdk.requests")
+        metrics.incr(f"rpc.method.{method}")
+        started = monotonic()
+        try:
+            result = await request
+            metrics.incr("rpc.success")
+            return result
+        except Exception as error:
+            metrics.incr("rpc.errors")
+            response = getattr(error, "response", None)
+            status = getattr(response, "status_code", None) or getattr(
+                error, "status_code", None
+            )
+            error_text = str(error).lower()
+            if status == HTTP_TOO_MANY_REQUESTS or "429" in error_text or (
+                "too many requests" in error_text
+            ):
+                metrics.incr("rpc.http_429")
+                headers = getattr(response, "headers", {}) or {}
+                retry_after = _retry_after_seconds(
+                    headers.get("Retry-After"), 1
+                )
+                await self._rate_limiter.defer(max(1.0, retry_after))
+            raise
+        finally:
+            metrics.record("rpc.latency", monotonic() - started)
+
     async def get_health(self) -> str | None:
         body = {
             "jsonrpc": "2.0",
@@ -447,7 +484,9 @@ class SolanaClient:
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
-        response = await client.get_account_info(pubkey, **kwargs)
+        response = await self._metered_sdk_rpc(
+            "getAccountInfo", client.get_account_info(pubkey, **kwargs)
+        )
         if not response.value:
             raise ValueError(f"Account {pubkey} not found")
         return response.value
@@ -473,8 +512,21 @@ class SolanaClient:
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
-        response = await client.get_multiple_accounts(pubkeys, **kwargs)
+        response = await self._metered_sdk_rpc(
+            "getMultipleAccounts", client.get_multiple_accounts(pubkeys, **kwargs)
+        )
         return list(response.value)
+
+    async def get_token_largest_accounts(
+        self, mint: Pubkey, commitment: str = "confirmed"
+    ):
+        """Fetch the largest token accounts through the shared RPC budget."""
+        await self._rate_limiter.acquire()
+        client = await self.get_client()
+        return await self._metered_sdk_rpc(
+            "getTokenLargestAccounts",
+            client.get_token_largest_accounts(mint, commitment=commitment),
+        )
 
     async def get_token_supply(
         self, mint: Pubkey, commitment: str | None = None
@@ -495,7 +547,9 @@ class SolanaClient:
         if commitment is not None:
             kwargs["commitment"] = commitment
         try:
-            response = await client.get_token_supply(mint, **kwargs)
+            response = await self._metered_sdk_rpc(
+                "getTokenSupply", client.get_token_supply(mint, **kwargs)
+            )
             if not response.value:
                 return None
             return response.value.amount
@@ -518,7 +572,9 @@ class SolanaClient:
         try:
             await self._rate_limiter.acquire()
             client = await self.get_client()
-            response = await client.get_slot(commitment=commitment)
+            response = await self._metered_sdk_rpc(
+                "getSlot", client.get_slot(commitment=commitment)
+            )
             return int(response.value)
         except Exception:
             logger.exception("get_slot failed")
@@ -547,8 +603,11 @@ class SolanaClient:
         try:
             await self._rate_limiter.acquire()
             client = await self.get_client()
-            response = await client.get_program_accounts(
-                program_id, commitment=commitment, filters=filters
+            response = await self._metered_sdk_rpc(
+                "getProgramAccounts",
+                client.get_program_accounts(
+                    program_id, commitment=commitment, filters=filters
+                ),
             )
             return [(acc.pubkey, acc.account) for acc in response.value]
         except Exception:
@@ -572,8 +631,11 @@ class SolanaClient:
         """
         await self._rate_limiter.acquire()
         client = await self.get_client()
-        response = await client.get_token_account_balance(
-            token_account, commitment=commitment
+        response = await self._metered_sdk_rpc(
+            "getTokenAccountBalance",
+            client.get_token_account_balance(
+                token_account, commitment=commitment
+            ),
         )
         if response.value:
             return int(response.value.amount)
@@ -603,16 +665,17 @@ class SolanaClient:
         )
 
     async def get_token_accounts_by_owner_all_programs(
-        self, owner: Pubkey, commitment: str = "confirmed", retries: int = 3
+        self, owner: Pubkey, commitment: str = "confirmed", retries: int = 2
     ) -> list[dict]:
         """List token accounts across SPL and Token-2022 programs.
 
         The stuck sweeper needs Token-2022 coverage too: reward coins (and
         older dust like the DICE position) live under TokenzQdBNbLqP...
 
-        PublicNode intermittently answers token-account scans with HTTP 403
-        under load; retry each program's scan with backoff rather than
-        dropping the whole sweep on a transient.
+        Keep the retry budget deliberately small: a second full wallet scan
+        after a rate-limited request multiplies provider load. A failed program
+        scan is deferred to the next scheduled sweep rather than recursively
+        amplified here.
         """
         import asyncio as _asyncio
 
@@ -622,7 +685,10 @@ class SolanaClient:
             for attempt in range(retries):
                 try:
                     accounts = await self._token_accounts_raw(
-                        owner, prog, commitment=commitment
+                        owner,
+                        prog,
+                        commitment=commitment,
+                        deadline_seconds=8.0,
                     )
                 except Exception as error:  # noqa: BLE001
                     last_error = error
@@ -631,9 +697,10 @@ class SolanaClient:
                     continue
                 if accounts is None:
                     last_error = RuntimeError("token-account RPC returned no response")
-                    if attempt < retries - 1:
-                        await _asyncio.sleep(3 * (attempt + 1))
-                    continue
+                    # post_rpc has already exhausted its bounded retry/deadline
+                    # policy and armed the shared provider cooldown on 429.
+                    # Do not immediately issue another full scan.
+                    break
                 combined.extend(accounts)
                 break
             else:
@@ -648,6 +715,8 @@ class SolanaClient:
         owner: Pubkey,
         program_id: Pubkey,
         commitment: str = "confirmed",
+        *,
+        deadline_seconds: float = 8.0,
     ) -> list[dict] | None:
         """Raw jsonParsed token-account scan via post_rpc.
 
@@ -674,8 +743,9 @@ class SolanaClient:
                     {"encoding": "jsonParsed", "commitment": commitment},
                 ],
             },
-            max_retries=3,
-            max_429_retries=8,
+            max_retries=2,
+            max_429_retries=2,
+            deadline_seconds=deadline_seconds,
         )
         if response is None:
             return None
@@ -696,7 +766,10 @@ class SolanaClient:
         """Get the latest blockhash."""
         await self._rate_limiter.acquire()
         client = await self.get_client()
-        response = await client.get_latest_blockhash(commitment="processed")
+        response = await self._metered_sdk_rpc(
+            "getLatestBlockhash",
+            client.get_latest_blockhash(commitment="processed"),
+        )
         val = response.value
         # C2.2: record lastValidBlockHeight next to the hash — the RPC
         # reports it and the cached-blockhash path uses it (see
@@ -790,7 +863,9 @@ class SolanaClient:
                 tx_opts = TxOptsModel(
                     skip_preflight=skip_preflight, preflight_commitment=Processed
                 )
-                response = await client.send_transaction(transaction, tx_opts)
+                response = await self._metered_sdk_rpc(
+                    "sendTransaction", client.send_transaction(transaction, tx_opts)
+                )
                 return response.value
 
             except Exception as e:
@@ -929,17 +1004,57 @@ class SolanaClient:
                 logger.exception(f"Malformed transaction signature: {signature}")
                 return ConfirmationStatus.UNCONFIRMED
 
-        await self._rate_limiter.acquire()
-        client = await self.get_client()
-        try:
-            await client.confirm_transaction(
-                signature, commitment=commitment, sleep_seconds=1
+        # solana-py's confirm_transaction performs its own repeated
+        # getSignatureStatuses (and sometimes getBlockHeight) calls without
+        # going through this application's token bucket. Poll through post_rpc
+        # instead so every confirmation read is metered and 429-cooldown aware.
+        commitment_rank = {
+            "processed": 0,
+            "confirmed": 1,
+            "finalized": 2,
+        }.get(commitment, 1)
+        deadline = monotonic() + 20.0
+        poll_interval = 1.0
+        while monotonic() < deadline:
+            response = await self.post_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getSignatureStatuses",
+                    # The signature has just been submitted, so the recent
+                    # status cache is sufficient. Avoid ledger-history search
+                    # on every poll; it is heavier and unnecessary here.
+                    "params": [[str(signature)]],
+                },
+                max_retries=2,
+                max_429_retries=3,
+                deadline_seconds=max(0.0, deadline - monotonic()),
             )
-        except Exception:
-            logger.exception(f"Failed to confirm transaction {signature}")
-            return ConfirmationStatus.UNCONFIRMED
+            if response and isinstance(response.get("result"), dict):
+                values = response["result"].get("value") or []
+                status = values[0] if values else None
+                if status is not None:
+                    confirmation = status.get("confirmationStatus")
+                    rank = {
+                        "processed": 0,
+                        "confirmed": 1,
+                        "finalized": 2,
+                    }.get(confirmation, -1)
+                    if rank >= commitment_rank:
+                        if status.get("err") is not None:
+                            return ConfirmationStatus.REVERTED
+                        return await self.verify_transaction_status(signature)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
 
-        return await self.verify_transaction_status(signature)
+        logger.warning(
+            "Timed out waiting for transaction %s to reach %s; outcome remains unknown",
+            str(signature)[:16],
+            commitment,
+        )
+        return ConfirmationStatus.UNCONFIRMED
 
     async def verify_transaction_succeeded(self, signature: str | Signature) -> bool:
         """Check whether a landed transaction actually executed successfully.
@@ -1285,45 +1400,104 @@ class SolanaClient:
                 logger.warning(f"RPC request {method} exceeded its {deadline}")
                 break
 
+            request_started: float | None = None
             try:
-                await self._rate_limiter.acquire()
-                session = await self._get_session()
-
-                async with session.post(
-                    self.rpc_endpoint,
-                    json=body,
-                    headers=self._rpc_headers or None,
-                ) as response:
-                    if response.status == HTTP_TOO_MANY_REQUESTS:
-                        rate_limit_attempts += 1
-                        if rate_limit_attempts >= max_429_retries:
-                            logger.error(
-                                f"RPC rate limited (429) on {method}, "
-                                f"exhausted {max_429_retries} rate-limit retries"
-                            )
-                            break
-                        total_wait = _retry_after_seconds(
-                            response.headers.get("Retry-After"), rate_limit_attempts
+                remaining = deadline.remaining()
+                if remaining is None:
+                    await self._rate_limiter.acquire()
+                else:
+                    if remaining <= 0:
+                        break
+                    # A provider-wide cooldown can be much longer than a
+                    # latency-sensitive caller's deadline. Bound the limiter
+                    # wait itself so fee sampling/confirmation cannot sit
+                    # blocked beyond the budget they explicitly requested.
+                    try:
+                        await asyncio.wait_for(
+                            self._rate_limiter.acquire(), timeout=remaining
                         )
+                    except TimeoutError:
                         logger.warning(
-                            f"RPC rate limited (429) on {method}, "
-                            f"429 retry {rate_limit_attempts}/{max_429_retries}, "
-                            f"waiting {total_wait:.1f}s"
+                            "RPC request %s exhausted its %s waiting for rate-limit capacity",
+                            method,
+                            deadline,
                         )
-                        if not deadline.allows(total_wait):
-                            logger.warning(
-                                f"RPC request {method} gave up on its {deadline} "
-                                f"(next retry would wait {total_wait:.1f}s)"
-                            )
-                            break
-                        await asyncio.sleep(total_wait)
-                        continue
+                        break
 
-                    response.raise_for_status()
-                    return await response.json()
+                session = await self._get_session()
+                metrics.incr("rpc.requests")
+                metrics.incr(f"rpc.method.{method}")
+                request_started = monotonic()
+
+                async def _send_one():
+                    async with session.post(
+                        self.rpc_endpoint,
+                        json=body,
+                        headers=self._rpc_headers or None,
+                    ) as response:
+                        if response.status == HTTP_TOO_MANY_REQUESTS:
+                            return None, True, response.headers.get("Retry-After")
+                        response.raise_for_status()
+                        return await response.json(), False, None
+
+                # Include the HTTP request and JSON decode in the same
+                # per-call budget, not only the retry sleeps between attempts.
+                remaining = deadline.remaining()
+                if remaining is None:
+                    result, rate_limited, retry_after = await _send_one()
+                else:
+                    if remaining <= 0:
+                        break
+                    async with asyncio.timeout(remaining):
+                        result, rate_limited, retry_after = await _send_one()
+
+                if rate_limited:
+                    metrics.incr("rpc.http_429")
+                    if request_started is not None:
+                        metrics.record("rpc.latency", monotonic() - request_started)
+                        request_started = None
+                    rate_limit_attempts += 1
+                    total_wait = _retry_after_seconds(retry_after, rate_limit_attempts)
+                    # Arm the provider-wide cooldown even when this particular
+                    # request has exhausted its retry budget.
+                    await self._rate_limiter.defer(total_wait)
+                    if rate_limit_attempts >= max_429_retries:
+                        logger.error(
+                            "RPC rate limited (429) on %s, exhausted %d rate-limit retries",
+                            method,
+                            max_429_retries,
+                        )
+                        break
+                    logger.warning(
+                        "RPC rate limited (429) on %s, retry %d/%d, shared cooldown %.1fs",
+                        method,
+                        rate_limit_attempts,
+                        max_429_retries,
+                        total_wait,
+                    )
+                    if not deadline.allows(total_wait):
+                        logger.warning(
+                            "RPC request %s gave up on its %s (next retry would wait %.1fs)",
+                            method,
+                            deadline,
+                            total_wait,
+                        )
+                        break
+                    # Re-enter through acquire(); the shared cooldown is
+                    # enforced centrally and no concurrent caller can keep
+                    # hitting the same throttled provider.
+                    continue
+
+                metrics.incr("rpc.success")
+                if request_started is not None:
+                    metrics.record("rpc.latency", monotonic() - request_started)
+                return result
 
             except aiohttp.ContentTypeError:
-                logger.exception(f"Failed to decode RPC response for {method}")
+                metrics.incr("rpc.errors")
+                if request_started is not None:
+                    metrics.record("rpc.latency", monotonic() - request_started)
+                logger.exception("Failed to decode RPC response for %s", method)
                 break
 
             # asyncio.TimeoutError is what aiohttp raises when the request
@@ -1331,24 +1505,40 @@ class SolanaClient:
             # here every RPC timeout propagated out of post_rpc unretried and
             # crashed the caller with an exception whose str() is empty.
             except (TimeoutError, aiohttp.ClientError):
+                metrics.incr("rpc.errors")
+                if request_started is not None:
+                    metrics.record("rpc.latency", monotonic() - request_started)
+                if deadline.expired():
+                    logger.warning(
+                        "RPC request %s exhausted its %s during request execution",
+                        method,
+                        deadline,
+                    )
+                    break
                 error_attempts += 1
                 if error_attempts >= max_retries:
                     logger.exception(
-                        f"RPC request {method} failed after {max_retries} attempts"
+                        "RPC request %s failed after %d attempts",
+                        method,
+                        max_retries,
                     )
                     break
 
                 wait_time = min(2 ** (error_attempts - 1), 16)
                 jitter = wait_time * random.uniform(0, 0.25)  # noqa: S311
                 logger.warning(
-                    f"RPC request {method} failed "
-                    f"(attempt {error_attempts}/{max_retries}), "
-                    f"retrying in {wait_time + jitter:.1f}s"
+                    "RPC request %s failed (attempt %d/%d), retrying in %.1fs",
+                    method,
+                    error_attempts,
+                    max_retries,
+                    wait_time + jitter,
                 )
                 if not deadline.allows(wait_time + jitter):
                     logger.warning(
-                        f"RPC request {method} gave up on its {deadline} "
-                        f"(next retry would wait {wait_time + jitter:.1f}s)"
+                        "RPC request %s gave up on its %s (next retry would wait %.1fs)",
+                        method,
+                        deadline,
+                        wait_time + jitter,
                     )
                     break
                 await asyncio.sleep(wait_time + jitter)

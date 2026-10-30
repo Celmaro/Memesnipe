@@ -89,7 +89,9 @@ trade:
   max_sell_impact_bps: 0
   # P2-STRUC-1: background blockhash refresh cadence (seconds). Lower = fresher
   # sends, more RPC pressure; 0.05 floor, public-RPC-friendly default 5.0.
-  blockhash_refresh_interval: 5.0
+  # 15s lowers the background RPC baseline to ~0.067 requests/sec while
+  # remaining comfortably inside the recent-blockhash validity window.
+  blockhash_refresh_interval: 15.0
   # R3-P2-2: durable nonce account (base58). Off by default (null). When set,
   # sends use the nonce account's stored blockhash + a nonce-advance
   # instruction (replay-protected, valid far beyond 150 blocks).
@@ -163,7 +165,10 @@ trade:
   # a flat token's hype window passed (53-trade cohort: median hold <15m).
   stagnation_exit_min: 0 # minutes; 0 = off
   stagnation_band_pct: 0.02 # +/-2% band around the entry price
-  price_check_interval: 1 # 1s checks << 30s hold (validated at load)
+  # RPC-remediation: cap monitor reads under the request budget.
+  # At the user-set 10-position cap this is ~3.3 price reads/sec worst case;
+  # the metered limiter + shared 429 cooldown queue the excess instead of storming.
+  price_check_interval: 3
   max_exit_sell_attempts: 5 # bounded retries with fresh price floor
   # Phase 3: after the bounded retries are spent, the position is handed to a
   # persistent exit watcher that keeps re-pricing and selling until it clears
@@ -178,7 +183,7 @@ trade:
   # buy/sell produced simulated fills; with it OFF the real buyer/seller fire.
   # Research capture (shadow_data/ + strategies ledger) stays ON in live mode
   # so every real trade is recorded for calibration.
-  shadow_mode: false # LIVE TRADING ON — real funds (0.01 SOL/buy, risk cut below)
+  shadow_mode: false # LIVE TRADING ON — real funds (0.01 SOL/buy, risk cut below). RPC-remediation code fixes landed without the branch's shadow flip; wallet must be refilled before buys can land.
 # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
 # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
 backfill:
@@ -190,7 +195,10 @@ backfill:
 
 # Priority fees: transaction speed vs cost (fixed = 0 extra RPC calls)
 priority_fees:
-  enable_dynamic: true # T1.4 auction: sample market fee via getRecentPrioritizationFees
+  # Disabled for the shared 2-RPS endpoint: distinct pool-account keys make
+  # the 2s account-keyed cache miss on most launches, adding a fee RPC per buy.
+  # Re-enable only after moving to a dedicated RPC and measuring the benefit.
+  enable_dynamic: false
   enable_fixed: true # fallback when the dynamic sample is unavailable
   fixed_amount: 100_000 # fallback CU price: ~0.00001 SOL/tx at documented CU defaults
   # Improvement #6: split buy/sell priority fees — urgent buys may pay more,
@@ -229,7 +237,8 @@ jito:
 # R3-P2-10: session risk guards (0 = off). The loss limit blocks NEW buys
 # while sells still run — it never traps money in a falling position.
 risk:
-  max_concurrent_positions: 10 # user-set live cap (was 0 = unlimited; wallet drained to 0.0086 SOL on 31 concurrent opens)
+  # User-set live exposure cap; RPC remediation meters and cools all requests.
+  max_concurrent_positions: 10
   daily_loss_limit_sol: 0.098 # ~$10 realized portfolio loss (SOL @ $102.15 on 2026-10-29): blocks NEW buys, sells still run (never traps money)
   budget_sol: 0.15 # user-set live cap (was 0 = off): total quote spent on buys this session
 
@@ -390,7 +399,7 @@ node:
   # Free-tier profile: mainnet-beta 429s the sustained 8 rps / burst-4 profile
   # (that storm produced 900K retry-log lines and zero sim trades on 2026-10-29).
   # 2 rps with burst 1  keeps shadow flow alive without tripping the limiter.
-  max_rps: 2 # gentler burst profile for free tiers (25/burst-25 burned our IP
+  max_rps: 2 # stays conservative until a dedicated endpoint is configured
              # on mainnet-beta/publicnode; 8/burst-4 kept 429ing; 2/burst-1 stable).
   burst_size: 1
   # R4-P4-3: startup RPC latency self-test (ON). Three get_slot round trips

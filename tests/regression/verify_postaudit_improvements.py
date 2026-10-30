@@ -67,8 +67,17 @@ def _trader(**kw):
         token_timestamps={},  # noqa: SLF001
         token_launch_timestamps={},  # noqa: SLF001
         processed_tokens=set(),  # noqa: SLF001
+        _buy_reservations=set(),  # noqa: SLF001 — RPC-remediation eviction priority
+        _active_exit_mints=set(),  # noqa: SLF001 — eviction preserves active exits
+        _unsold_positions={},  # noqa: SLF001 — eviction preserves unsold tails
         _unsold_persist_path=None,  # noqa: SLF001 — C7.2 off in tests
     )
+
+    def clear_state(mint):
+        """No-op stub: the eviction branch calls this; state maps are empty."""
+        return None
+
+    t._clear_mint_tracking_state = clear_state  # noqa: SLF001
 
     async def gate(_self, token):
         return await UniversalTrader._curve_gate_reason(t, token)

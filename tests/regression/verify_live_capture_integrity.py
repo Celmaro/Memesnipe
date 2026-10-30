@@ -135,7 +135,7 @@ async def main() -> bool:
         "empty-result scan yields empty list, not None",
         (await client._token_accounts_raw(owner, TOKEN_2022_PROGRAM_ID)) == [],
     )
-    retried: dict[int, int] = {}
+    retried: dict[str, int] = {}
 
     async def flaky_post_rpc(body, **kwargs):
         prog = body["params"][1]["programId"]
@@ -150,10 +150,38 @@ async def main() -> bool:
 
     client.post_rpc = flaky_post_rpc  # type: ignore[attr-defined]
     got = await client.get_token_accounts_by_owner_all_programs(owner, retries=2)
+    # RPC-remediation contract (2026-10-30): post_rpc's bounded retries +
+    # provider cooldown are the retry mechanism. A None result means post_rpc
+    # already exhausted its budget and armed the shared 429 cooldown — the
+    # sweeper defers the rest to the next scheduled sweep rather than issuing
+    # another immediate full-wallet scan (load amplification). Exception
+    # paths still outer-retry up to `retries`.
     check(
-        "a failed scan is retried, not dropped",
-        [x["mint"] for x in got] == ["retryMint"],
-        f"got {got}",
+        "None scan result defers to next sweep, does not re-scan",
+        retried.get(str(SPL_TOKEN_PROGRAM_ID), 0) == 1 and got == [],
+        f"got {got} (SPL post_rpc calls={retried})",
+    )
+
+    # Exception path: an unexpected error still outer-retries up to `retries`.
+    boom: dict[str, int] = {}
+
+    async def error_then_ok_post_rpc(body, **kwargs):
+        prog = body["params"][1]["programId"]
+        if prog == str(TOKEN_2022_PROGRAM_ID):
+            return _fake_response({"value": []})
+        boom[prog] = boom.get(prog, 0) + 1
+        if boom[prog] == 1:
+            raise RuntimeError("transient network error")
+        return _fake_response(
+            {"value": [_json_parsed_account("recoverMint", "7")]}
+        )
+
+    client.post_rpc = error_then_ok_post_rpc  # type: ignore[attr-defined]
+    got2 = await client.get_token_accounts_by_owner_all_programs(owner, retries=2)
+    check(
+        "exception outer-retries up to retries and recovers",
+        [x["mint"] for x in got2] == ["recoverMint"],
+        f"got {got2}",
     )
 
     # --- 2. partial-leg pnl_pct units (percent, matching final closes) ------

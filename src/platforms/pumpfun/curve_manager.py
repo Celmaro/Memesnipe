@@ -1,6 +1,7 @@
 """Pump.fun CurveManager: bonding curve reads and pricing, IDL-decoded."""
 
 import time
+from collections import OrderedDict
 from typing import Any
 
 from solders.pubkey import Pubkey
@@ -143,6 +144,7 @@ class PumpFunCurveManager(CurveManager):
     #: price_check_interval (>=1s), so a 1s TTL adds no stale-price exposure
     #: beyond the existing cadence.
     _POOL_STATE_TTL = 1.0
+    _POOL_STATE_CACHE_MAX_ENTRIES = 512
 
     def __init__(self, client: SolanaClient, idl_parser: IDLParser):
         """Initialize pump.fun curve manager with injected IDL parser.
@@ -153,9 +155,12 @@ class PumpFunCurveManager(CurveManager):
         """
         self.client = client
         self._idl_parser = idl_parser
-        # T2.1 warm-read cache: {pool_address: (fetched_at, state)}. Bounded by
-        # the TTL; a commitment override still forces a fresh read.
-        self._state_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # T2.1 warm-read LRU: TTL bounds freshness; MAX_ENTRIES bounds memory.
+        # TTL alone does NOT bound a dict because expired keys remain resident.
+        # A commitment override still forces a fresh read.
+        self._state_cache: OrderedDict[
+            str, tuple[float, dict[str, Any]]
+        ] = OrderedDict()
         # R3-P0-1: decoded FeeConfig account (market-cap tiers), TTL-cached.
         self._fee_config_cache: tuple[float, Any] | None = None
         self._FEE_CONFIG_TTL = 60.0
@@ -186,12 +191,21 @@ class PumpFunCurveManager(CurveManager):
             Dictionary containing bonding curve state data
         """
         key = str(pool_address)
+        now = time.monotonic()
         if commitment is None:
+            # Opportunistically remove expired entries before lookup. This
+            # keeps cold launches from accumulating forever in a long session.
+            expired = [
+                cached_key
+                for cached_key, (fetched_at, _state) in self._state_cache.items()
+                if now - fetched_at >= self._POOL_STATE_TTL
+            ]
+            for cached_key in expired:
+                self._state_cache.pop(cached_key, None)
             cached = self._state_cache.get(key)
             if cached is not None:
-                fetched_at, state = cached
-                if (time.monotonic() - fetched_at) < self._POOL_STATE_TTL:
-                    return state
+                self._state_cache.move_to_end(key)
+                return cached[1]
 
         try:
             account = await self.client.get_account_info(
@@ -202,9 +216,6 @@ class PumpFunCurveManager(CurveManager):
 
             # Decode bonding curve state using injected IDL parser
             curve_state_data = self._decode_curve_state_with_idl(account.data)
-
-            if commitment is None:
-                self._state_cache[key] = (time.monotonic(), curve_state_data)
 
             # R3-P0-1: resolve the market-cap-scaled fee tier for SOL-paired
             # curves. Conservative contract: any failure keeps the flat
@@ -217,6 +228,12 @@ class PumpFunCurveManager(CurveManager):
                 if tier_bps is not None:
                     curve_state_data["fee_bps"] = tier_bps
                     curve_state_data["fee_fraction"] = tier_bps / 10_000
+
+            if commitment is None:
+                self._state_cache[key] = (time.monotonic(), curve_state_data)
+                self._state_cache.move_to_end(key)
+                while len(self._state_cache) > self._POOL_STATE_CACHE_MAX_ENTRIES:
+                    self._state_cache.popitem(last=False)
 
             return curve_state_data
 

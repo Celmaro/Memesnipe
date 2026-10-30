@@ -1457,15 +1457,64 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             if creators and trader_key in creators:
                 self._creator_sold_for_exit.add(mint_key)
         if trade.get("is_buy") and mint_key and trader_key:
-            self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
+            # Co-fire and wash/LPI are explicitly bounded cross-launch windows.
+            # The rug-buyer set is position/candidate state, so do NOT retain
+            # every buyer for every token on the whole subscribed program.
+            if self._should_track_mint_buyers(mint_key):
+                self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
             self._cofire.observe_buy(mint_key, trader_key)
         # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
         # is the bot's wallet prompts the monitor for an immediate
         # exit evaluation (off by default = current polling).
         if self.event_driven_exits_enabled and self.wallet is not None:
-            if str(trade.get("trader") or "") == str(self.wallet.public_key):
+            if (
+                mint_key
+                and (
+                    mint_key in self._active_exit_mints
+                    or mint_key in self._unsold_positions
+                )
+                and str(trade.get("trader") or "") == str(self.wallet.public_key)
+            ):
                 self._own_trade_prompt.add(mint_key)
         return trade
+
+    def _should_track_mint_buyers(self, mint: str) -> bool:
+        """True only while the mint is a candidate or has an owned position."""
+        return (
+            mint in getattr(self, "token_timestamps", {})
+            or mint in getattr(self, "_buy_reservations", set())
+            or mint in getattr(self, "_active_exit_mints", set())
+            or mint in getattr(self, "_unsold_positions", {})
+        )
+
+    def _clear_mint_tracking_state(self, mint: str) -> None:
+        """Drop transient per-mint screening/monitor state once it is no longer live.
+
+        The Geyser trade feed can see transactions for every mint on the
+        subscribed program, not just positions owned by this bot. Keep the
+        expensive per-wallet buyer map only while a mint is a tracked
+        candidate or an active/unsold position.
+        """
+        for name in (
+            "_rug_buyers",
+            "_creator_sellers",
+            "_rug_entry",
+            "_momentum_peak_rate",
+            "_momentum_peak_price",
+        ):
+            state = getattr(self, name, None)
+            if isinstance(state, dict):
+                state.pop(mint, None)
+        for name in ("_creator_sold_for_exit", "_own_trade_prompt"):
+            state = getattr(self, name, None)
+            if isinstance(state, set):
+                state.discard(mint)
+        graduated = getattr(self, "_graduated_mints", None)
+        if isinstance(graduated, set):
+            try:
+                graduated.discard(Pubkey.from_string(mint))
+            except ValueError:
+                pass
 
     def _holder_gates_on(self) -> bool:
         """R3-P1-5: whether either holder-concentration gate is configured."""
@@ -1522,15 +1571,16 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
     async def _refresh_one_holder_snapshot(self, mint: str) -> None:
         """Pull largest accounts + supply for one mint and store a snapshot."""
         try:
-            client = await self.solana_client.get_client()
             mint_pk = Pubkey.from_string(mint)
-            largest = await client.get_token_largest_accounts(mint_pk)
-            supply = await client.get_token_supply(mint_pk)
+            # Both reads use SolanaClient wrappers so the holder refresher
+            # cannot bypass the process-wide rate limiter under live load.
+            largest = await self.solana_client.get_token_largest_accounts(mint_pk)
+            supply = await self.solana_client.get_token_supply(mint_pk)
             rows = [
                 (str(item.address), int(str(item.amount)))
                 for item in (largest.value or [])
             ]
-            total_raw = int(str(supply.value.amount)) if supply.value else 0
+            total_raw = int(supply) if supply is not None else 0
             slot = largest.context.slot if largest.context else 0
             from screening.holder_snapshot import compute_snapshot
 
@@ -2018,7 +2068,9 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
 
     async def _cleanup_resources(self) -> None:
         """Perform cleanup operations before shutting down."""
-        if self.traded_mints:
+        # Shadow mode must never mutate the real wallet, including a
+        # post-session cleanup configured independently of the exit path.
+        if self.traded_mints and not getattr(self, "shadow_mode", False):
             try:
                 logger.info(f"Cleaning up {len(self.traded_mints)} traded token(s)...")
                 # Build parallel lists of mints and token_program_ids
@@ -2095,6 +2147,14 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             )
             del self.token_timestamps[oldest_key]
             self.token_launch_timestamps.pop(oldest_key, None)
+            # A queued candidate that aged out is no longer used by screening.
+            # Preserve state for an in-flight buy, open position, or unsold tail.
+            if (
+                oldest_key not in self._buy_reservations
+                and oldest_key not in self._active_exit_mints
+                and oldest_key not in self._unsold_positions
+            ):
+                self._clear_mint_tracking_state(oldest_key)
             logger.debug(
                 f"Tracked-token cap ({self.max_tracked_tokens}) reached; "
                 f"dropping oldest {oldest_key[:12]}..."
@@ -2193,7 +2253,9 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             hist = snap["hist"].get("token.processing", {})
             logger.info(
                 "metrics: received=%d detected=%d processed=%d queue_depth=%d "
-                "proc_avg=%ss proc_p95=%ss errors=%d stale=%d",
+                "proc_avg=%ss proc_p95=%ss errors=%d stale=%d "
+                "rpc_requests=%d rpc_429=%d rpc_p95=%ss "
+                "geyser_reconnects=%d grpc_exhausted=%d",
                 snap["counters"].get("geyser.updates_received", 0),
                 snap["counters"].get("geyser.tokens_detected", 0),
                 snap["counters"].get("tokens.dequeued", 0),
@@ -2202,6 +2264,11 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 hist.get("p95", 0.0),
                 snap["counters"].get("tokens.queue_errors", 0),
                 snap["counters"].get("tokens.skipped_stale", 0),
+                snap["counters"].get("rpc.requests", 0),
+                snap["counters"].get("rpc.http_429", 0),
+                snap["hist"].get("rpc.latency", {}).get("p95", 0.0),
+                snap["counters"].get("geyser.reconnects", 0),
+                snap["counters"].get("geyser.grpc_resource_exhausted", 0),
             )
 
     async def _drain_token_queue(self, max_age: float) -> None:
@@ -2950,10 +3017,14 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         try:
             await self._tp_sl_exit_inner(token_info, buy_result)
         finally:
-            self._active_exit_mints.discard(str(token_info.mint))
+            mint_key = str(token_info.mint)
+            self._active_exit_mints.discard(mint_key)
             # trail states are per-position; a stale one would give a
             # re-opened mint the previous run's floor/peak
-            self._trail_states.pop(str(token_info.mint), None)
+            self._trail_states.pop(mint_key, None)
+            # The persistent unsold watcher needs TokenInfo + Position only;
+            # transient buyer/advisory maps are safe to release here too.
+            self._clear_mint_tracking_state(mint_key)
 
     async def _tp_sl_exit_inner(
         self, token_info: TokenInfo, buy_result: TradeResult

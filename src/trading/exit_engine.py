@@ -633,13 +633,20 @@ class ExitEngineMixin:
         Args:
             token_info: Token whose account may now be closable
         """
-        await handle_cleanup_after_sell(
-            self.solana_client,
-            self.wallet,
-            token_info.mint,
-            token_info.token_program_id,
-            self.priority_fee_manager,
-            self.cleanup_mode,
-            self.cleanup_with_priority_fee,
-            self.cleanup_force_close_with_burn,
-        )
+        # Shadow mode must be genuinely read-only. The simulated exit path
+        # reaches this helper too; without this guard, cleanup.mode=after_sell
+        # could still submit an ATA close against the real wallet.
+        if not self.shadow_mode:
+            await handle_cleanup_after_sell(
+                self.solana_client,
+                self.wallet,
+                token_info.mint,
+                token_info.token_program_id,
+                self.priority_fee_manager,
+                self.cleanup_mode,
+                self.cleanup_with_priority_fee,
+                self.cleanup_force_close_with_burn,
+            )
+        clear_state = getattr(self, "_clear_mint_tracking_state", None)
+        if clear_state is not None:
+            clear_state(str(token_info.mint))
