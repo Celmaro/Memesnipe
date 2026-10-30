@@ -288,7 +288,9 @@ class ExitEngineMixin:
                 quote_received=price * qty,
                 exit_reason=exit_reason,
                 pnl_quote=(price - position.entry_price) * qty,
-                pnl_pct=(price - position.entry_price) / position.entry_price
+                # Percent, matching get_pnl().price_change_pct used by final
+                # closes — partial legs and final closes must share units.
+                pnl_pct=(price - position.entry_price) / position.entry_price * 100
                 if position.entry_price > 0
                 else 0.0,
                 hold_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
@@ -330,9 +332,13 @@ class ExitEngineMixin:
                     quote_received=sell_result.price * qty,
                     exit_reason=exit_reason,
                     pnl_quote=(sell_result.price - position.entry_price) * qty,
+                    # Percent, matching get_pnl().price_change_pct used by
+                    # final closes — partial legs and final closes must share
+                    # units.
                     pnl_pct=(
                         (sell_result.price - position.entry_price)
                         / position.entry_price
+                        * 100
                         if position.entry_price > 0
                         else 0.0
                     ),

@@ -229,9 +229,9 @@ jito:
 # R3-P2-10: session risk guards (0 = off). The loss limit blocks NEW buys
 # while sells still run — it never traps money in a falling position.
 risk:
-  max_concurrent_positions: 0 # 0 = off (unlimited open positions; shadow A/B needs the sample)
+  max_concurrent_positions: 10 # user-set live cap (was 0 = unlimited; wallet drained to 0.0086 SOL on 31 concurrent opens)
   daily_loss_limit_sol: 0.098 # ~$10 realized portfolio loss (SOL @ $102.15 on 2026-10-29): blocks NEW buys, sells still run (never traps money)
-  budget_sol: 0 # cap on total quote spent on buys this session; 0 = off
+  budget_sol: 0.15 # user-set live cap (was 0 = off): total quote spent on buys this session
 
 # Filters for token selection
 filters:

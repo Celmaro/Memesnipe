@@ -595,30 +595,12 @@ class SolanaClient:
         Returns:
             List of account summaries; empty on failure or no accounts
         """
-        from solana.rpc.core import TokenAccountOpts
-
-        await self._rate_limiter.acquire()
-        client = await self.get_client()
-        try:
-            response = await client.get_token_accounts_by_owner(
-                owner,
-                TokenAccountOpts(program_id=SPL_TOKEN_PROGRAM_ID),
-                commitment=commitment,
+        return (
+            await self._token_accounts_raw(
+                owner, SPL_TOKEN_PROGRAM_ID, commitment=commitment
             )
-        except Exception:
-            logger.exception("get_token_accounts_by_owner failed")
-            return []
-        out: list[dict] = []
-        if not response.value:
-            return out
-        for item in response.value:
-            parsed = getattr(item.account, "data", None)
-            if parsed is None:
-                continue
-            mint = parsed.get("mint")
-            amount = parsed.get("tokenAmount", {}).get("amount", "0")
-            out.append({"mint": mint, "token_amount": {"amount": amount}})
-        return out
+            or []
+        )
 
     async def get_token_accounts_by_owner_all_programs(
         self, owner: Pubkey, commitment: str = "confirmed", retries: int = 3
@@ -634,36 +616,25 @@ class SolanaClient:
         """
         import asyncio as _asyncio
 
-        from solana.rpc.core import TokenAccountOpts
-
         combined: list[dict] = []
         for prog in (SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
             last_error: Exception | None = None
             for attempt in range(retries):
                 try:
-                    await self._rate_limiter.acquire()
-                    client = await self.get_client()
-                    response = await client.get_token_accounts_by_owner(
-                        owner,
-                        TokenAccountOpts(program_id=prog),
-                        commitment=commitment,
+                    accounts = await self._token_accounts_raw(
+                        owner, prog, commitment=commitment
                     )
                 except Exception as error:  # noqa: BLE001
                     last_error = error
                     if attempt < retries - 1:
                         await _asyncio.sleep(3 * (attempt + 1))
                     continue
-                if not response.value:
-                    break
-                for item in response.value:
-                    parsed = getattr(item.account, "data", None)
-                    if parsed is None:
-                        continue
-                    mint = parsed.get("mint")
-                    amount = parsed.get("tokenAmount", {}).get("amount", "0")
-                    combined.append(
-                        {"mint": mint, "token_amount": {"amount": amount}}
-                    )
+                if accounts is None:
+                    last_error = RuntimeError("token-account RPC returned no response")
+                    if attempt < retries - 1:
+                        await _asyncio.sleep(3 * (attempt + 1))
+                    continue
+                combined.extend(accounts)
                 break
             else:
                 logger.error(
@@ -671,6 +642,55 @@ class SolanaClient:
                     f"after {retries} attempts: {last_error}"
                 )
         return combined
+
+    async def _token_accounts_raw(
+        self,
+        owner: Pubkey,
+        program_id: Pubkey,
+        commitment: str = "confirmed",
+    ) -> list[dict] | None:
+        """Raw jsonParsed token-account scan via post_rpc.
+
+        solana-py's TokenAccountOpts defaults to base64, so
+        ``item.account.data`` arrives as raw bytes and ``parsed.get`` crashes
+        the stuck-token sweeper (observed live: ``AttributeError: 'bytes'
+        object has no attribute 'get'``). ``getTokenAccountsByOwner`` with
+        ``encoding: jsonParsed`` returns ``data.parsed.info`` as a plain dict;
+        route that through the repo's own post_rpc wrapper (rate limit, 429
+        and error retries) so the recovery path cannot be killed by a single
+        transient rate limit.
+
+        Returns None only when post_rpc exhausted its retries; an empty wallet
+        scan is ``[]`` (distinct from failure so callers can stop retrying).
+        """
+        response = await self.post_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    str(owner),
+                    {"programId": str(program_id)},
+                    {"encoding": "jsonParsed", "commitment": commitment},
+                ],
+            },
+            max_retries=3,
+            max_429_retries=8,
+        )
+        if response is None:
+            return None
+        out: list[dict] = []
+        for item in response.get("result", {}).get("value", []):
+            data = item.get("account", {}).get("data", {})
+            if not isinstance(data, dict):
+                continue
+            info = data.get("parsed", {}).get("info", {})
+            mint = info.get("mint")
+            if not mint:
+                continue
+            amount = info.get("tokenAmount", {}).get("amount", "0")
+            out.append({"mint": mint, "token_amount": {"amount": amount}})
+        return out
 
     async def get_latest_blockhash(self) -> Hash:
         """Get the latest blockhash."""
