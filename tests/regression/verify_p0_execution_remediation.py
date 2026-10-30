@@ -441,6 +441,17 @@ def main() -> int:
         )
     check("watcher keeps unresolved STOP position", asyncio.run(watcher_stop()))
 
+    # --- Position: malformed entry_price must not crash the watcher ---------
+    def malformed_entry():
+        # Live evidence 2026-10-30: the persistent watcher crashed with
+        # ZeroDivisionError on a rehydrated/orphan row whose entry_price
+        # persisted as 0.0. get_pnl must degrade to 0% instead of dividing.
+        pos = _position(qty=100.0, entry=1.0)
+        pos.entry_price = 0.0
+        pnl = pos.get_pnl(0.00000003)
+        return pnl["price_change_pct"] == 0.0 and pnl["unrealized_pnl_quote"] == 0.0
+    check("position pnl survives zero entry price", malformed_entry())
+
     if failures:
         print(f"\nR5-P0-1 FAILED ({len(failures)}): {failures}")
         return 1

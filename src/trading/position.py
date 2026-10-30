@@ -172,8 +172,18 @@ class Position:
             raise ValueError("No price available for PnL calculation")
 
         price_change = price_to_use - self.entry_price
-        price_change_pct = (price_change / self.entry_price) * 100
-        unrealized_pnl = price_change * self.quantity
+        # Rehydrated/orphan rows can lack a trustworthy entry price. Never let
+        # a malformed persisted position crash the persistent exit watcher;
+        # report zero percentage PnL while the sell path still attempts the
+        # actual wallet balance.
+        price_change_pct = (
+            (price_change / self.entry_price) * 100
+            if self.entry_price > 0
+            else 0.0
+        )
+        unrealized_pnl = (
+            price_change * self.quantity if self.entry_price > 0 else 0.0
+        )
 
         return {
             "entry_price": self.entry_price,
