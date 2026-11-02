@@ -79,6 +79,11 @@ class CoFireTracker:
             candidate = min(self._wallet_mints, key=lambda k: len(self._wallet_mints[k]))
             self._wallet_mints.pop(candidate, None)
 
+    def buyer_count(self, mint: str) -> int:
+        """How many distinct early buyers this mint has observed so far."""
+        buyers = self._mint_buyers.get(mint)
+        return len(buyers) if buyers else 0
+
     def co_fire_count(self, wallet: str) -> int:
         """How many distinct mints this wallet has bought into recently."""
         return len(self._wallet_mints.get(wallet, set()))

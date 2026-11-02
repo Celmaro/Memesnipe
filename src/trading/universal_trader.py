@@ -354,6 +354,18 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         # (buy+sell the same mint) — fake volume (2507.01963). Fed by the
         # trade feed; fail-open (0) until observed.
         max_wash_share: float = 0.0,
+        # R5-P1-1: entry-evidence gate. A launch younger than min_token_age_s
+        # has no trade history, so the behavioral filters (wash, coordination,
+        # holders) evaluate an empty feed and fail open — they add no edge.
+        # Park the candidate and re-queue it at that age (background task;
+        # never an inline sleep, which would stall the single queue processor
+        # and let every token behind it go stale), then require the demand
+        # evidence below at pre-buy. Measured live 2026-10-30: every entry
+        # fired 3-16 s after launch (median 9 s) — inside the blind window.
+        # 0 = off for each key (off path is byte-identical to prior behavior).
+        min_token_age_s: float = 0.0,
+        min_observed_trades: int = 0,
+        min_unique_buyers: int = 0,
         # R4-P3-1: fragility-scaled position sizing (ME2F; 0/1 = off).
         # When the holder-distribution whale score AND the observed trade
         # rate both spike (the paper's two-score trigger), buy size scales
@@ -751,6 +763,16 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
 
         self._wash_lpi = WashLpiDetector()
         self.max_wash_share = max_wash_share
+        # R5-P1-1: entry-evidence gate state (all 0 = off by default).
+        self.min_token_age_s = float(min_token_age_s or 0.0)
+        self.min_observed_trades = int(min_observed_trades or 0)
+        self.min_unique_buyers = int(min_unique_buyers or 0)
+        # Bounded park set for candidates waiting on min_token_age_s. Parked
+        # entries are asyncio tasks (not queue items), so the processor stays
+        # free for other launches while they age.
+        self._first_seen_mints: dict[str, float] = {}
+        self._evidence_pending_count = 0
+        self.max_evidence_pending = 256
         # R4-P1-8: momentum-fade advisory state (log-only; peak trade rate
         # and peak price per mint for the -50%-rate-without-new-high test).
         self._momentum_peak_rate: dict[str, float] = {}
@@ -2207,6 +2229,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 key=lambda k: self.token_timestamps[k],
             )
             del self.token_timestamps[oldest_key]
+            self._first_seen_mints.pop(oldest_key, None)
             self.token_launch_timestamps.pop(oldest_key, None)
             # A queued candidate that aged out is no longer used by screening.
             # Preserve state for an in-flight buy, open position, or unsold tail.
@@ -2223,6 +2246,43 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
 
         # Record timestamp when token was discovered
         self.token_timestamps[token_key] = monotonic()
+        if not hasattr(self, "_first_seen_mints"):
+            self._first_seen_mints = {}
+        self._first_seen_mints.setdefault(token_key, monotonic())
+        # R5-P1-1: entry-evidence park. A launch younger than min_token_age_s
+        # has no trade history yet — the behavioral gates would evaluate an
+        # empty feed and fail open. Park it in a background task instead of
+        # enqueueing now: an inline sleep would stall the single queue
+        # processor and let every token behind it go stale. The task
+        # re-queues the token at age and _dynamic_screening_reason(
+        # require_evidence=True) judges it on the demand it accumulated.
+        min_age = float(getattr(self, "min_token_age_s", 0.0) or 0.0)
+        if min_age > 0:
+            age = monotonic() - self._first_seen_mints.get(
+                token_key, monotonic()
+            )
+            remaining = min_age - age
+            if remaining > 0:
+                pending = int(getattr(self, "_evidence_pending_count", 0) or 0)
+                cap = int(getattr(self, "max_evidence_pending", 256) or 256)
+                if pending >= cap:
+                    logger.info(
+                        f"Dropping {token_info.symbol} — evidence wait full "
+                        f"({cap} parked)"
+                    )
+                    self._queued_mints.discard(token_key)
+                    return
+                self._evidence_pending_count = pending + 1
+                logger.info(
+                    f"Parking {token_info.symbol} for evidence: "
+                    f"{remaining:.0f}s until {min_age:.0f}s old"
+                )
+                # Hold the dedupe slot while parked: a duplicate detect must
+                # not start a second wait for the same mint. _deferred_enqueue
+                # discards it before re-entering _queue_token.
+                self._queued_mints.add(token_key)
+                asyncio.create_task(self._deferred_enqueue(token_info, remaining))
+                return
         # Record the launch timestamp the listener decoded (CreateEvent), when
         # present. Units are the listener's (pump.fun clock); kept raw so a
         # future clock-aware gate can use it. None means the listener did not
@@ -2235,6 +2295,27 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         logger.info(
             f"Queued new token: {token_info.symbol} ({token_info.mint}) on {token_info.platform.value}"
         )
+
+    async def _deferred_enqueue(self, token_info: TokenInfo, delay: float) -> None:
+        """R5-P1-1: re-queue a parked launch once it reaches min_token_age_s.
+
+        Runs as a background task so the queue processor keeps working while
+        the candidate ages. The re-entry into ``_queue_token`` computes a
+        non-positive remaining delay (``_first_seen_mints`` is not reset) and
+        enqueues normally; the pre-buy evidence gate then applies the demand
+        thresholds to the observations it accumulated.
+        """
+        try:
+            await asyncio.sleep(max(0.0, delay))
+            self._evidence_pending_count = max(0, self._evidence_pending_count - 1)
+            self._queued_mints.discard(str(token_info.mint))
+            await self._queue_token(token_info)
+        except asyncio.CancelledError:
+            self._evidence_pending_count = max(0, self._evidence_pending_count - 1)
+            raise
+        except Exception:
+            self._evidence_pending_count = max(0, self._evidence_pending_count - 1)
+            logger.exception("Evidence re-enqueue failed for %s", token_info.symbol)
 
     def _claim_queue_token(
         self, token_info: TokenInfo, max_age: float, prefix: str = ""
@@ -2701,7 +2782,9 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             # now with the post-wait snapshot so a coin that passed on stale
             # (or empty) data is refused before submission. Stateless: the
             # creator-cadence side effect lives only in _skip_reason().
-            prebuy_reason = self._dynamic_screening_reason(token_info)
+            prebuy_reason = self._dynamic_screening_reason(
+                token_info, require_evidence=True
+            )
             if prebuy_reason:
                 logger.info(
                     f"Skipping {token_info.symbol} - {prebuy_reason} "

@@ -77,6 +77,27 @@ class WashLpiDetector:
             victim = min(self._events, key=lambda k: len(self._events[k]))
             del self._events[victim]
 
+    def event_count(self, mint: str) -> int:
+        """How many trade events this mint has in its observation window.
+
+        0 when the mint has never been observed (the entry-evidence gate
+        treats that as \"no data yet\", not as a pass).
+        """
+        events = self._events.get(mint)
+        return len(events) if events else 0
+
+    def unique_buyer_count(self, mint: str) -> int:
+        """Distinct wallets observed BUYING this mint (windowed).
+
+        Used by the entry-evidence gate: a real launch draws many distinct
+        buyers within the first minute; a bundled launch shows the same
+        few wallets over and over.
+        """
+        events = self._events.get(mint)
+        if not events:
+            return 0
+        return len({w for _ts, w, is_buy, _q, _px in events if is_buy})
+
     def wash_share(self, mint: str) -> float:
         """Fraction of quote volume from round-tripping wallets (STRONG test).
 

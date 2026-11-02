@@ -1,0 +1,260 @@
+"""R5-P1-1: entry-evidence gate — wait for trade history before buying.
+
+Why this exists (live evidence, 2026-10-30 shadow archive): every single
+entry fired 3-16 s after launch (median 9 s). At that age the behavioral
+filters (wash round-trips, co-fire coordination, holder snapshots) have no
+observations, so they fail open and the "quality filters" add no edge. The
+gate parks a young candidate, re-queues it at min_token_age_s, and then
+requires observed-trade / unique-buyer evidence at PRE-BUY time.
+
+Checks (no network, no funds):
+
+  A. WashLpiDetector.event_count / unique_buyer_count reflect observations.
+  B. CoFireTracker.buyer_count reflects early-buyer observations.
+  C. Gate fires pre-buy when evidence is below min_observed_trades.
+  D. Gate fires pre-buy when evidence is below min_unique_buyers.
+  E. Gate passes when both thresholds are met.
+  F. require_evidence=False (detection-time call) never applies the gate —
+     detection must not permanently skip a mint before its window opened.
+  G. _queue_token parks a young candidate (queue stays empty, pending count
+     increments) and a duplicate detect does not double-park.
+  H. _deferred_enqueue re-queues the token after the delay.
+  I. YAML arms 60 s / 20 trades / 10 buyers.
+  J. config_loader accepts the keys and rejects a negative age.
+
+Usage:
+    uv run tests/regression/verify_entry_evidence_gate.py
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+import yaml  # noqa: E402
+from solders.pubkey import Pubkey  # noqa: E402
+
+from core.pubkeys import WSOL_MINT  # noqa: E402
+from interfaces.core import Platform  # noqa: E402
+from screening.coordination import CoFireTracker  # noqa: E402
+from screening.wash_lpi import WashLpiDetector  # noqa: E402
+from trading.universal_trader import UniversalTrader  # noqa: E402
+
+failures = []
+
+
+def check(label: str, passed: bool, detail: str = "") -> None:
+    print(f"  [{'PASS' if passed else 'FAIL'}] {label} {detail}")
+    if not passed:
+        failures.append(label)
+
+
+def _token(symbol="EVID", mint=None):
+    return SimpleNamespace(
+        mint=Pubkey.from_string(
+            mint or "37Vnce2mgcjCDqw75X57Xy68DvfFerdxNwB12qetpump"
+        ),
+        symbol=symbol,
+        platform=Platform.PUMP_FUN,
+        quote_mint=WSOL_MINT,
+        creation_timestamp=None,
+        transfer_fee_bps=0,
+    )
+
+
+def _gate_trader(**overrides):
+    t = object.__new__(UniversalTrader)
+    t._wash_lpi = WashLpiDetector()
+    t._cofire = CoFireTracker()
+    # every other dynamic gate off, so only the evidence gate can fire
+    t.max_coordinated_supply_share = 0.0
+    t.max_wash_share = 0.0
+    t.rug_score_threshold = 0.0
+    t.factory_deploy_rate = 0.0
+    t.creator_pnl_store = None
+    t.min_unique_holders = 0
+    t.max_top10_concentration = 0.0
+    t.max_gini_coefficient = 0.0
+    t._holder_store = SimpleNamespace(get=lambda _m: None)
+    t._rug_buyers = {}
+    t._creator_launch_ts = {}
+    t.min_metadata_extensions = 0
+    t._metadata_store = SimpleNamespace(get=lambda _m: None)
+    t.max_transfer_fee_bps = None
+    t.min_observed_trades = 0
+    t.min_unique_buyers = 0
+    for k, v in overrides.items():
+        setattr(t, k, v)
+    return t
+
+
+def main() -> int:
+    print("R5-P1-1: entry-evidence gate (min age / trades / buyers)")
+
+    # --- A: wash tracker counters ---------------------------------------
+    wl = WashLpiDetector()
+    mint = "mintA"
+    for i in range(7):
+        wl.observe_trade(
+            mint=mint,
+            wallet=f"w{i % 3}",
+            is_buy=True,
+            quote_lamports=1_000_000,
+            token_price=1e-8,
+            ts=float(i),
+        )
+    wl.observe_trade(
+        mint=mint,
+        wallet="w0",
+        is_buy=False,
+        quote_lamports=1_000_000,
+        token_price=1e-8,
+        ts=99.0,
+    )
+    check("wash event_count counts observations", wl.event_count(mint) == 8)
+    check("wash unique_buyer_count counts distinct buyers",
+          wl.unique_buyer_count(mint) == 3)
+    check("wash unknown mint reads zero", wl.event_count("nope") == 0)
+
+    # --- B: co-fire buyer count ------------------------------------------
+    cf = CoFireTracker()
+    for w in ("a", "b", "c"):
+        cf.observe_buy("mintB", w)
+    cf.observe_buy("mintB", "a")  # duplicate wallet
+    check("cofire buyer_count counts distinct early buyers",
+          cf.buyer_count("mintB") == 3)
+
+    # --- C/D/E: the pre-buy gate -----------------------------------------
+    tok = _token()
+    t = _gate_trader(min_observed_trades=20, min_unique_buyers=0)
+    for i in range(5):
+        t._wash_lpi.observe_trade(
+            mint=str(tok.mint), wallet=f"w{i}", is_buy=True,
+            quote_lamports=1_000_000, token_price=1e-8, ts=float(i),
+        )
+    r = t._dynamic_screening_reason(tok, require_evidence=True)
+    check("gate refuses insufficient trade evidence",
+          bool(r) and "insufficient trade evidence" in r, f"-> {r}")
+
+    t2 = _gate_trader(min_observed_trades=0, min_unique_buyers=10)
+    for i in range(4):
+        t2._cofire.observe_buy(str(tok.mint), f"b{i}")
+    r2 = t2._dynamic_screening_reason(tok, require_evidence=True)
+    check("gate refuses insufficient buyer evidence",
+          bool(r2) and "insufficient buyer evidence" in r2, f"-> {r2}")
+
+    t3 = _gate_trader(min_observed_trades=20, min_unique_buyers=10)
+    for i in range(25):
+        t3._wash_lpi.observe_trade(
+            mint=str(tok.mint), wallet=f"w{i}", is_buy=True,
+            quote_lamports=1_000_000, token_price=1e-8, ts=float(i),
+        )
+    for i in range(12):
+        t3._cofire.observe_buy(str(tok.mint), f"buyer{i}")
+    r3 = t3._dynamic_screening_reason(tok, require_evidence=True)
+    check("gate passes when both thresholds are met", r3 is None, f"-> {r3}")
+
+    # --- F: detection-time call must NOT apply the evidence gate ---------
+    t4 = _gate_trader(min_observed_trades=20, min_unique_buyers=10)
+    r4 = t4._dynamic_screening_reason(tok)  # require_evidence default False
+    check("detection-time call skips the evidence gate", r4 is None, f"-> {r4}")
+
+    # --- G: young token is parked, duplicate detect does not double-park --
+    async def park():
+        q = asyncio.Queue(maxsize=10)
+        t = object.__new__(UniversalTrader)
+        t.processed_tokens = set()
+        t._queued_mints = set()
+        t.token_queue = q
+        t.token_timestamps = {}
+        t._first_seen_mints = {}
+        t.token_launch_timestamps = {}
+        t.max_tracked_tokens = 1000
+        t.min_token_age_s = 60.0
+        t._evidence_pending_count = 0
+        t.max_evidence_pending = 256
+        tk = _token(symbol="YOUNG")
+        await UniversalTrader._queue_token(t, tk)
+        await UniversalTrader._queue_token(t, tk)  # duplicate detect
+        parked = q.empty() and t._evidence_pending_count == 1
+        # let the deferred task start (it sleeps 60s; cancel it after)
+        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        return parked
+
+    check("young candidate parked once (queue empty)", asyncio.run(park()))
+
+    # --- H: deferred enqueue re-queues after the delay -------------------
+    async def defer():
+        q = asyncio.Queue(maxsize=10)
+        t = object.__new__(UniversalTrader)
+        t.processed_tokens = set()
+        t._queued_mints = set()
+        t.token_queue = q
+        t.token_timestamps = {}
+        t._first_seen_mints = {}  # seeded after tk is built below
+        t.token_launch_timestamps = {}
+        t.max_tracked_tokens = 1000
+        t.min_token_age_s = 60.0
+        t._evidence_pending_count = 1
+        t.max_evidence_pending = 256
+        tk = _token(symbol="AGED")
+        t._queued_mints.add(str(tk.mint))  # held while parked
+        from time import monotonic
+
+        t._first_seen_mints[str(tk.mint)] = monotonic() - 60.1  # now "aged"
+        await UniversalTrader._deferred_enqueue(t, tk, 0.01)
+        return not q.empty() and t._evidence_pending_count == 0
+
+    check("deferred enqueue re-queues the aged token", asyncio.run(defer()))
+
+    # --- I: YAML armed values --------------------------------------------
+    cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
+    f = cfg["filters"]
+    check(
+        "YAML arms min_token_age_s 60 / trades 20 / buyers 10",
+        f.get("min_token_age_s") == 60
+        and f.get("min_observed_trades") == 20
+        and f.get("min_unique_buyers") == 10,
+        f"-> {f.get('min_token_age_s')}/{f.get('min_observed_trades')}/"
+        f"{f.get('min_unique_buyers')}",
+    )
+
+    # --- J: config validation --------------------------------------------
+    from config_loader import validate_config
+
+    good = {"filters": {"min_token_age_s": 60, "min_observed_trades": 20,
+                        "min_unique_buyers": 10, "quote_amounts": {"sol": 0.01},
+                        "match_string": "pump", "listener_type": "geyser"}}
+    cfg_obj = SimpleNamespace(get=lambda k, d=None: cfg.get(k, d),
+                              __getitem__=lambda s, k: cfg[k])
+    # validate_config needs a full config; build the minimal real one instead
+    base = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
+    try:
+        validate_config(base)
+        ok_cfg = True
+    except Exception as exc:  # noqa: BLE001
+        ok_cfg = f"raised: {exc}"
+    neg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
+    neg["filters"]["min_token_age_s"] = -5
+    try:
+        validate_config(neg)
+        neg_rejected = False
+    except Exception:
+        neg_rejected = True
+    check("config validates armed keys", ok_cfg is True, f"-> {ok_cfg}")
+    check("config rejects negative min_token_age_s", neg_rejected)
+
+    if failures:
+        print(f"\nR5-P1-1 FAILED ({len(failures)}): {failures}")
+        return 1
+    print("\nR5-P1-1: entry-evidence gate OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

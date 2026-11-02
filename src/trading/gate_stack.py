@@ -125,7 +125,8 @@ class GateStackMixin:
         return self._dynamic_screening_reason(token_info, quote_mint)
 
     def _dynamic_screening_reason(
-        self, token_info: TokenInfo, quote_mint: Any = None
+        self, token_info: TokenInfo, quote_mint: Any = None,
+        require_evidence: bool = False,
     ) -> str | None:
         """Re-check the DATA-DEPENDENT gates with a fresh snapshot (R5-P0-2).
 
@@ -222,6 +223,33 @@ class GateStackMixin:
                     f"holders {snap.unique_holders if snap else 0}, "
                     f"buyers {len(buyers) if buyers else 0})"
                 )
+        # R5-P1-1: entry-evidence gate — POST-WAIT ONLY. The behavioral
+        # filters (wash, coordination, holder distribution) need observations
+        # to mean anything. Measured live (2026-10-30 shadow archive): every
+        # entry fired 3-16 s after launch (median 9 s), where those feeds are
+        # empty and therefore fail open — the filters could never add edge.
+        # The trader parks a candidate until min_token_age_s and re-queues
+        # it; this gate then refuses coins that still show no real demand at
+        # that age. Only evaluated at pre-buy: at detection the feeds are
+        # empty BY CONSTRUCTION and a refusal there would permanently skip
+        # the mint before its observation window ever opened.
+        if require_evidence:
+            min_trades = int(getattr(self, "min_observed_trades", 0) or 0)
+            min_buyers = int(getattr(self, "min_unique_buyers", 0) or 0)
+            if min_trades > 0:
+                seen = self._wash_lpi.event_count(str(token_info.mint))
+                if seen < min_trades:
+                    return (
+                        f"insufficient trade evidence: {seen} observed < "
+                        f"{min_trades} required (min_observed_trades)"
+                    )
+            if min_buyers > 0:
+                buyers = self._cofire.buyer_count(str(token_info.mint))
+                if buyers < min_buyers:
+                    return (
+                        f"insufficient buyer evidence: {buyers} unique < "
+                        f"{min_buyers} required (min_unique_buyers)"
+                    )
         # R4-P1-3: insider-coordination supply gate (0 = off). Fraction of
         # the mint's early buyers that co-fire across >= 3 OTHER launches is
         # a coordination signal (MELT 36.5% average). Fail-open: no

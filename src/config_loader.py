@@ -192,6 +192,30 @@ CONFIG_VALIDATION_RULES = [
         1.0,
         "filters.max_wash_share must be a fraction between 0 and 1 (0 = off)",
     ),
+    # R5-P1-1: entry-evidence gate (0 = off). The behavioral filters need
+    # observations; these keys make the bot wait for them instead of buying
+    # a 9-second-old coin whose feeds are empty.
+    (
+        "filters.min_token_age_s",
+        (int, float),
+        0.0,
+        86400.0,
+        "filters.min_token_age_s must be non-negative seconds (0 = off)",
+    ),
+    (
+        "filters.min_observed_trades",
+        int,
+        0,
+        1_000_000,
+        "filters.min_observed_trades must be a non-negative integer (0 = off)",
+    ),
+    (
+        "filters.min_unique_buyers",
+        int,
+        0,
+        1_000_000,
+        "filters.min_unique_buyers must be a non-negative integer (0 = off)",
+    ),
     # R4-P3-1: fragility-scaled sizing (scale_min 1.0 = off; 0.05..1.0).
     (
         "filters.fragility_scale_min",
@@ -530,6 +554,7 @@ _KNOWN_SECTION_KEYS: dict[str, set[str]] = {
         "listener_type", "allowed_quote_mints", "allow_mayhem_mode",
         "blocked_creators", "max_token_age", "max_transfer_fee_bps",
         "marry_mode", "yolo_mode", "max_wash_share", "max_gini_coefficient",
+        "min_token_age_s", "min_observed_trades", "min_unique_buyers",
         "min_unique_holders", "max_top10_concentration",
         "max_coordinated_supply_share", "rug_score_threshold",
         "rug_heuristics_enabled", "exit_on_creator_sell",

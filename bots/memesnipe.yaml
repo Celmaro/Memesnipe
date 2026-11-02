@@ -337,6 +337,26 @@ filters:
   # (paper 2507.01963: 82.8% of high-return tokens show artificial growth;
   # 30% is a deliberately loose floor to collect live block stats).
   max_wash_share: 0.3
+  # R5-P1-1: entry-evidence gate — the behavioral filters above (wash,
+  # coordination) and the holder gates only mean something once the coin
+  # has actual trade history. Verified live (2026-10-30 shadow archive):
+  # every single entry fired 3-16 s after launch (median 9 s), inside the
+  # blind window where those feeds are empty and fail open — the filters
+  # could never add edge. These keys make the bot WAIT for evidence:
+  #   min_token_age_s:        park the candidate and re-queue it at 60 s old
+  #                           (background task; the queue processor is NOT
+  #                           stalled), then judge it on post-wait data.
+  #   min_observed_trades:    refuse at pre-buy if the coin still shows
+  #                           fewer trades than this (a dead launch).
+  #   min_unique_buyers:      refuse if too few distinct wallets bought
+  #                           (a bundled launch reuses the same wallets).
+  # Values from the 2026-11-01 recommendation (30-35 SOL band was the only
+  # net-positive bucket: 40% WR, +22.8% avg — but buying then is impossible
+  # with populated filters, so we wait for data and let the MC band fall
+  # where it falls, capped by max_market_cap_sol 60). All three 0 = off.
+  min_token_age_s: 60
+  min_observed_trades: 20
+  min_unique_buyers: 10
   # R5-P0-4: armed — coordinator co-fire feed is live (observe_buy on every
   # trade event) and the gate fails open (0 with no observations). First-pass
   # threshold: refuse when >30% of a mint's early buyers co-fire across >=3

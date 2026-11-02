@@ -318,6 +318,10 @@ async def start_bot(config_path: str):
                 "max_coordinated_supply_share", 0.0
             ),
             max_wash_share=cfg["filters"].get("max_wash_share", 0.0),
+            # R5-P1-1: entry-evidence gate (0 = off by default).
+            min_token_age_s=cfg["filters"].get("min_token_age_s", 0.0),
+            min_observed_trades=cfg["filters"].get("min_observed_trades", 0),
+            min_unique_buyers=cfg["filters"].get("min_unique_buyers", 0),
             fragility_scale_min=cfg["filters"].get("fragility_scale_min", 1.0),
             fragility_whale_threshold=cfg["filters"].get(
                 "fragility_whale_threshold", 0.6
