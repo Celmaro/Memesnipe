@@ -138,8 +138,8 @@ def main() -> int:
     # 6. Config wiring.
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML max_coordinated_supply_share 0",
-        cfg["filters"].get("max_coordinated_supply_share") == 0.0,
+        "YAML max_coordinated_supply_share 0.3 (armed R5-P0-4)",
+        cfg["filters"].get("max_coordinated_supply_share") == 0.3,
         f"-> {cfg['filters'].get('max_coordinated_supply_share')!r}",
     )
     check(

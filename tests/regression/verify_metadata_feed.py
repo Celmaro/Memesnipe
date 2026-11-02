@@ -154,8 +154,8 @@ def main() -> int:
 
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML default min_metadata_extensions 0",
-        cfg["filters"].get("min_metadata_extensions") == 0,
+        "YAML min_metadata_extensions 2 (armed R5-P0-4)",
+        cfg["filters"].get("min_metadata_extensions") == 2,
         f"-> {cfg['filters'].get('min_metadata_extensions')!r}",
     )
     check(

@@ -791,6 +791,55 @@ class SolanaClient:
             )
         return val.blockhash
 
+    async def send_raw_transaction(
+        self,
+        transaction: VersionedTransaction,
+        skip_preflight: bool = True,
+        max_retries: int = 3,
+    ) -> Signature:
+        """Send a client-built serialized transaction (aggregator path).
+
+        The Jupiter swap API returns a fully-assembled serialized
+        transaction (fee payer + blockhash set, unsigned). The instruction
+        path above cannot rebuild it, so this mirrors the send/retry tail
+        of ``build_and_send_transaction`` for an already-signed
+        ``VersionedTransaction``. R5-P0-5: without this the aggregator
+        fallback was config-only — ``JupiterClient.swap`` could never
+        submit, and graduated/closed-curve positions parked forever.
+
+        Returns:
+            Transaction signature on first accepted send.
+        """
+        client = await self.get_client()
+        for attempt in range(max_retries):
+            try:
+                await self._rate_limiter.acquire()
+                tx_opts = TxOptsModel(
+                    skip_preflight=skip_preflight, preflight_commitment=Processed
+                )
+                response = await self._metered_sdk_rpc(
+                    "sendTransaction", client.send_transaction(transaction, tx_opts)
+                )
+                return response.value
+            except Exception as e:  # noqa: BLE001
+                kind = classify_tx_failure(e)
+                terminal = kind in {
+                    TxFailureKind.INSUFFICIENT_FUNDS,
+                    TxFailureKind.BLOCKHASH_EXPIRED,
+                }
+                if attempt == max_retries - 1 or terminal:
+                    if terminal:
+                        logger.error(
+                            f"Terminal send failure ({kind.value}): {e}"
+                        )
+                    else:
+                        logger.warning(
+                            f"send_raw_transaction attempt {attempt + 1} failed: {e}"
+                        )
+                    raise
+                logger.warning(f"send_raw_transaction retry {attempt + 1}: {e}")
+        raise RuntimeError("send_raw_transaction exhausted retries")
+
     async def build_and_send_transaction(
         self,
         instructions: list[Instruction],

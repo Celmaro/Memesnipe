@@ -166,6 +166,110 @@ async def test_seller_fallback_selection() -> list[str]:
     return failures
 
 
+async def test_real_submit_path() -> list[str]:
+    """R5-P0-5: the swap submit path must SIGN + SEND + CONFIRM.
+
+    Before this change JupiterClient.swap() returned a hard-coded
+    failure ("submit requires the executor path") after assembling the
+    swap tx — no signature, no send, no confirm. Graduated/closed-curve
+    positions therefore parked forever (live evidence 2026-10-30: 25
+    held positions, only 2 exits). This pins the real chain: the client
+    deserializes the server-built tx, signs it with the wallet keypair,
+    sends it through the metered RPC, and confirms before reporting.
+    """
+    failures = []
+
+    def check(label: str, passed: bool, detail: str = "") -> None:
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label} {detail}")
+        if not passed:
+            failures.append(label)
+
+    print("R5-P0-5 Jupiter real submit path")
+    from solders.keypair import Keypair
+    from solders.signature import Signature
+
+    from interfaces.core import Platform
+    from trading.base import TradeResult
+    from platforms.pumpfun.curve_manager import TOKEN_DECIMALS
+
+    kp = Keypair()
+    wallet = SimpleNamespace(keypair=lambda: kp, public_key=kp.pubkey())
+
+    class FakeRpc:
+        def __init__(self):
+            self.sent = []
+            self.confirmed = []
+
+        async def send_raw_transaction(self, signed_tx):
+            self.sent.append(signed_tx)
+            return Signature.from_bytes(bytes(range(64)))
+
+        async def confirm_transaction_detailed(self, sig):
+            self.confirmed.append(sig)
+            from core.client import ConfirmationStatus
+
+            return ConfirmationStatus.SUCCESS
+
+    rpc = FakeRpc()
+    client = JupiterClient(
+        rpc_client=rpc, wallet=wallet, max_price_impact_pct=20.0
+    )
+    token = SimpleNamespace(
+        mint="Mint111111111111111111111111111111111111111",
+        platform=Platform.PUMP_FUN,
+        quote_mint="So11111111111111111111111111111111111111112",
+    )
+    quote = JupiterQuote(in_amount=10_000_000, out_amount=9_000_000, price_impact_pct=5.0)
+
+    # Build a small real VersionedTransaction (no signatures) the way the
+    # Jupiter swap API returns it, to prove deserialize+sign+send works.
+    from solders.instruction import Instruction
+    from solders.message import MessageV0
+    from solders.pubkey import Pubkey
+    from solders.transaction import VersionedTransaction
+    import base64
+
+    dest = Pubkey.from_string("So11111111111111111111111111111111111111112")
+    ix = Instruction(program_id=dest, data=bytes([0]), accounts=[])
+    from solders.hash import Hash
+
+    msg = MessageV0.try_compile(
+        kp.pubkey(), [ix], [], Hash.from_bytes(bytes(range(32)))
+    )
+    # serialize a VersionedTransaction the way the Jupiter swap API returns
+    # it. VersionedTransaction(msg, []) fails ("not enough signers") — the
+    # message requires one; pass the keypair so construction succeeds. The
+    # R5-P0-5 path deserializes and RE-signs with the wallet keypair, so
+    # an already-signed fixture is the more realistic input anyway.
+    raw_tx = VersionedTransaction(msg, [kp])
+    tx_b64 = base64.b64encode(bytes(raw_tx)).decode()
+
+    result = await client._submit_swap(token, quote, tx_b64)
+    check(
+        "swap submits via RPC (send called)",
+        len(rpc.sent) == 1,
+        f"-> {len(rpc.sent)}",
+    )
+    check(
+        "swap confirms (confirm called)",
+        len(rpc.confirmed) == 1,
+        f"-> {len(rpc.confirmed)}",
+    )
+    check("swap reports success", result.success, f"-> {result}")
+    check("swap has tx signature", result.tx_signature is not None)
+
+    # Missing rpc/wallet: honest failure, never fake success.
+    bare = JupiterClient(http_client=FakeHttp({"inAmount": "1", "outAmount": "1"}))
+    result_bare = await bare._submit_swap(token, quote, tx_b64)
+    check(
+        "no rpc/wallet injected -> honest failure",
+        not result_bare.success,
+        f"-> {result_bare.error_message}",
+    )
+
+    return failures
+
+
 def _coro_result(result: TradeResult):
     """Return an async stub that yields the given TradeResult."""
 
@@ -189,8 +293,8 @@ def test_config_wiring(failures: list) -> None:
 
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML default aggregator_fallback false",
-        cfg["trade"].get("aggregator_fallback") is False,
+        "YAML aggregator_fallback true (armed R5-P0-5)",
+        cfg["trade"].get("aggregator_fallback") is True,
         f"-> {cfg['trade'].get('aggregator_fallback')!r}",
     )
     check(
@@ -211,6 +315,7 @@ def test_config_wiring(failures: list) -> None:
 def main() -> int:
     failures = asyncio.run(test_quote_parsing())
     failures += asyncio.run(test_seller_fallback_selection())
+    failures += asyncio.run(test_real_submit_path())
     test_config_wiring(failures)
     if failures:
         print(f"\nR3-P1-3 FAILED ({len(failures)}): {failures}")

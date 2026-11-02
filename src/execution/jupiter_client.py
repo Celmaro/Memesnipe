@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from core.pubkeys import normalize_quote_mint
 from interfaces.core import Platform, TokenInfo
 from trading.base import TradeFailureReason, TradeResult
+from platforms.pumpfun.curve_manager import TOKEN_DECIMALS  # R5-P0-5
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,16 @@ class JupiterClient:
         slippage_bps: int = 500,
         max_price_impact_pct: float = 20.0,
         http_client=None,
+        rpc_client=None,  # R5-P0-5: SolanaClient for the real swap submission
+        wallet=None,  # R5-P0-5: core Wallet for signing the server-built tx
     ):
         self.quote_url = quote_url
         self.swap_url = swap_url
         self.slippage_bps = slippage_bps
         self.max_price_impact_pct = max_price_impact_pct
         self._http = http_client  # injected for tests; aiohttp used otherwise
+        self._rpc_client = rpc_client
+        self._wallet = wallet
 
     async def get_quote(
         self,
@@ -185,19 +190,83 @@ class JupiterClient:
                     error_message="Jupiter swap API returned no transaction",
                     failure_reason=TradeFailureReason.SUBMIT_FAILED,
                 )
-            # The caller owns signing/submission (same as every other path).
-            # This client returns the unsigned tx string for the executor.
+            # R5-P0-5: the real live path — sign the server-built tx with the
+            # bot wallet and submit through the metered RPC. Prior to this
+            # the swap returned a hard-coded failure ("submit requires the
+            # executor path") with NO signing or send, so every graduated /
+            # closed-curve position that routed here parked forever, and the
+            # position stayed in the wallet with no exit path (live-verified
+            # 2026-10-30: 25 held positions, 2 exits).
+            return await self._submit_swap(
+                token_info, quote, swap_payload["transaction"]
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Jupiter swap failed")
+            return TradeResult(
+                success=False,
+                platform=token_info.platform,
+                error_message=str(e),
+                failure_reason=TradeFailureReason.SUBMIT_FAILED,
+            )
+
+    async def _submit_swap(
+        self,
+        token_info: TokenInfo,
+        quote: JupiterQuote,
+        transaction_b64: str,
+    ) -> TradeResult:
+        """Sign and submit a Jupiter server-built swap transaction.
+
+        The v6 swap API returns a serialized VersionedTransaction (fee
+        payer and blockhash already set, message signed by NO ONE yet).
+        Deserialize it, sign with the bot wallet, send through the
+        metered RPC, and confirm. Any failure degrades to a failed
+        TradeResult — the aggregator is a fallback, never a new wedge.
+
+        Requires ``rpc_client`` and ``wallet`` (injected at construction
+        when the trader arms ``aggregator_fallback``); without them this
+        cannot submit and reports the failure honestly instead of a fake
+        success.
+        """
+        from solders.transaction import VersionedTransaction
+
+        if self._rpc_client is None or self._wallet is None:
             return TradeResult(
                 success=False,
                 platform=token_info.platform,
                 error_message=(
-                    "Jupiter live swap assembled but submit requires the "
-                    "executor path — see executor wiring"
+                    "Jupiter swap tx assembled but no rpc_client/wallet "
+                    "injected — cannot submit"
                 ),
                 failure_reason=TradeFailureReason.SUBMIT_FAILED,
             )
+        try:
+            import base64
+
+            raw = base64.b64decode(transaction_b64)
+            tx = VersionedTransaction.from_bytes(raw)
+            # Sign with the bot keypair. Do NOT hand-sign via
+            # keypair.sign_message(tx.message.serialize()): MessageV0 has
+            # no serialize(), and reimplementing the message-hash bytes is
+            # version-fragile. The constructor accepts keypairs and signs
+            # internally, exactly like the instruction path in
+            # SolanaClient.build_and_send_transaction — one proven path for
+            # both legacy and v0 messages (live-fixed 2026-11-01).
+            signed = VersionedTransaction(tx.message, [self._wallet.keypair()])
+            tx_sig = await self._rpc_client.send_raw_transaction(signed)
+            status = await self._rpc_client.confirm_transaction_detailed(tx_sig)
+            from core.client import ConfirmationStatus
+
+            success = status is ConfirmationStatus.SUCCESS
+            return TradeResult(
+                success=success,
+                platform=token_info.platform,
+                tx_signature=tx_sig,
+                amount=quote.in_amount / (10**TOKEN_DECIMALS),
+                price=quote.out_sol_decimal / max(quote.in_amount, 1) * (10**TOKEN_DECIMALS),
+            )
         except Exception as e:  # noqa: BLE001
-            logger.exception("Jupiter swap failed")
+            logger.exception("Jupiter swap submit failed")
             return TradeResult(
                 success=False,
                 platform=token_info.platform,

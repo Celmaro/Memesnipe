@@ -111,7 +111,14 @@ trade:
   # R3-P1-3: Jupiter aggregator sell fallback. When a platform sell fails
   # with a pool-gone / liquidity signal (submit failure), route the exit
   # through Jupiter's quote+swap API at the caps below. Off by default.
-  aggregator_fallback: false
+  # R5-P0-5: ARMED — the swap submit path is now real (sign + send +
+  # confirm via the metered RPC; was a stub that never sent). This is the
+  # exit path for graduated/closed-curve positions: pump.fun can no
+  # longer sell them (pool gone), and without this they parked forever
+  # in the wallet (live-verified: 25 held, 2 exits). Impact cap 20% and
+  # 500bps slippage bound the damage; REVERTED failures are NEVER routed
+  # (double-sell protection).
+  aggregator_fallback: true
   aggregator_slippage_bps: 500
   aggregator_max_price_impact_pct: 20.0
 
@@ -319,21 +326,67 @@ filters:
   # R4-P1-1: multi-dimensional rug-risk score gate (0 = off). Weighted sum
   # over creator cadence / holder concentration / buyer set (local features
   # only — no hot-path RPC); refuses when the score exceeds the threshold.
-  # Calibrated on replay before arming.
-  rug_score_threshold: 0.0
+  # Calibrated on replay before arming. R5-P0-4: STAYS OFF — see comment at
+  # filters.rug_score_threshold below (coverage trap refuses all fresh
+  # launches; needs a feeder fix first).
+  # R5-P0-4: armed from research default after live-data data-flow audit —
+  # the feed (trade events -> wash_lpi.observe_trade) is live-wired and the
+  # gate is fail-open (0.0 with no observations), so arming cannot block
+  # data-starved coins, only demonstrably round-tripped volume. First-pass
+  # threshold: refuse when >30% of observed quote volume is round-trip
+  # (paper 2507.01963: 82.8% of high-return tokens show artificial growth;
+  # 30% is a deliberately loose floor to collect live block stats).
+  max_wash_share: 0.3
+  # R5-P0-4: armed — coordinator co-fire feed is live (observe_buy on every
+  # trade event) and the gate fails open (0 with no observations). First-pass
+  # threshold: refuse when >30% of a mint's early buyers co-fire across >=3
+  # OTHER launches (MELT 2602.13480 averaged 36.5% coordinated supply).
+  max_coordinated_supply_share: 0.3
   # R4-P1-2: creator-factory gate (0 = off; launches/hour). Refuses coins
   # whose creator deploys faster than this (factory mass-deployers —
   # 2609.10246; disposable-token rug history — 2602.13480).
-  factory_deploy_rate: 0.0
+  # R5-P0-4: armed — cadence artifact fixed (R5-P2-2: <2 launches = None,
+  # benign), so first-time creators can never trip it. First-pass threshold
+  # 30/hr = a launch every 2 minutes sustained; deliberately loose to
+  # collect live block stats before tightening.
+  factory_deploy_rate: 30.0
   # R4-P1-3: insider-coordination gate (0 = off; share 0..1). Refuses coins
   # where this fraction of early-buyer wallets co-fire across many launches
   # (MELT: 36.5% of supply held by coordinated accounts on average).
-  max_coordinated_supply_share: 0.0
+  # R5-P0-4: see max_coordinated_supply_share — armed, same rationale.
+  # (alias target: coordinated_wallet_share, wallet-fraction units)
+  # max_coordinated_supply_share is the YAML key actually consumed;
+  #   this comment documents the R5-P0-4 arming decision.
   # R4-P1-6: wash-trade share gate (0 = off; share 0..1). Refuses coins
   # where this fraction of recent quote volume comes from wallets that
   # round-trip the same mint (fake volume; 2507.01963: 82.8% of high-return
   # tokens show artificial growth).
-  max_wash_share: 0.0
+  # R5-P0-4: armed — see max_wash_share comment above.
+  # (max_wash_share is the YAML key actually consumed; this comment
+  #   documents the R5-P0-4 arming decision.)
+  # R3-P2-8: metadata socials gate (0 = off). When >0, require at least this
+  # many non-empty metadata extensions (twitter/telegram/website) from the
+  # token's metadata JSON. Fail-open until the refresher has read it.
+  # R5-P0-4: armed at 2 — refuse coins with <2 of twitter/telegram/website
+  # once metadata is read; fail-open before the refresher runs.
+  min_metadata_extensions: 2
+  # T2.5 honeypot gates (off by default; fail-open on read errors).
+  # Freeze-authority: reject mints whose account carries a freeze authority.
+  # R5-P0-4: armed — a freeze authority is a structural honeypot signal;
+  # fail-open on read errors keeps it from blocking on RPC noise.
+  honeypot_freeze_authority: true
+  # Curve supply-hold: reject coins whose curve holds less than this fraction
+  # of total supply (0 disables). ~80% is the pump.fun launch norm.
+  # R5-P0-4: armed at 0.5 — rejects only the clearly-abnormal (<50% held
+  # on-curve); the pump.fun norm ~80% sits far above this.
+  min_curve_hold_fraction: 0.5
+  # R5-P0-4: rug_score_threshold STAYS OFF (0) — arming it would refuse
+  # every fresh launch: the gate feeds only 4 of the 6 coverage features
+  # (cadence/gini/top10/buyers); first-time creators have cadence=None
+  # (R5-P2-2), dropping coverage to 3/6 < the 0.6 min_coverage -> fail-closed
+  # refuse. Zero-fills failure mode identical to the old 35-SOL cap incident.
+  # Requires a feeder fix (pass curve_progress + dev_balance) before arming.
+  rug_score_threshold: 0.0
   # R4-P3-1: fragility-scaled position sizing (1.0 = off). When the
   # ME2F two-signal trigger fires (volatility/whale score AND trade rate
   # both >= thresholds), buy size scales down toward fragility_scale_min.
@@ -351,10 +404,6 @@ filters:
   contention_multiplier: 2.5
   contention_window_s: 60.0
   max_fee_fraction_of_position: 0.005  # 0.5% of the trade quote
-  # R3-P2-8: metadata socials gate (0 = off). When >0, require at least this
-  # many non-empty metadata extensions (twitter/telegram/website) from the
-  # token's metadata JSON. Fail-open until the refresher has read it.
-  min_metadata_extensions: 0
   # Improvement #5: bound the tracked queue so a launch flood can't grow it
   # without limit (drop oldest beyond this).
   max_tracked_tokens: 500
@@ -365,12 +414,6 @@ filters:
   # reject a stale/glitched single read; cheap and decision-blocking.
   consecutive_match_count: 2
   gate_recheck_interval: 0.5 # seconds between confirmation rechecks
-  # T2.5 honeypot gates (off by default; fail-open on read errors).
-  # Freeze-authority: reject mints whose account carries a freeze authority.
-  honeypot_freeze_authority: false
-  # Curve supply-hold: reject coins whose curve holds less than this fraction
-  # of total supply (0 disables). ~80% is the pump.fun launch norm.
-  min_curve_hold_fraction: 0.0
   marry_mode: false # MUST be false so the bot auto-sells
   yolo_mode: true # Phase 3: continuous sniping (freshness fix landed)
 

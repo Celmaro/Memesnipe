@@ -197,13 +197,13 @@ def main() -> int:
     # 8. Config wiring (4 places).
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     check(
-        "YAML rug_score_threshold 0",
+        "YAML rug_score_threshold 0 (stays off R5-P0-4: coverage trap)",
         cfg["filters"].get("rug_score_threshold") == 0.0,
         f"-> {cfg['filters'].get('rug_score_threshold')!r}",
     )
     check(
-        "YAML factory_deploy_rate 0",
-        cfg["filters"].get("factory_deploy_rate") == 0.0,
+        "YAML factory_deploy_rate 30.0 (armed R5-P0-4)",
+        cfg["filters"].get("factory_deploy_rate") == 30.0,
         f"-> {cfg['filters'].get('factory_deploy_rate')!r}",
     )
     check(

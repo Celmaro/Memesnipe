@@ -640,12 +640,18 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
 
         # R3-P1-3: Jupiter aggregator fallback client (only built when the
         # feature is enabled; None otherwise keeps the fallback off).
+        # R5-P0-5: inject rpc_client + wallet so the swap path can ACTUALLY
+        # submit (sign the server-built tx, send, confirm) — previously the
+        # client was built bare and swap() could never send, so graduated /
+        # closed-curve positions parked forever with no exit path.
         if aggregator_fallback:
             from execution.jupiter_client import JupiterClient
 
             self.jupiter_client = JupiterClient(
                 slippage_bps=aggregator_slippage_bps,
                 max_price_impact_pct=aggregator_max_price_impact_pct,
+                rpc_client=self.solana_client,
+                wallet=self.wallet,
             )
         else:
             self.jupiter_client = None
