@@ -79,6 +79,16 @@ def _position(qty=100.0, entry=1.0) -> Position:
 class _FakeProvider:
     """Real pump.fun PDA derivation math for orphan enrichment — no RPC."""
 
+    def derive_pool_address(self, mint, quote_mint=None):
+        # Canonical pump.fun bonding-curve PDA (`bonding-curve` seed) — the
+        # account that actually exists on-chain for live coins (R5-P0-6).
+        from platforms.pumpfun.address_provider import PumpFunAddresses
+
+        addr, _ = Pubkey.find_program_address(
+            [b"bonding-curve", bytes(mint)], PumpFunAddresses.PROGRAM
+        )
+        return addr
+
     def derive_bonding_curve_v2(self, mint):
         from platforms.pumpfun.address_provider import PumpFunAddresses
 
@@ -622,12 +632,16 @@ def main() -> int:
             return (
                 first is False
                 and second is False
-                and cm.reads == 1
+                # R5-P0-6: enrichment probes the canonical `bonding-curve`
+                # PDA first, then the legacy v2-seed fallback, so an
+                # unreadable curve costs exactly 2 reads ONCE per 300s
+                # window (the second call is served from the cache).
+                and cm.reads == 2
                 and str(token.mint) in t._unreadable_curves
             )
         finally:
             _ee.get_platform_implementations = orig_ee
-    check("unreadable curve cached 300s (1 RPC)", asyncio.run(neg_cache()))
+    check("unreadable curve cached 300s (2 RPC once)", asyncio.run(neg_cache()))
 
     # --- Watcher: STOP verdict keeps the position in the registry ------------
     async def watcher_stop():
@@ -751,6 +765,85 @@ def main() -> int:
             _platforms_mod.get_platform_implementations = orig
             _ee.get_platform_implementations = orig_ee
     check("orphan enrich derives v2 sell fields", asyncio.run(orphan_enrichment()))
+
+    # --- Orphan enrichment: canonical `bonding-curve` seed is probed first --
+    async def orphan_enrich_uses_canonical_seed():
+        # Live evidence 2026-10-30 (25 held positions never sold; user
+        # ground truth: they did NOT graduate): the orphan enrichment
+        # derived the bonding curve with the WRONG seed
+        # (`bonding-curve-v2`), so on-chain the account did not exist ->
+        # "curve unreadable" -> sell skipped forever. The canonical PDA
+        # (`bonding-curve` seed, derive_pool_address) EXISTS on-chain for
+        # the same mints (verified 2026-11-01: correct account has 224B
+        # data; v2-seed account not found). The enrichment must probe the
+        # canonical seed FIRST and succeed there.
+        from interfaces.core import Platform
+        from platforms.pumpfun.address_provider import PumpFunAddresses
+
+        t = _trader()
+        # Deterministic mint so the derivation is computable offline.
+        mint = Pubkey.from_string(
+            "37Vnce2mgcjCDqw75X57Xy68DvfFerdxNwB12qetpump"
+        )
+
+        canonical = Pubkey.find_program_address(
+            [b"bonding-curve", bytes(mint)], PumpFunAddresses.PROGRAM
+        )[0]
+        wrong_seed = PumpFunAddresses.find_bonding_curve_v2(mint)
+
+        # Sanity: the two derivations must differ; if the seeds ever
+        # collide this check dies loudly instead of silently passing.
+        seed_differs = canonical != wrong_seed
+
+        calls = {"canonical_reads": 0, "wrong_reads": 0}
+
+        class TruthfulCurveManager:
+            # Mirrors on-chain reality: only the canonical-seed account
+            # exists and carries a creator; the v2-seed account is not
+            # found (what the old code saw - and misread as "graduated").
+            async def get_pool_state(self, pool, commitment=None):
+                if pool == canonical:
+                    calls["canonical_reads"] += 1
+                    return {"creator": str(PumpFunAddresses.PROGRAM)}
+                if pool == wrong_seed:
+                    calls["wrong_reads"] += 1
+                    return {}  # account does not exist on-chain
+                return {}
+
+        import types as _types
+        import trading.exit_engine as _ee
+
+        impls = _types.SimpleNamespace(
+            address_provider=_FakeProvider(), curve_manager=TruthfulCurveManager()
+        )
+
+        def fake_get(platform, client):
+            return impls
+
+        orig = _ee.get_platform_implementations
+        _ee.get_platform_implementations = fake_get
+        try:
+            token = _token()
+            token.platform = Platform.PUMP_FUN
+            token.bonding_curve = None
+            token.associated_bonding_curve = None
+            token.creator = None
+            token.creator_vault = None
+            token.mint = mint
+            ok = await t._ensure_sellable_orphan(token)
+            return (
+                seed_differs
+                and ok is True
+                and token.bonding_curve == canonical
+                and calls["canonical_reads"] == 1
+                and calls["wrong_reads"] == 0  # wins on the first probe
+            )
+        finally:
+            _ee.get_platform_implementations = orig
+    check(
+        "orphan enrich probes canonical bonding-curve seed first",
+        asyncio.run(orphan_enrich_uses_canonical_seed()),
+    )
 
     # --- Orphan skip: un-enrichable (closed curve) must NOT crash -----------
     async def orphan_skip_no_crash():

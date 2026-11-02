@@ -387,19 +387,45 @@ class ExitEngineMixin:
             )
             provider = implementations.address_provider
             curve_manager = implementations.curve_manager
-            pool = token_info.bonding_curve or provider.derive_bonding_curve_v2(
-                token_info.mint
-            )
+            # R5-P0-6: wallet-derived orphans do not carry the curve PDA.
+            # The live pump.fun program uses the `bonding-curve` seed, exposed
+            # by derive_pool_address(). The old v2-seed derivation points at a
+            # nonexistent account for normal pump.fun coins, so enrichment
+            # returned "curve unreadable" and skipped otherwise-sellable
+            # positions forever. Try the canonical PDA first; retain the old
+            # seed as a defensive fallback for any legacy variant.
+            candidates = []
+            if token_info.bonding_curve is not None:
+                candidates.append(token_info.bonding_curve)
+            else:
+                candidates.append(provider.derive_pool_address(token_info.mint))
+                legacy_derive = getattr(provider, "derive_bonding_curve_v2", None)
+                if legacy_derive is not None:
+                    legacy_pool = legacy_derive(token_info.mint)
+                    if legacy_pool not in candidates:
+                        candidates.append(legacy_pool)
+            pool = candidates[0]
             token_program = getattr(token_info, "token_program_id", None)
             # Commit ONLY at the end: half-mutating bonding_curve before the
             # curve read makes the NEXT call early-return True and the sell
             # crash on the still-missing creator_vault (verified live).
             creator = token_info.creator
             if creator is None:
-                state = await curve_manager.get_pool_state(pool)
-                creator_raw = state.get("creator") or state.get(
-                    "creator_address", ""
-                )
+                state = {}
+                creator_raw = ""
+                for candidate in candidates:
+                    try:
+                        candidate_state = await curve_manager.get_pool_state(candidate)
+                    except Exception:
+                        candidate_state = {}
+                    candidate_creator = candidate_state.get("creator") or candidate_state.get(
+                        "creator_address", ""
+                    )
+                    if candidate_creator:
+                        pool = candidate
+                        state = candidate_state
+                        creator_raw = candidate_creator
+                        break
                 if not creator_raw:
                     logger.warning(
                         "Curve for %s has no creator; orphan stays un-sellable",
