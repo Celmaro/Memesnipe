@@ -212,7 +212,83 @@ def main() -> int:
 
     check("deferred enqueue re-queues the aged token", asyncio.run(defer()))
 
-    # --- I: YAML armed values --------------------------------------------
+    # --- I: park row emitted (observation capture) -----------------------
+    class _FakeCapture:
+        def __init__(self):
+            self.rows = []
+
+        def park(self, **kw):
+            self.rows.append(("park", kw))
+
+        def gate_eval(self, **kw):
+            self.rows.append(("gate_eval", kw))
+
+        def detect(self, **kw):
+            self.rows.append(("detect", kw))
+
+    async def park_capture():
+        q = asyncio.Queue(maxsize=10)
+        t = object.__new__(UniversalTrader)
+        t.processed_tokens = set()
+        t._queued_mints = set()
+        t.token_queue = q
+        t.token_timestamps = {}
+        t._first_seen_mints = {}
+        t.token_launch_timestamps = {}
+        t.max_tracked_tokens = 1000
+        t.min_token_age_s = 60.0
+        t._evidence_pending_count = 0
+        t.max_evidence_pending = 256
+        cap = _FakeCapture()
+        t.shadow_capture = cap
+        tk = _token(symbol="CAP1")
+        await UniversalTrader._queue_token(t, tk)
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task():
+                task.cancel()
+        return cap.rows
+
+    prows = [kw for kind, kw in asyncio.run(park_capture()) if kind == "park"]
+    check(
+        "park row emitted with remaining time",
+        len(prows) == 1 and 59.0 <= float(prows[0]["remaining_s"]) <= 60.0,
+        f"-> {prows}",
+    )
+
+    # --- J: gate_eval row carries verdict + observed inputs --------------
+    async def gate_capture():
+        from time import monotonic
+
+        t = _gate_trader(min_observed_trades=20, min_unique_buyers=10)
+        cap = _FakeCapture()
+        t.shadow_capture = cap
+        t._first_seen_mints = {str(tok.mint): monotonic() - 61.0}
+        for i in range(25):
+            t._wash_lpi.observe_trade(
+                mint=str(tok.mint),
+                wallet=f"w{i}",
+                is_buy=True,
+                quote_lamports=1_000_000,
+                token_price=1e-8,
+                ts=float(i),
+            )
+        for i in range(12):
+            t._cofire.observe_buy(str(tok.mint), f"buyer{i}")
+        await UniversalTrader._capture_gate_eval(t, tok, "pass")
+        return [kw for kind, kw in cap.rows if kind == "gate_eval"]
+
+    grows = asyncio.run(gate_capture())
+    check(
+        "gate_eval row carries verdict + observed inputs",
+        len(grows) == 1
+        and grows[0]["verdict"] == "pass"
+        and int(grows[0].get("observed_trades") or 0) >= 20
+        and int(grows[0].get("unique_buyers") or 0) >= 10
+        and float(grows[0].get("age_s") or 0) >= 60,
+        f"-> {grows}",
+    )
+
+    # --- K: YAML armed values --------------------------------------------
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     f = cfg["filters"]
     check(

@@ -350,6 +350,15 @@ filters:
   #                           fewer trades than this (a dead launch).
   #   min_unique_buyers:      refuse if too few distinct wallets bought
   #                           (a bundled launch reuses the same wallets).
+  # Measured at +60 s across the shadow archive (482 tracked mints): median
+  # MC 29.2 SOL, IQR 28.4-30.8 -- 85 % sit at 28-32 SOL (launch floor is
+  # 27.96), i.e. under 1 SOL of real buying; only 4 % are above 36 SOL.
+  # Direction 45->75 s: 67 % flat, 26 % descending, 7 % ascending. So a 60 s
+  # entry mostly meets dead coins (the gate's job is to refuse them), and
+  # the "healthy coin pumped past 40-45" case is a 1-3 % event, NOT the norm.
+  # NOTE: 20 trades / 10 buyers can happen on ~0.1 SOL of volume (MC +0.7 %),
+  # so if live data shows gate-passers with no price movement, add a volume
+  # or MC-movement condition rather than loosening the count thresholds.
   # Values from the 2026-11-01 recommendation (30-35 SOL band was the only
   # net-positive bucket: 40% WR, +22.8% avg — but buying then is impossible
   # with populated filters, so we wait for data and let the MC band fall

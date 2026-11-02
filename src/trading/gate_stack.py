@@ -317,6 +317,68 @@ class GateStackMixin:
             )
         return None
 
+    def screening_snapshot(self, token_info: TokenInfo) -> dict:
+        """R5-P1-1 observation: the values the dynamic gates read right now.
+
+        Read-only and getattr-safe (verifier stubs lack most of these): the
+        pre-buy gate emits them beside its verdict so live tuning can see
+        which filter bound and at what value. No RPC here — curve/MC values
+        are added by the caller from the pool snapshot it already reads.
+        """
+        out: dict = {}
+        mint = str(token_info.mint)
+        try:
+            wash = getattr(self, "_wash_lpi", None)
+            if wash is not None:
+                out["observed_trades"] = wash.event_count(mint)
+                out["wash_share"] = round(float(wash.wash_share(mint)), 4)
+        except Exception:
+            pass
+        try:
+            cofire = getattr(self, "_cofire", None)
+            if cofire is not None:
+                out["unique_buyers"] = cofire.buyer_count(mint)
+                out["coordinated_share"] = round(
+                    float(cofire.coordinated_share(mint)), 4
+                )
+        except Exception:
+            pass
+        try:
+            store = getattr(self, "_holder_store", None)
+            snap = store.get(mint) if store is not None else None
+            if snap is not None:
+                out["unique_holders"] = snap.unique_holders
+                out["top10_fraction"] = round(float(snap.top10_fraction), 4)
+                out["gini"] = round(float(snap.gini), 4)
+        except Exception:
+            pass
+        try:
+            store = getattr(self, "_metadata_store", None)
+            meta = store.get(mint) if store is not None else None
+            if meta is not None:
+                out["metadata_extensions"] = meta.non_empty_extensions
+        except Exception:
+            pass
+        try:
+            out["transfer_fee_bps"] = token_info.transfer_fee_bps
+        except Exception:
+            pass
+        try:
+            from screening.rug_score import cadence_mints_per_hour
+
+            creator_key = str(token_info.creator or "") or (
+                str(token_info.user) if token_info.user else ""
+            )
+            window = getattr(self, "_creator_launch_ts", {}).get(creator_key, [])
+            cadence = cadence_mints_per_hour(window, monotonic())
+            out["creator_cadence_hr"] = (
+                round(float(cadence), 2) if cadence is not None else None
+            )
+            out["creator"] = creator_key or None
+        except Exception:
+            pass
+        return out
+
     async def _curve_gate_reason(self, token_info: TokenInfo) -> str | None:
         """Why the curve refuses this coin, or None to trade it.
 

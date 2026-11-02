@@ -2277,6 +2277,14 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     f"Parking {token_info.symbol} for evidence: "
                     f"{remaining:.0f}s until {min_age:.0f}s old"
                 )
+                if getattr(self, "shadow_capture", None) is not None:
+                    self.shadow_capture.park(
+                        mint=token_key,
+                        symbol=token_info.symbol,
+                        remaining_s=remaining,
+                        age_s=max(0.0, age),
+                        min_token_age_s=min_age,
+                    )
                 # Hold the dedupe slot while parked: a duplicate detect must
                 # not start a second wait for the same mint. _deferred_enqueue
                 # discards it before re-entering _queue_token.
@@ -2494,6 +2502,46 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             )
         except Exception:
             logger.exception("Shadow detect capture failed")
+
+    async def _capture_gate_eval(
+        self, token_info: TokenInfo, verdict: str, reason: str | None = None
+    ) -> None:
+        """R5-P1-1: record the pre-buy gate verdict WITH its input values.
+
+        ``_capture_detect`` only stores the skip reason, so a live run could
+        never answer "which filter bound, at what value". This emits the
+        screening snapshot (trades, buyers, wash, cofire, holders, metadata,
+        creator cadence), the candidate's age and — from one pool read — its
+        market cap and curve progress. Best-effort: research data must never
+        raise into the trade path.
+        """
+        if getattr(self, "shadow_capture", None) is None:
+            return
+        try:
+            fields = self.screening_snapshot(token_info)
+            first_seen = self._first_seen_mints.get(str(token_info.mint))
+            if first_seen is not None:
+                fields["age_s"] = round(monotonic() - first_seen, 2)
+            pool = await self._pool_snapshot(token_info)
+            if pool:
+                mc = pool.get("market_cap_quote")
+                if mc is not None:
+                    fields["mc_sol"] = round(float(mc), 2)
+                real = pool.get("real_quote_reserves")
+                if real is not None:
+                    fields["curve_progress_sol"] = round(float(real) / 1e9, 6)
+                fields["price"] = pool.get("price_per_token")
+                fields["graduated"] = pool.get("graduated")
+            self.shadow_capture.gate_eval(
+                mint=str(token_info.mint),
+                symbol=token_info.symbol,
+                platform=token_info.platform.value,
+                verdict=verdict,
+                reason=reason,
+                **fields,
+            )
+        except Exception:
+            logger.exception("Shadow gate-eval capture failed")
 
     async def _sol_price_usd(self) -> float | None:
         """Current SOL/USD price for research capture, or None on failure.
@@ -2786,12 +2834,16 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 token_info, require_evidence=True
             )
             if prebuy_reason:
+                await self._capture_gate_eval(
+                    token_info, "reject", prebuy_reason
+                )
                 logger.info(
                     f"Skipping {token_info.symbol} - {prebuy_reason} "
                     f"(pre-buy recheck)"
                 )
                 self._capture_detect(token_info, prebuy_reason)
                 return
+            await self._capture_gate_eval(token_info, "pass")
 
             # Buy token
             # R3-P2-10: session risk guards — the loss limit blocks NEW buys

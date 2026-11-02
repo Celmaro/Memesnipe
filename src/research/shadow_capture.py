@@ -119,6 +119,53 @@ class ShadowDataCapture:
             **extra,
         )
 
+    def gate_eval(
+        self,
+        mint: str,
+        symbol: str,
+        platform: str,
+        verdict: str,
+        reason: str | None = None,
+        **extra: Any,
+    ) -> None:
+        """Pre-buy gate verdict with the input values that produced it.
+
+        R5-P1-1 observation: without this row the live run shows buys and
+        closes but never WHY a candidate passed or failed at 60 s, so the
+        evidence gate could not be tuned from live data.
+        """
+        self._emit(
+            "gate_eval",
+            mint=mint,
+            symbol=symbol,
+            platform=platform,
+            verdict=verdict,
+            reason=reason,
+            **extra,
+        )
+
+    def park(
+        self,
+        mint: str,
+        symbol: str,
+        remaining_s: float,
+        age_s: float | None = None,
+        **extra: Any,
+    ) -> None:
+        """A launch parked for the entry-evidence wait (R5-P1-1).
+
+        Proves the park -> re-enqueue path ran and how long the candidate
+        waited before the demand thresholds were applied.
+        """
+        self._emit(
+            "park",
+            mint=mint,
+            symbol=symbol,
+            remaining_s=round(float(remaining_s), 2),
+            age_s=round(float(age_s), 2) if age_s is not None else None,
+            **extra,
+        )
+
     def sim_open(
         self,
         mint: str,
