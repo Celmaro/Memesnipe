@@ -200,7 +200,7 @@ trade:
   # concurrent. P0 execution remediation + RiskTracker restart persistence
   # landed (113/113). The $10 realized-loss cut bounds the downside; sells
   # always run, buys only. Flip back to shadow after each data window.
-  shadow_mode: false
+  shadow_mode: true
 # T2.6: RPC catch-up backfill (off by default; off = safe baseline).
 # Replays missed launches/events after a geyser gap via getSignaturesForAddress.
 backfill:

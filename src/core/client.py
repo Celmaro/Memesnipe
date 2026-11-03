@@ -1448,7 +1448,7 @@ class SolanaClient:
         Returns:
             Parsed JSON response, or None if all attempts fail.
         """
-        method = body.get("method", "unknown")
+        method = body.get("method", "unknown") if isinstance(body, dict) else "batch"
         error_attempts = 0
         rate_limit_attempts = 0
         deadline = _Deadline(deadline_seconds)

@@ -508,6 +508,7 @@ class UniversalGeyserListener(BaseTokenListener):
 
         if not update.HasField("transaction"):
             return None
+        metrics.incr("geyser.tx_frames")
 
         update_slot = getattr(update.transaction, "slot", None)
         if update_slot is not None and update_slot in self._dead_slots:
@@ -530,10 +531,13 @@ class UniversalGeyserListener(BaseTokenListener):
             # existing mint. Forward the transaction's logs to the copy engine
             # (guarded so a slow mirror never blocks the geyser loop).
             if self.trade_callback is not None:
+                metrics.incr("geyser.trade_frames")
                 logs = []
                 meta = getattr(update.transaction, "meta", None)
                 if meta is not None:
                     logs = list(meta.log_messages or [])
+                if not logs:
+                    metrics.incr("geyser.trade_logs_empty")
                 if logs:
                     # R3-P2-11: pass the outer signer (message account_keys[0])
                     # so the parser can correct CPI/aggregator attribution.

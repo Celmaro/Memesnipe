@@ -375,6 +375,85 @@ def main() -> int:
         f"-> trades={c_trades} buyers={c_buyers}",
     )
 
+    # --- L: RPC trade backfill (blind-feed workaround) --------------------
+    class _FakeBackfillClient:
+        def __init__(self):
+            self.calls = []
+            self.sigs = []
+            self.txs = []
+
+        async def post_rpc(self, body, **kwargs):
+            self.calls.append(body)
+            if isinstance(body, dict) and body.get("method") == "getSignaturesForAddress":
+                return {"result": self.sigs}
+            if isinstance(body, list):
+                return self.txs
+            return None
+
+    async def backfill_case(mint_sym, candidate_mint, sigs, txs, min_trades=20):
+        t = object.__new__(UniversalTrader)
+        t.min_observed_trades = min_trades
+        t._evidence_backfilled = set()
+        t._wash_lpi = WashLpiDetector()
+        t._cofire = CoFireTracker()
+        t._rug_buyers = {}
+        t._backfill_client = _FakeBackfillClient()
+        t._backfill_client.sigs = sigs
+        t._backfill_client.txs = txs
+        t.solana_client = t._backfill_client
+        t.platform_implementations = SimpleNamespace(event_parser=_FakeParser(candidate_mint))
+        tk = _token(mint_sym, candidate_mint)
+        await UniversalTrader._backfill_trades_from_rpc(t, tk)
+        return t
+
+    fake_sig = {
+        "signature": "FAKESIG" + "0" * 56,
+        "err": None,
+        "slot": 1,
+        "blockTime": 1,
+    }
+    fake_tx = {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": {
+            "transaction": {"message": {"accountKeys": ["traderA"]}},
+            "meta": {"logMessages": ["Program data: aGVsbG8="]},
+        },
+    }
+    bf = asyncio.run(
+        backfill_case(
+            "BFILL",
+            "37Vnce2mgcjCDqw75X57Xy68DvfFerdxNwB12qetpump",
+            [fake_sig],
+            [fake_tx],
+        )
+    )
+    bf_mint = "37Vnce2mgcjCDqw75X57Xy68DvfFerdxNwB12qetpump"
+    check(
+        "backfill feeds trackers from RPC and marks the mint",
+        bf._wash_lpi.event_count(bf_mint) == 1
+        and bf._cofire.buyer_count(bf_mint) == 1
+        and bf_mint in bf._evidence_backfilled,
+        f"-> trades={bf._wash_lpi.event_count(bf_mint)} "
+        f"buyers={bf._cofire.buyer_count(bf_mint)}",
+    )
+
+    bf2 = asyncio.run(
+        backfill_case(
+            "BFILL",
+            bf_mint,
+            [fake_sig],
+            [fake_tx],
+            min_trades=0,
+        )
+    )
+    check(
+        "backfill skipped entirely when the evidence gate is off",
+        bf2._wash_lpi.event_count(bf_mint) == 0
+        and bf2._backfill_client.calls == [],
+        f"-> rpc calls={len(bf2._backfill_client.calls)}",
+    )
+
     # --- K: YAML armed values --------------------------------------------
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     f = cfg["filters"]

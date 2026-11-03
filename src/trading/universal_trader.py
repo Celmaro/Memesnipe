@@ -778,6 +778,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         # entries are asyncio tasks (not queue items), so the processor stays
         # free for other launches while they age.
         self._first_seen_mints: dict[str, float] = {}
+        # R5-P1-1: mints already backfilled from RPC (log-feed blind workaround).
+        self._evidence_backfilled: set[str] = set()
         self._evidence_pending_count = 0
         self.max_evidence_pending = 256
         # R4-P1-8: momentum-fade advisory state (log-only; peak trade rate
@@ -1487,6 +1489,113 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         except Exception:
             logger.exception("Rug trade feed init failed; drain test only")
 
+    async def _backfill_trades_from_rpc(self, token_info: TokenInfo) -> None:
+        """Populate the evidence trackers from RPC when the log feed is blind.
+
+        The Geyser provider in use streams transaction frames WITHOUT
+        ``meta.log_messages`` (measured: 2302/2302 empty), so TradeEvent
+        parsing never sees a trade and the 60 s evidence gate always judges
+        ``trades=0 / buyers=0`` — it can never pass. Token creates still
+        parse (instruction-based), which is why detection works.
+
+        This fetches the mint's recent successful transactions (the token is
+        ~60 s old, so the whole history fits in one page) and decodes the
+        TradeEvents from RPC logs with the SAME parser, feeding the same
+        wash/LPI and co-fire trackers the gate reads. Idempotent per mint
+        and skipped when the live feed already has data.
+        """
+        if getattr(self, "min_observed_trades", 0) <= 0:
+            return
+        mint = str(token_info.mint)
+        if mint in getattr(self, "_evidence_backfilled", set()):
+            return
+        if self._wash_lpi.event_count(mint) > 0:
+            self._evidence_backfilled.add(mint)
+            return
+        client = getattr(self, "solana_client", None)
+        if client is None:
+            return
+        self._evidence_backfilled.add(mint)
+
+        sig_resp = await client.post_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [mint, {"limit": 100}],
+            },
+            deadline_seconds=8.0,
+        )
+        sigs = (sig_resp or {}).get("result") or []
+        ok_sigs = [s for s in sigs if s.get("err") is None]
+        if not ok_sigs:
+            return
+        # Newest first: for a young mint the whole life fits; cap the batch
+        # (each method burns one RPC slot at ~2 rps).
+        sigs_page = ok_sigs[:25]
+        batch = [
+            {
+                "jsonrpc": "2.0",
+                "id": i,
+                "method": "getTransaction",
+                "params": [
+                    s["signature"],
+                    {"encoding": "json", "maxSupportedTransactionVersion": 1},
+                ],
+            }
+            for i, s in enumerate(sigs_page)
+        ]
+        responses = await client.post_rpc(batch, deadline_seconds=15.0)
+        if not isinstance(responses, list):
+            return
+        observed = 0
+        parser = self.platform_implementations.event_parser
+        for item in responses:
+            tx = item.get("result") if isinstance(item, dict) else None
+            if not tx:
+                continue
+            try:
+                keys = tx["transaction"]["message"]["accountKeys"]
+                signer = (
+                    keys[0]
+                    if isinstance(keys[0], str)
+                    else keys[0].get("pubkey")
+                )
+                logs = tx["meta"].get("logMessages") or []
+                logs = [m if isinstance(m, str) else m.get("log", "") for m in logs]
+                trade = parser.parse_trade_event_from_logs(
+                    logs, outer_signer=signer
+                )
+            except Exception:
+                continue
+            if not trade or str(trade.get("mint", "")) != mint:
+                continue
+            try:
+                tok_amt = float(trade.get("token_amount") or 0)
+                sol_amt = float(trade.get("sol_amount") or 0)
+                trader_key = str(trade.get("trader") or "")
+                self._wash_lpi.observe_trade(
+                    mint,
+                    trader_key,
+                    is_buy=bool(trade.get("is_buy")),
+                    quote_lamports=int(float(trade.get("quote_amount") or 0)),
+                    ts=monotonic(),
+                    token_price=(sol_amt / tok_amt if tok_amt > 0 else None),
+                )
+                if trade.get("is_buy") and trader_key:
+                    self._rug_buyers.setdefault(mint, set()).add(trader_key)
+                    self._cofire.observe_buy(mint, trader_key)
+                observed += 1
+            except Exception:
+                continue
+        metrics.incr("feed.rpc_backfill_runs")
+        metrics.incr("feed.rpc_backfill_trades", observed)
+        logger.info(
+            f"RPC trade backfill {token_info.symbol}: "
+            f"{observed} trades from {len(sigs_page)} txs "
+            f"(live feed blind)"
+        )
+
     async def _consume_trade_logs(
         self, logs: list[str], outer_signer: str | None = None
     ) -> dict | None:
@@ -1520,7 +1629,9 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             logs, outer_signer=outer_signer
         )
         if not trade:
+            metrics.incr("feed.logs_unparsed")
             return None
+        metrics.incr("feed.trades_parsed")
         mint_key = str(trade.get("mint", ""))
         trader_key = str(trade.get("trader") or "")
         # R4-P1-6: feed the wash/LPI detector every trade event (bounded
@@ -1538,6 +1649,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             if self._should_track_mint_buyers(mint_key) or mint_key in getattr(
                 self, "_first_seen_mints", {}
             ):
+                metrics.incr("feed.candidate_trades")
                 self._wash_lpi.observe_trade(
                     mint_key,
                     trader_key,
@@ -2427,7 +2539,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 "metrics: received=%d detected=%d processed=%d queue_depth=%d "
                 "proc_avg=%ss proc_p95=%ss errors=%d stale=%d "
                 "rpc_requests=%d rpc_429=%d rpc_p95=%ss "
-                "geyser_reconnects=%d grpc_exhausted=%d",
+                "geyser_reconnects=%d grpc_exhausted=%d "
+                "feed_parsed=%d feed_unparsed=%d feed_cand=%d txfr=%d trdfr=%d empty=%d",
                 snap["counters"].get("geyser.updates_received", 0),
                 snap["counters"].get("geyser.tokens_detected", 0),
                 snap["counters"].get("tokens.dequeued", 0),
@@ -2441,6 +2554,12 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 snap["hist"].get("rpc.latency", {}).get("p95", 0.0),
                 snap["counters"].get("geyser.reconnects", 0),
                 snap["counters"].get("geyser.grpc_resource_exhausted", 0),
+                snap["counters"].get("feed.trades_parsed", 0),
+                snap["counters"].get("feed.logs_unparsed", 0),
+                snap["counters"].get("feed.candidate_trades", 0),
+                snap["counters"].get("geyser.tx_frames", 0),
+                snap["counters"].get("geyser.trade_frames", 0),
+                snap["counters"].get("geyser.trade_logs_empty", 0),
             )
 
     async def _drain_token_queue(self, max_age: float) -> None:
@@ -2881,6 +3000,14 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             # now with the post-wait snapshot so a coin that passed on stale
             # (or empty) data is refused before submission. Stateless: the
             # creator-cadence side effect lives only in _skip_reason().
+            try:
+                await self._backfill_trades_from_rpc(token_info)
+            except Exception:
+                logger.debug(
+                    f"RPC trade backfill failed for {token_info.symbol} "
+                    f"(non-fatal, gate may reject on empty evidence)",
+                    exc_info=True,
+                )
             prebuy_reason = self._dynamic_screening_reason(
                 token_info, require_evidence=True
             )
