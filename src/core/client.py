@@ -1460,27 +1460,30 @@ class SolanaClient:
 
             request_started: float | None = None
             try:
+                # A JSON-RPC batch is one HTTP POST but N provider methods;
+                # charge the bucket all N so backfills do not 429 out the
+                # curve gates that share this limiter.
+                weight = len(body) if isinstance(body, list) else 1
                 remaining = deadline.remaining()
-                if remaining is None:
-                    await self._rate_limiter.acquire()
-                else:
-                    if remaining <= 0:
-                        break
-                    # A provider-wide cooldown can be much longer than a
-                    # latency-sensitive caller's deadline. Bound the limiter
-                    # wait itself so fee sampling/confirmation cannot sit
-                    # blocked beyond the budget they explicitly requested.
-                    try:
-                        await asyncio.wait_for(
-                            self._rate_limiter.acquire(), timeout=remaining
-                        )
-                    except TimeoutError:
-                        logger.warning(
-                            "RPC request %s exhausted its %s waiting for rate-limit capacity",
-                            method,
-                            deadline,
-                        )
-                        break
+                for _ in range(weight):
+                    if remaining is None:
+                        await self._rate_limiter.acquire()
+                    else:
+                        if remaining <= 0:
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                self._rate_limiter.acquire(), timeout=remaining
+                            )
+                        except TimeoutError:
+                            logger.warning(
+                                "RPC request %s exhausted its %s waiting for rate-limit capacity",
+                                method,
+                                deadline,
+                            )
+                            break
+                if deadline.remaining() is not None and deadline.remaining() <= 0:
+                    break
 
                 session = await self._get_session()
                 metrics.incr("rpc.requests")

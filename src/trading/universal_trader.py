@@ -1530,9 +1530,12 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         ok_sigs = [s for s in sigs if s.get("err") is None]
         if not ok_sigs:
             return
-        # Newest first: for a young mint the whole life fits; cap the batch
-        # (each method burns one RPC slot at ~2 rps).
-        sigs_page = ok_sigs[:25]
+        # Newest first: for a young mint the whole life fits. Cap the batch:
+        # each getTransaction costs the provider one request and the shared
+        # bucket charges them all (2 rps), so 10 txs + 1 signature list =
+        # ~5.5s per candidate — inside the 60s gate budget without starving
+        # the curve gates' own reads.
+        sigs_page = ok_sigs[:10]
         batch = [
             {
                 "jsonrpc": "2.0",
@@ -2943,6 +2946,19 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                     f"Waiting for {self.wait_time_after_creation} seconds for the pool/curve to stabilize..."
                 )
                 await asyncio.sleep(self.wait_time_after_creation)
+
+                # R5-P1-1: this geyser feed carries NO log_messages, so the
+                # TradeEvent trackers never fill. Backfill this candidate's
+                # trades from RPC BEFORE any gate runs, so every later verdict
+                # (curve reject included) is judged on real evidence, not on a
+                # structurally empty feed.
+                try:
+                    await self._backfill_trades_from_rpc(token_info)
+                except Exception:
+                    logger.debug(
+                        f"RPC trade backfill failed for {token_info.symbol}",
+                        exc_info=True,
+                    )
 
             # Curve quality gates (min progress / max MC) — only on the non-extreme
             # path. Block-0 extreme-fast buys have no demand data yet (the

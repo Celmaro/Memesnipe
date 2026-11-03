@@ -61,22 +61,28 @@ class TokenBucketRateLimiter:
                 max(0.0, self._cooldown_until - now),
             )
 
-    async def acquire(self) -> None:
-        """Acquire a token, waiting for both cooldown and bucket capacity."""
-        while True:
-            async with self._lock:
-                now = time.monotonic()
-                self._refill()
-                cooldown_wait = max(0.0, self._cooldown_until - now)
-                if cooldown_wait > 0:
-                    wait_time = cooldown_wait
-                elif self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                else:
-                    wait_time = (1.0 - self._tokens) / self._max_rps
+    async def acquire(self, tokens: int = 1) -> None:
+        """Acquire tokens, waiting for both cooldown and bucket capacity.
 
-            await asyncio.sleep(wait_time)
+        A JSON-RPC batch of N methods costs the provider N requests even
+        though it is one HTTP call, so the caller passes ``tokens=N`` to
+        keep the shared bucket honest (prevents 429s elsewhere).
+        """
+        for _ in range(max(1, tokens)):
+            while True:
+                async with self._lock:
+                    now = time.monotonic()
+                    self._refill()
+                    cooldown_wait = max(0.0, self._cooldown_until - now)
+                    if cooldown_wait > 0:
+                        wait_time = cooldown_wait
+                    elif self._tokens >= 1.0:
+                        self._tokens -= 1.0
+                        break
+                    else:
+                        wait_time = (1.0 - self._tokens) / self._max_rps
+
+                await asyncio.sleep(wait_time)
 
     def _refill(self) -> None:
         """Refill tokens based on elapsed time since last refill."""
