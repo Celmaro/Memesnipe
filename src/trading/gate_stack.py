@@ -415,6 +415,10 @@ class GateStackMixin:
                     return "curve gate check failed (no pool address) - fail-closed"
                 return None
             state = await curve_manager.get_pool_state(pool_address)
+            # Observation hook (R5-P1-1): hand the decoded state to the
+            # gate_eval capture so a curve-gate rejection is recorded with
+            # its MC/progress WITHOUT a second RPC read by the capture.
+            self._last_curve_state = (str(token_info.mint), state)
             if not state.get("is_sol_paired", False):
                 return None
             if state.get("graduated"):

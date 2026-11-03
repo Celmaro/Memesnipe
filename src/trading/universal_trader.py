@@ -2511,16 +2511,22 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             logger.exception("Shadow detect capture failed")
 
     async def _capture_gate_eval(
-        self, token_info: TokenInfo, verdict: str, reason: str | None = None
+        self,
+        token_info: TokenInfo,
+        verdict: str,
+        reason: str | None = None,
+        pool_state: dict | None = None,
     ) -> None:
         """R5-P1-1: record the pre-buy gate verdict WITH its input values.
 
         ``_capture_detect`` only stores the skip reason, so a live run could
         never answer "which filter bound, at what value". This emits the
         screening snapshot (trades, buyers, wash, cofire, holders, metadata,
-        creator cadence), the candidate's age and — from one pool read — its
-        market cap and curve progress. Best-effort: research data must never
-        raise into the trade path.
+        creator cadence), the candidate's age and — from the pool state —
+        its market cap and curve progress. ``pool_state`` may be supplied
+        pre-fetched by the curve gate (avoids a second RPC read); otherwise
+        one pool snapshot is taken here. Best-effort: research data must
+        never raise into the trade path.
         """
         if getattr(self, "shadow_capture", None) is None:
             return
@@ -2529,16 +2535,24 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             first_seen = self._first_seen_mints.get(str(token_info.mint))
             if first_seen is not None:
                 fields["age_s"] = round(monotonic() - first_seen, 2)
-            pool = await self._pool_snapshot(token_info)
-            if pool:
-                mc = pool.get("market_cap_quote")
+            if pool_state is None:
+                pool_state = await self._pool_snapshot(token_info)
+            if pool_state:
+                mc = pool_state.get("market_cap_quote")
+                if mc is None:
+                    # raw curve state (no market_cap_quote wrapper): compute
+                    # the same MC the curve gate does (price * supply / 1e6)
+                    price = pool_state.get("price_per_token")
+                    supply = pool_state.get("token_total_supply")
+                    if price is not None and supply:
+                        mc = float(price) * (float(supply) / 1e6)
                 if mc is not None:
                     fields["mc_sol"] = round(float(mc), 2)
-                real = pool.get("real_quote_reserves")
+                real = pool_state.get("real_quote_reserves")
                 if real is not None:
                     fields["curve_progress_sol"] = round(float(real) / 1e9, 6)
-                fields["price"] = pool.get("price_per_token")
-                fields["graduated"] = pool.get("graduated")
+                fields["price"] = pool_state.get("price_per_token")
+                fields["graduated"] = pool_state.get("graduated")
             self.shadow_capture.gate_eval(
                 mint=str(token_info.mint),
                 symbol=token_info.symbol,
@@ -2806,6 +2820,21 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             if not self.extreme_fast_mode:
                 curve_gate_reason = await self._curve_gate_reason(token_info)
                 if curve_gate_reason:
+                    # Observation (R5-P1-1): record the curve-gate rejection
+                    # with the evidence-gate inputs so the shadow archive
+                    # shows how many parked tokens WOULD have passed the
+                    # trade/buyer thresholds before this gate refused them.
+                    stashed = getattr(self, "_last_curve_state", None)
+                    await self._capture_gate_eval(
+                        token_info,
+                        "reject",
+                        curve_gate_reason,
+                        pool_state=(
+                            stashed[1]
+                            if stashed and stashed[0] == str(token_info.mint)
+                            else None
+                        ),
+                    )
                     logger.info(f"Skipping {token_info.symbol} - {curve_gate_reason}")
                     self._capture_detect(token_info, curve_gate_reason)
                     return
