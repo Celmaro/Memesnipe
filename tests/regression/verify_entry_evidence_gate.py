@@ -317,6 +317,64 @@ def main() -> int:
         f"-> {grows}",
     )
 
+    # --- K: trade-feed scoping (candidates only) --------------------------
+    class _FakeParser:
+        def __init__(self, mint):
+            self.mint = mint
+
+        def parse_trade_event_from_logs(self, logs, outer_signer=None):  # noqa: ARG002
+            return {
+                "mint": self.mint,
+                "trader": "trader1",
+                "is_buy": True,
+                "token_amount": "1000000",
+                "sol_amount": "1000000",
+                "quote_amount": "1000000",
+            }
+
+    def _feed_trader(mint, candidate: bool):
+        t = object.__new__(UniversalTrader)
+        t._wash_lpi = WashLpiDetector()
+        t._cofire = CoFireTracker()
+        t._rug_buyers = {}
+        t.token_timestamps = {}
+        t._buy_reservations = set()
+        t._active_exit_mints = set()
+        t._unsold_positions = {}
+        t._first_seen_mints = {mint: 0.0} if candidate else {}
+        t.migrate_watcher = None
+        t._creator_sellers = {}
+        t._creator_sold_for_exit = set()
+        t.exit_on_creator_sell = False
+        t.post_entry_advisories_enabled = False
+        t.event_driven_exits_enabled = False
+        t.wallet = None
+        t.platform_implementations = SimpleNamespace(event_parser=_FakeParser(mint))
+        return t
+
+    async def scope_case(mint, candidate):
+        t = _feed_trader(mint, candidate)
+        await UniversalTrader._consume_trade_logs(t, ["log"], None)
+        return t._wash_lpi.event_count(mint), t._cofire.buyer_count(mint)
+
+    nc_trades, nc_buyers = asyncio.run(
+        scope_case("NONCANDPUMPmintNotTracked111111111111111111", False)
+    )
+    check(
+        "non-candidate mint trades are NOT observed (feed stays bounded)",
+        nc_trades == 0 and nc_buyers == 0,
+        f"-> trades={nc_trades} buyers={nc_buyers}",
+    )
+
+    c_trades, c_buyers = asyncio.run(
+        scope_case("CANDPUMPmintTracked222222222222222222222222", True)
+    )
+    check(
+        "candidate mint trades ARE observed (evidence window survives)",
+        c_trades == 1 and c_buyers == 1,
+        f"-> trades={c_trades} buyers={c_buyers}",
+    )
+
     # --- K: YAML armed values --------------------------------------------
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     f = cfg["filters"]

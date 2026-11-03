@@ -1528,14 +1528,24 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         try:
             tok_amt = float(trade.get("token_amount") or 0)
             sol_amt = float(trade.get("sol_amount") or 0)
-            self._wash_lpi.observe_trade(
-                mint_key,
-                trader_key,
-                is_buy=bool(trade.get("is_buy")),
-                quote_lamports=int(float(trade.get("quote_amount") or 0)),
-                ts=monotonic(),
-                token_price=(sol_amt / tok_amt if tok_amt > 0 else None),
-            )
+            # R5-P1-1: observe ONLY candidate/position mints. The Geyser feed
+            # sees every trade on the whole pump.fun program (thousands of
+            # mints/hour); feeding all of them into a 500-mint tracker makes
+            # eviction (fewest-events victim) throw away exactly the parked
+            # candidates, so at 60s their event_count was 0 and the evidence
+            # gate could never pass anything. Scoping here keeps the window
+            # alive for the mints the gate actually judges.
+            if self._should_track_mint_buyers(mint_key) or mint_key in getattr(
+                self, "_first_seen_mints", {}
+            ):
+                self._wash_lpi.observe_trade(
+                    mint_key,
+                    trader_key,
+                    is_buy=bool(trade.get("is_buy")),
+                    quote_lamports=int(float(trade.get("quote_amount") or 0)),
+                    ts=monotonic(),
+                    token_price=(sol_amt / tok_amt if tok_amt > 0 else None),
+                )
         except Exception:
             logger.debug("wash/LPI observe failed (non-fatal)", exc_info=True)
         # R3-P1-4: creator-sell trigger — a sell whose trader matches
@@ -1550,9 +1560,14 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             # Co-fire and wash/LPI are explicitly bounded cross-launch windows.
             # The rug-buyer set is position/candidate state, so do NOT retain
             # every buyer for every token on the whole subscribed program.
-            if self._should_track_mint_buyers(mint_key):
+            # R5-P1-1: same scoping as the wash feed — a platform-wide buyer
+            # map is evicted (oldest mint first) long before a parked
+            # candidate reaches its 60 s check, which zeroed buyer_count.
+            if self._should_track_mint_buyers(mint_key) or mint_key in getattr(
+                self, "_first_seen_mints", {}
+            ):
                 self._rug_buyers.setdefault(mint_key, set()).add(trader_key)
-            self._cofire.observe_buy(mint_key, trader_key)
+                self._cofire.observe_buy(mint_key, trader_key)
         # R3-P2-12: own-wallet trade flag — a TradeEvent whose trader
         # is the bot's wallet prompts the monitor for an immediate
         # exit evaluation (off by default = current polling).
