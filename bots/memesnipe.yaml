@@ -364,8 +364,8 @@ filters:
   # with populated filters, so we wait for data and let the MC band fall
   # where it falls, capped by max_market_cap_sol 60). All three 0 = off.
   min_token_age_s: 60
-  min_observed_trades: 20
-  min_unique_buyers: 10
+  min_observed_trades: 10
+  min_unique_buyers: 5
   # R5-P0-4: armed — coordinator co-fire feed is live (observe_buy on every
   # trade event) and the gate fails open (0 with no observations). First-pass
   # threshold: refuse when >30% of a mint's early buyers co-fire across >=3

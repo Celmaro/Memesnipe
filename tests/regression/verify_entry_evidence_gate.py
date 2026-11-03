@@ -19,7 +19,7 @@ Checks (no network, no funds):
   G. _queue_token parks a young candidate (queue stays empty, pending count
      increments) and a duplicate detect does not double-park.
   H. _deferred_enqueue re-queues the token after the delay.
-  I. YAML arms 60 s / 20 trades / 10 buyers.
+  I. YAML arms 60 s / 10 trades / 5 buyers (obs window 2026-11-03).
   J. config_loader accepts the keys and rejects a negative age.
 
 Usage:
@@ -488,10 +488,10 @@ def main() -> int:
     cfg = yaml.safe_load(Path("bots/memesnipe.yaml").read_text())
     f = cfg["filters"]
     check(
-        "YAML arms min_token_age_s 60 / trades 20 / buyers 10",
+        "YAML arms min_token_age_s 60 / trades 10 / buyers 5",
         f.get("min_token_age_s") == 60
-        and f.get("min_observed_trades") == 20
-        and f.get("min_unique_buyers") == 10,
+        and f.get("min_observed_trades") == 10
+        and f.get("min_unique_buyers") == 5,
         f"-> {f.get('min_token_age_s')}/{f.get('min_observed_trades')}/"
         f"{f.get('min_unique_buyers')}",
     )
