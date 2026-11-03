@@ -35,9 +35,16 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-#: Offset of the freeze-authority option byte in a standard mint account
-#: (SPL Token and Token-2022 fixed header): 1 => authority present.
-_FREEZE_AUTHORITY_OPTION_OFFSET = 45
+#: SPL mint layout (SPL Token and Token-2022 fixed header):
+#:   0..4   mint_authority COption tag (u32)
+#:   4..36  mint_authority pubkey
+#:   36..44 supply (u64)
+#:   44     decimals (u8)
+#:   45     is_initialized (u8)  <-- ALWAYS 1 on a live mint
+#:   46..50 freeze_authority COption tag (u32)  <-- this is the flag
+#:   50..82 freeze_authority pubkey
+#: Reading byte 45 (is_initialized) rejected EVERY mint as a honeypot.
+_FREEZE_AUTHORITY_OPTION_OFFSET = 46
 
 
 def has_freeze_authority(mint_account_data: bytes) -> bool:
@@ -47,12 +54,16 @@ def has_freeze_authority(mint_account_data: bytes) -> bool:
         mint_account_data: Raw account data of the mint (base64-decoded bytes)
 
     Returns:
-        True if the option byte at offset 45 is set. Conventions vary by token
-        program, so a too-short data buffer returns False (fail-open).
+        True only when the freeze-authority COption tag (u32 LE at offset 46)
+        is 1. A too-short buffer returns False (fail-open).
     """
-    if len(mint_account_data) <= _FREEZE_AUTHORITY_OPTION_OFFSET:
+    if len(mint_account_data) < _FREEZE_AUTHORITY_OPTION_OFFSET + 4:
         return False
-    return mint_account_data[_FREEZE_AUTHORITY_OPTION_OFFSET] == 1
+    tag = int.from_bytes(
+        mint_account_data[_FREEZE_AUTHORITY_OPTION_OFFSET:_FREEZE_AUTHORITY_OPTION_OFFSET + 4],
+        "little",
+    )
+    return tag == 1
 
 
 def burn_fraction(

@@ -205,6 +205,35 @@ def _probe_skip_reason_locality() -> list[str]:
     return failures
 
 
+def _probe_freeze_authority_layout() -> list[str]:
+    """Freeze-authority check must read the COption tag at byte 46, not the
+    is_initialized byte at 45 (which is always 1 and rejected every mint)."""
+    from screening.honeypot import has_freeze_authority
+
+    failures: list[str] = []
+
+    def mint_bytes(*, initialized: bool = True, freeze: bool = False) -> bytes:
+        b = bytearray(82)
+        b[0:4] = (0).to_bytes(4, "little")          # mint authority: None
+        b[36:44] = (1_000_000).to_bytes(8, "little")
+        b[44] = 6                                    # decimals
+        b[45] = 1 if initialized else 0              # is_initialized
+        b[46:50] = (1 if freeze else 0).to_bytes(4, "little")
+        return bytes(b)
+
+    if has_freeze_authority(mint_bytes(initialized=True, freeze=False)):
+        failures.append("normal initialized mint without freeze authority flagged")
+    if not has_freeze_authority(mint_bytes(initialized=True, freeze=True)):
+        failures.append("mint WITH freeze authority not flagged")
+    if has_freeze_authority(b"\x00" * 20):
+        failures.append("short buffer should fail open")
+    print(
+        "  [%s] freeze-authority layout (byte 46 COption, not byte 45 init)"
+        % ("PASS" if not failures else "FAIL")
+    )
+    return failures
+
+
 class _ExplodingClient:
     def __getattr__(self, _name):
         raise AssertionError("gate must not touch RPC on the hot path")
@@ -213,6 +242,7 @@ class _ExplodingClient:
 def main() -> int:
     failures = _probe_skip_reason_locality()
     failures += asyncio.run(_probe_honeypot_caching())
+    failures += _probe_freeze_authority_layout()
 
     if failures:
         print(f"\nR3-P2-1 FAILED ({len(failures)}): {failures}")
