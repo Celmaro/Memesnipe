@@ -182,6 +182,13 @@ def _resolve_quote_config(
 _SOL_PRICE_TTL_SECONDS = 60
 _SOL_PRICE_TIMEOUT_SECONDS = 5
 _HTTP_OK = 200
+# R5-P1-1 clock-boundary guard: a deferred task can wake microscopically
+# before the mint reaches min_token_age_s, leaving `remaining` a tiny
+# positive float. Parking again makes an instant re-park loop (observed:
+# 7 bogus park rows in 0.4 s) that churns the pending-evidence count.
+# Within half a second of maturity there is no meaningful evidence gap,
+# so treat the candidate as mature instead of re-parking.
+_PARK_EPSILON_S = 0.5
 
 
 class UniversalTrader(ExitEngineMixin, GateStackMixin):
@@ -2262,7 +2269,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 token_key, monotonic()
             )
             remaining = min_age - age
-            if remaining > 0:
+            if remaining > _PARK_EPSILON_S:
                 pending = int(getattr(self, "_evidence_pending_count", 0) or 0)
                 cap = int(getattr(self, "max_evidence_pending", 256) or 256)
                 if pending >= cap:

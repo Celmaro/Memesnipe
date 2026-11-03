@@ -212,6 +212,35 @@ def main() -> int:
 
     check("deferred enqueue re-queues the aged token", asyncio.run(defer()))
 
+    # --- H2: clock-boundary re-park loop is prevented --------------------
+    async def boundary():
+        from time import monotonic
+
+        q = asyncio.Queue(maxsize=10)
+        t = object.__new__(UniversalTrader)
+        t.processed_tokens = set()
+        t._queued_mints = set()
+        t.token_queue = q
+        t.token_timestamps = {}
+        t._first_seen_mints = {}
+        t.token_launch_timestamps = {}
+        t.max_tracked_tokens = 1000
+        t.min_token_age_s = 60.0
+        t._evidence_pending_count = 0
+        t.max_evidence_pending = 256
+        tk = _token(symbol="BOUNDARY")
+        # 59.9 s old: remaining is 0.1 s — under the park epsilon, so it
+        # must enqueue NOW instead of re-parking (a 0.1 s wait is not
+        # evidence; re-parking spins the deferred task loop).
+        t._first_seen_mints[str(tk.mint)] = monotonic() - 59.9
+        await UniversalTrader._queue_token(t, tk)
+        return (not q.empty()) and t._evidence_pending_count == 0
+
+    check(
+        "59.9s-old candidate enqueues instead of re-parking",
+        asyncio.run(boundary()),
+    )
+
     # --- I: park row emitted (observation capture) -----------------------
     class _FakeCapture:
         def __init__(self):
