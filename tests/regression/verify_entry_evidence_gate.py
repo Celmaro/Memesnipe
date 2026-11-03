@@ -393,7 +393,9 @@ def main() -> int:
     async def backfill_case(mint_sym, candidate_mint, sigs, txs, min_trades=20):
         t = object.__new__(UniversalTrader)
         t.min_observed_trades = min_trades
+        t.min_unique_buyers = 10
         t._evidence_backfilled = set()
+        t._rpc_evidence = {}
         t._wash_lpi = WashLpiDetector()
         t._cofire = CoFireTracker()
         t._rug_buyers = {}
@@ -412,6 +414,9 @@ def main() -> int:
         "slot": 1,
         "blockTime": 1,
     }
+    # Enough successful sigs to clear min_unique_buyers -> buyer fetch happens.
+    many_sigs = [dict(fake_sig, signature=f"FAKESIG{i:02d}" + "0" * 54) for i in range(25)]
+    few_sigs = many_sigs[:3]
     fake_tx = {
         "jsonrpc": "2.0",
         "id": 0,
@@ -424,7 +429,7 @@ def main() -> int:
         backfill_case(
             "BFILL",
             "37Vnce2mgcjCDqw75X57Xy68DvfFerdxNwB12qetpump",
-            [fake_sig],
+            many_sigs,
             [fake_tx],
         )
     )
@@ -442,11 +447,26 @@ def main() -> int:
         backfill_case(
             "BFILL",
             bf_mint,
-            [fake_sig],
+            many_sigs,
             [fake_tx],
             min_trades=0,
         )
     )
+    bf3 = asyncio.run(
+        backfill_case(
+            "BFILL",
+            bf_mint,
+            few_sigs,
+            [fake_tx],
+        )
+    )
+    check(
+        "backfill sig-only when signature count cannot meet buyer gate",
+        bf3._rpc_evidence.get(bf_mint, {}).get("trades") == 2
+        and bf3._rpc_evidence.get(bf_mint, {}).get("buyers") is None,
+        f"-> {bf3._rpc_evidence.get(bf_mint)}",
+    )
+
     check(
         "backfill skipped entirely when the evidence gate is off",
         bf2._wash_lpi.event_count(bf_mint) == 0

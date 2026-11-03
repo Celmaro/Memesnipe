@@ -780,6 +780,8 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         self._first_seen_mints: dict[str, float] = {}
         # R5-P1-1: mints already backfilled from RPC (log-feed blind workaround).
         self._evidence_backfilled: set[str] = set()
+        # R5-P1-1: RPC-derived evidence counts (geyser feed carries no logs).
+        self._rpc_evidence: dict[str, dict] = {}
         self._evidence_pending_count = 0
         self.max_evidence_pending = 256
         # R4-P1-8: momentum-fade advisory state (log-only; peak trade rate
@@ -1489,6 +1491,21 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         except Exception:
             logger.exception("Rug trade feed init failed; drain test only")
 
+    def _store_rpc_evidence(self, mint: str, row: dict) -> None:
+        """Store one mint's RPC evidence, keeping the map bounded.
+
+        Thousands of mints pass per hour; the gate only reads a row in the
+        seconds between backfill and its verdict, so evicting the oldest
+        entries is safe.
+        """
+        if not hasattr(self, "_rpc_evidence"):
+            self._rpc_evidence = {}
+        self._rpc_evidence[mint] = row
+        if len(self._rpc_evidence) > 4000:
+            for key in list(self._rpc_evidence)[:1500]:
+                if key != mint:
+                    self._rpc_evidence.pop(key, None)
+
     async def _backfill_trades_from_rpc(self, token_info: TokenInfo) -> None:
         """Populate the evidence trackers from RPC when the log feed is blind.
 
@@ -1529,6 +1546,19 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         sigs = (sig_resp or {}).get("result") or []
         ok_sigs = [s for s in sigs if s.get("err") is None]
         if not ok_sigs:
+            self._store_rpc_evidence(mint, {"trades": 0, "buyers": 0})
+            return
+        # The signature list alone gives the trade count for ONE RPC call: a
+        # pump.fun mint's successful txs are its trades (minus the create).
+        # Under a launch flood (~40 candidates/min) this is what keeps the
+        # evidence queue from growing without bound at 2 rps.
+        sig_trades = max(0, len(ok_sigs) - 1)
+        self._store_rpc_evidence(mint, {"trades": sig_trades, "buyers": None})
+        min_buyers = int(getattr(self, "min_unique_buyers", 0) or 0)
+        # Buyer identities cost one getTransaction each; only pay when the
+        # signature count makes passing the buyer gate possible at all.
+        if min_buyers > 0 and sig_trades < min_buyers:
+            metrics.incr("feed.rpc_backfill_sigonly")
             return
         # Newest first: for a young mint the whole life fits. Cap the batch:
         # each getTransaction costs the provider one request and the shared
@@ -1553,6 +1583,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         if not isinstance(responses, list):
             return
         observed = 0
+        buyers_seen: set[str] = set()
         parser = self.platform_implementations.event_parser
         for item in responses:
             tx = item.get("result") if isinstance(item, dict) else None
@@ -1589,9 +1620,11 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 if trade.get("is_buy") and trader_key:
                     self._rug_buyers.setdefault(mint, set()).add(trader_key)
                     self._cofire.observe_buy(mint, trader_key)
+                    buyers_seen.add(trader_key)
                 observed += 1
             except Exception:
                 continue
+        self._rpc_evidence[mint]["buyers"] = len(buyers_seen)
         metrics.incr("feed.rpc_backfill_runs")
         metrics.incr("feed.rpc_backfill_trades", observed)
         logger.info(

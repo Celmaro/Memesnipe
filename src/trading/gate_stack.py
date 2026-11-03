@@ -236,18 +236,17 @@ class GateStackMixin:
         if require_evidence:
             min_trades = int(getattr(self, "min_observed_trades", 0) or 0)
             min_buyers = int(getattr(self, "min_unique_buyers", 0) or 0)
+            seen, seen_buyers = self._evidence_counts(str(token_info.mint))
             if min_trades > 0:
-                seen = self._wash_lpi.event_count(str(token_info.mint))
                 if seen < min_trades:
                     return (
                         f"insufficient trade evidence: {seen} observed < "
                         f"{min_trades} required (min_observed_trades)"
                     )
             if min_buyers > 0:
-                buyers = self._cofire.buyer_count(str(token_info.mint))
-                if buyers < min_buyers:
+                if seen_buyers < min_buyers:
                     return (
-                        f"insufficient buyer evidence: {buyers} unique < "
+                        f"insufficient buyer evidence: {seen_buyers} unique < "
                         f"{min_buyers} required (min_unique_buyers)"
                     )
         # R4-P1-3: insider-coordination supply gate (0 = off). Fraction of
@@ -317,6 +316,37 @@ class GateStackMixin:
             )
         return None
 
+    def _evidence_counts(self, mint: str) -> tuple[int, int]:
+        """Trade and unique-buyer counts, preferring the stronger source.
+
+        The Geyser feed in this deployment carries no log_messages, so the
+        wash/co-fire trackers only fill from the pre-buy RPC backfill
+        (``_rpc_evidence``). Where a provider does stream logs, the trackers
+        fill naturally and win by count anyway.
+        """
+        trades = buyers = 0
+        try:
+            wash = getattr(self, "_wash_lpi", None)
+            if wash is not None:
+                trades = int(wash.event_count(mint))
+        except Exception:
+            pass
+        try:
+            cofire = getattr(self, "_cofire", None)
+            if cofire is not None:
+                buyers = int(cofire.buyer_count(mint))
+        except Exception:
+            pass
+        ev = getattr(self, "_rpc_evidence", None)
+        if isinstance(ev, dict):
+            row = ev.get(mint) or {}
+            try:
+                trades = max(trades, int(row.get("trades") or 0))
+                buyers = max(buyers, int(row.get("buyers") or 0))
+            except Exception:
+                pass
+        return trades, buyers
+
     def screening_snapshot(self, token_info: TokenInfo) -> dict:
         """R5-P1-1 observation: the values the dynamic gates read right now.
 
@@ -328,16 +358,20 @@ class GateStackMixin:
         out: dict = {}
         mint = str(token_info.mint)
         try:
+            seen, seen_buyers = self._evidence_counts(mint)
+            out["observed_trades"] = seen
+            out["unique_buyers"] = seen_buyers
+        except Exception:
+            pass
+        try:
             wash = getattr(self, "_wash_lpi", None)
             if wash is not None:
-                out["observed_trades"] = wash.event_count(mint)
                 out["wash_share"] = round(float(wash.wash_share(mint)), 4)
         except Exception:
             pass
         try:
             cofire = getattr(self, "_cofire", None)
             if cofire is not None:
-                out["unique_buyers"] = cofire.buyer_count(mint)
                 out["coordinated_share"] = round(
                     float(cofire.coordinated_share(mint)), 4
                 )
