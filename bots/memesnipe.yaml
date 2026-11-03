@@ -291,7 +291,7 @@ filters:
   # the $10 realized-loss cut bounds the downside. Re-tighten after ~20-30
   # live fills if the mode=live PF collapses vs the backtest.
   max_market_cap_sol: 120.0 # OBS WINDOW (2026-11-03): 60 blocked every real-demand token (18 rejects at MC 60-239 that had >=1 SOL progress + >=20 trades). Runners leave the 60 band by construction — shadow-only test of that band.
-  min_curve_progress_sol: 1.0 # fixing-loop live: skip dead launches (was 0.25; a 4x raise still admits the floor, kills the truly dead)
+  min_curve_progress_sol: 0.3 # OBS WINDOW (2026-11-03): measured 1,271 curve rejects — median 0.017, p90 0.511, MAX 0.999. A 1.0 floor was unreachable (0 passes in ~10h, evidence gate never once evaluated). 0.3 admits ~18% and lets the demand gate actually run.
   # Improvement #4: buy-on-breakout — buy only after MC rises through this.
   # Leave null to keep pure launch sniping (max cap only).
   min_market_cap_sol: null
