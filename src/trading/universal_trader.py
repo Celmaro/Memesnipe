@@ -1532,10 +1532,11 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             return
         # Newest first: for a young mint the whole life fits. Cap the batch:
         # each getTransaction costs the provider one request and the shared
-        # bucket charges them all (2 rps), so 10 txs + 1 signature list =
-        # ~5.5s per candidate — inside the 60s gate budget without starving
-        # the curve gates' own reads.
-        sigs_page = ok_sigs[:10]
+        # bucket charges them all (2 rps). 6 txs + 1 sig list ≈ 3.5s per
+        # candidate — under the ~4.6s arrival interval, so the evidence queue
+        # does not grow unboundedly, while still covering the 0-9 trades a
+        # 60s-old mint typically has.
+        sigs_page = ok_sigs[:6]
         batch = [
             {
                 "jsonrpc": "2.0",
