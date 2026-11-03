@@ -1556,7 +1556,7 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         self._store_rpc_evidence(mint, {"trades": sig_trades, "buyers": None})
         if not hasattr(self, "_rpc_sig_cache"):
             self._rpc_sig_cache = {}
-        self._rpc_sig_cache[mint] = [s_["signature"] for s_ in ok_sigs[:20]]
+        self._rpc_sig_cache[mint] = [s_["signature"] for s_ in ok_sigs[:60]]
         if len(self._rpc_sig_cache) > 4000:
             for key in list(self._rpc_sig_cache)[:1500]:
                 if key != mint:
@@ -1591,9 +1591,12 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         sigs = (getattr(self, "_rpc_sig_cache", {}) or {}).get(mint) or []
         if not sigs:
             return
-        # Cover enough txs that 10 distinct buyers are reachable: 2x the
-        # threshold, capped at 20 (each costs one provider request).
-        page = sigs[: min(len(sigs), max(2 * min_buyers, 12))]
+        # Cover enough txs that 10 distinct buyers are reachable. A 60s-old
+        # launch's signature list is NEWEST-FIRST, and its most recent txs are
+        # exactly the sells of an early dump — limiting to the newest 20 made
+        # unique buyers systematically undercount. Sample the available
+        # history (up to 60, the whole useful life of a fresh mint).
+        page = sigs[: min(len(sigs), 60)]
         batch = [
             {
                 "jsonrpc": "2.0",
