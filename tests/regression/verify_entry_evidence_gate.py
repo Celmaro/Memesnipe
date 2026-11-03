@@ -390,12 +390,13 @@ def main() -> int:
                 return self.txs
             return None
 
-    async def backfill_case(mint_sym, candidate_mint, sigs, txs, min_trades=20):
+    async def backfill_case(mint_sym, candidate_mint, sigs, txs, min_trades=20, min_buyers=10):
         t = object.__new__(UniversalTrader)
         t.min_observed_trades = min_trades
-        t.min_unique_buyers = 10
+        t.min_unique_buyers = min_buyers
         t._evidence_backfilled = set()
         t._rpc_evidence = {}
+        t._rpc_sig_cache = {}
         t._wash_lpi = WashLpiDetector()
         t._cofire = CoFireTracker()
         t._rug_buyers = {}
@@ -406,6 +407,7 @@ def main() -> int:
         t.platform_implementations = SimpleNamespace(event_parser=_FakeParser(candidate_mint))
         tk = _token(mint_sym, candidate_mint)
         await UniversalTrader._backfill_trades_from_rpc(t, tk)
+        await UniversalTrader._backfill_buyers_from_rpc(t, tk)
         return t
 
     fake_sig = {
@@ -414,7 +416,7 @@ def main() -> int:
         "slot": 1,
         "blockTime": 1,
     }
-    # Enough successful sigs to clear min_unique_buyers -> buyer fetch happens.
+    # 25 successful sigs: sig-only count = 24 trades, enough to trigger buyer decode.
     many_sigs = [dict(fake_sig, signature=f"FAKESIG{i:02d}" + "0" * 54) for i in range(25)]
     few_sigs = many_sigs[:3]
     fake_tx = {
@@ -435,12 +437,11 @@ def main() -> int:
     )
     bf_mint = "37Vnce2mgcjCDqw75X57Xy68DvfFerdxNwB12qetpump"
     check(
-        "backfill feeds trackers from RPC and marks the mint",
-        bf._wash_lpi.event_count(bf_mint) == 1
-        and bf._cofire.buyer_count(bf_mint) == 1
+        "trade count from signatures + buyer decode from txs",
+        bf._rpc_evidence.get(bf_mint, {}).get("trades") == 24
+        and bf._rpc_evidence.get(bf_mint, {}).get("buyers") == 1
         and bf_mint in bf._evidence_backfilled,
-        f"-> trades={bf._wash_lpi.event_count(bf_mint)} "
-        f"buyers={bf._cofire.buyer_count(bf_mint)}",
+        f"-> {bf._rpc_evidence.get(bf_mint)}",
     )
 
     bf2 = asyncio.run(
@@ -452,6 +453,13 @@ def main() -> int:
             min_trades=0,
         )
     )
+    check(
+        "backfill skipped entirely when the evidence gate is off",
+        bf2._wash_lpi.event_count(bf_mint) == 0
+        and bf2._backfill_client.calls == [],
+        f"-> rpc calls={len(bf2._backfill_client.calls)}",
+    )
+
     bf3 = asyncio.run(
         backfill_case(
             "BFILL",
@@ -461,17 +469,19 @@ def main() -> int:
         )
     )
     check(
-        "backfill sig-only when signature count cannot meet buyer gate",
+        "sig-only when signature count cannot meet buyer gate",
         bf3._rpc_evidence.get(bf_mint, {}).get("trades") == 2
         and bf3._rpc_evidence.get(bf_mint, {}).get("buyers") is None,
         f"-> {bf3._rpc_evidence.get(bf_mint)}",
     )
 
+    gate_reason = UniversalTrader._dynamic_screening_reason(
+        bf, _token("BFILL", bf_mint), require_evidence=True
+    )
     check(
-        "backfill skipped entirely when the evidence gate is off",
-        bf2._wash_lpi.event_count(bf_mint) == 0
-        and bf2._backfill_client.calls == [],
-        f"-> rpc calls={len(bf2._backfill_client.calls)}",
+        "evidence gate consults RPC counts (blind feed)",
+        gate_reason == "insufficient buyer evidence: 1 unique < 10 required (min_unique_buyers)",
+        f"-> {gate_reason}",
     )
 
     # --- K: YAML armed values --------------------------------------------

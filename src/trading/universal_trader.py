@@ -1554,32 +1554,59 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
         # evidence queue from growing without bound at 2 rps.
         sig_trades = max(0, len(ok_sigs) - 1)
         self._store_rpc_evidence(mint, {"trades": sig_trades, "buyers": None})
+        if not hasattr(self, "_rpc_sig_cache"):
+            self._rpc_sig_cache = {}
+        self._rpc_sig_cache[mint] = [s_["signature"] for s_ in ok_sigs[:20]]
+        if len(self._rpc_sig_cache) > 4000:
+            for key in list(self._rpc_sig_cache)[:1500]:
+                if key != mint:
+                    self._rpc_sig_cache.pop(key, None)
+        # Buyer identities cost one getTransaction each and few tokens
+        # survive the curve gate, so they are fetched lazily at pre-buy by
+        # _backfill_buyers_from_rpc(). This pass pays ONE call per candidate.
+        metrics.incr("feed.rpc_backfill_sigonly")
+        return
+    async def _backfill_buyers_from_rpc(self, token_info: TokenInfo) -> None:
+        """Decode buyer identities for a candidate that cleared the curve gate.
+
+        Called at pre-buy only: the curve/honeypot gates reject the vast
+        majority of launches, and buyer decode costs one getTransaction per
+        transaction. Sampling is bounded so ``unique_buyers`` can actually
+        reach the 10 required by the gate (the earlier 6-tx cap made that
+        impossible).
+        """
         min_buyers = int(getattr(self, "min_unique_buyers", 0) or 0)
-        # Buyer identities cost one getTransaction each; only pay when the
-        # signature count makes passing the buyer gate possible at all.
-        if min_buyers > 0 and sig_trades < min_buyers:
-            metrics.incr("feed.rpc_backfill_sigonly")
+        if min_buyers <= 0:
             return
-        # Newest first: for a young mint the whole life fits. Cap the batch:
-        # each getTransaction costs the provider one request and the shared
-        # bucket charges them all (2 rps). 6 txs + 1 sig list ≈ 3.5s per
-        # candidate — under the ~4.6s arrival interval, so the evidence queue
-        # does not grow unboundedly, while still covering the 0-9 trades a
-        # 60s-old mint typically has.
-        sigs_page = ok_sigs[:6]
+        mint = str(token_info.mint)
+        row = (getattr(self, "_rpc_evidence", {}) or {}).get(mint)
+        if not row or row.get("buyers") is not None:
+            return
+        trades = int(row.get("trades") or 0)
+        if trades < min_buyers:
+            return
+        client = getattr(self, "solana_client", None)
+        if client is None:
+            return
+        sigs = (getattr(self, "_rpc_sig_cache", {}) or {}).get(mint) or []
+        if not sigs:
+            return
+        # Cover enough txs that 10 distinct buyers are reachable: 2x the
+        # threshold, capped at 20 (each costs one provider request).
+        page = sigs[: min(len(sigs), max(2 * min_buyers, 12))]
         batch = [
             {
                 "jsonrpc": "2.0",
                 "id": i,
                 "method": "getTransaction",
                 "params": [
-                    s["signature"],
+                    sig,
                     {"encoding": "json", "maxSupportedTransactionVersion": 1},
                 ],
             }
-            for i, s in enumerate(sigs_page)
+            for i, sig in enumerate(page)
         ]
-        responses = await client.post_rpc(batch, deadline_seconds=15.0)
+        responses = await client.post_rpc(batch, deadline_seconds=20.0)
         if not isinstance(responses, list):
             return
         observed = 0
@@ -1592,15 +1619,11 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             try:
                 keys = tx["transaction"]["message"]["accountKeys"]
                 signer = (
-                    keys[0]
-                    if isinstance(keys[0], str)
-                    else keys[0].get("pubkey")
+                    keys[0] if isinstance(keys[0], str) else keys[0].get("pubkey")
                 )
                 logs = tx["meta"].get("logMessages") or []
                 logs = [m if isinstance(m, str) else m.get("log", "") for m in logs]
-                trade = parser.parse_trade_event_from_logs(
-                    logs, outer_signer=signer
-                )
+                trade = parser.parse_trade_event_from_logs(logs, outer_signer=signer)
             except Exception:
                 continue
             if not trade or str(trade.get("mint", "")) != mint:
@@ -1624,13 +1647,11 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
                 observed += 1
             except Exception:
                 continue
-        self._rpc_evidence[mint]["buyers"] = len(buyers_seen)
-        metrics.incr("feed.rpc_backfill_runs")
-        metrics.incr("feed.rpc_backfill_trades", observed)
+        row["buyers"] = len(buyers_seen)
+        metrics.incr("feed.rpc_buyer_decodes")
         logger.info(
-            f"RPC trade backfill {token_info.symbol}: "
-            f"{observed} trades from {len(sigs_page)} txs "
-            f"(live feed blind)"
+            f"RPC buyer decode {token_info.symbol}: {len(buyers_seen)} buyers "
+            f"from {len(page)} txs (trades={trades})"
         )
 
     async def _consume_trade_logs(
@@ -3051,10 +3072,10 @@ class UniversalTrader(ExitEngineMixin, GateStackMixin):
             # (or empty) data is refused before submission. Stateless: the
             # creator-cadence side effect lives only in _skip_reason().
             try:
-                await self._backfill_trades_from_rpc(token_info)
+                await self._backfill_buyers_from_rpc(token_info)
             except Exception:
                 logger.debug(
-                    f"RPC trade backfill failed for {token_info.symbol} "
+                    f"RPC buyer backfill failed for {token_info.symbol} "
                     f"(non-fatal, gate may reject on empty evidence)",
                     exc_info=True,
                 )
